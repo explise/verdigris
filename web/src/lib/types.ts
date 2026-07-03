@@ -99,6 +99,6 @@ export interface Settings {
 /** Tier economics shared by the cost estimator (mirrors the backend sim model). */
 export const TIER_ECON: Record<TierId, { perGB: number; latency: string; storage: number; label: string }> = {
   hot:  { perGB: 0,    latency: "0.4s", storage: 0.023,  label: "S3 Standard" },
-  warm: { perGB: 0.01, latency: "~6s",  storage: 0.004,  label: "Glacier Instant" },
-  cold: { perGB: 0.03, latency: "3–5h", storage: 0.0036, label: "Glacier Flexible" },
+  warm: { perGB: 0.03, latency: "~6s",  storage: 0.004,  label: "Glacier Instant" },
+  cold: { perGB: 0.01, latency: "3–5h", storage: 0.0036, label: "Glacier Flexible" },
 };

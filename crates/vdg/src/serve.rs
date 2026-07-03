@@ -382,8 +382,15 @@ async fn h_storage(State(st): State<AppState>) -> ApiResult {
             { "at": format!("after {} days", st.cfg.lifecycle.warm_to_cold_days), "action": "transition Warm -> Cold (Glacier Flexible)" },
             { "at": format!("after {} days", st.cfg.lifecycle.expire_days),       "action": "expire (delete)" },
         ],
-        // Compaction subsystem doesn't exist yet (build step 4).
-        "compaction": { "smallFiles": m.files.len(), "compacted": 0, "targetSize": "256 MB", "status": "not implemented", "placeholder": true },
+        // Compaction is implemented (on-demand `vdg compact`): report the real
+        // small-file count, how many files are compacted, and the generation.
+        "compaction": {
+            "smallFiles": m.files.iter().filter(|f| f.path.rsplit('/').next().is_some_and(|n| n.starts_with("part-"))).count(),
+            "compacted": m.files.iter().filter(|f| f.path.rsplit('/').next().is_some_and(|n| n.starts_with('c'))).count(),
+            "generation": m.compaction_gen,
+            "targetSize": "256 MB",
+            "status": if m.compaction_gen > 0 { "compacted" } else { "idle" },
+        },
         "totalGB": m.total_bytes() as f64 / cost::GIB,
         "totalPerMonth": total_per_month,
     })))

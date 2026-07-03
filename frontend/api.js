@@ -82,8 +82,8 @@
   // tier scan economics — used by the cost estimator
   const TIER_ECON = {
     hot:  { perGB: 0,     latency: "0.4s",  storage: 0.023,   label: "S3 Standard" },
-    warm: { perGB: 0.01,  latency: "~6s",   storage: 0.004,   label: "Glacier Instant" },
-    cold: { perGB: 0.03,  latency: "3–5h",  storage: 0.0036,  label: "Glacier Flexible" },
+    warm: { perGB: 0.03,  latency: "~6s",   storage: 0.004,   label: "Glacier Instant" },
+    cold: { perGB: 0.01,  latency: "3–5h",  storage: 0.0036,  label: "Glacier Flexible" },
   };
   const TIER_SCAN_GB = { hot: 0.21, warm: 4.2, cold: 38 };
 

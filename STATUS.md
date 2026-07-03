@@ -64,7 +64,7 @@ The prototype is the reference; `web/` is where the real product goes. Both rend
 10. **`_verify.js` can't run offline anymore** (pages now fetch). Either add a `fetch` stub/mock toggle to the harness, or run it against a live `vdg`.
 
 ### Cross-cutting / product
-11. **Pricing rates swapped in client `TIER_ECON`** (`frontend/api.js`, `web/src/lib/types.ts`): warm should be ~$0.03/GB (Glacier Instant per-GET), cold ~$0.01/GB (Glacier Flexible standard) per `CLAUDE.md`. Currently `warm:0.01, cold:0.03`. Only affects mock-mode estimates (live estimate is backend-computed), but it's a real correctness bug. **Awaiting confirmation to fix.**
+11. ~~**Pricing rates swapped in client `TIER_ECON`**~~ — **FIXED.** `warm:0.03` (Glacier Instant per-GET), `cold:0.01` (Glacier Flexible standard) per `CLAUDE.md`, in both `frontend/api.js` and `web/src/lib/types.ts`.
 12. **Logo is a placeholder glyph** — needs a real verdigris/patina mark.
 13. **Real-engine footer copy** — UI now reads `stats.engine`; confirm product wants "datafusion" surfaced to users vs a friendlier label.
 

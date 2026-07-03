@@ -166,9 +166,11 @@ in-memory, or S3/MinIO — no recompile to switch.
   can't be time-pruned. Finer pruning needs row-group/column stats.
 - **Streaming/multipart Parquet writes** (today buffered; OK because `BatchPolicy` bounds size).
 - **`/v1/tail` SSE/WebSocket** — live tail is client-side mock only.
-- **Pricing rates** — confirm warm (Glacier IR) ≈ $0.03/GB and cold (Glacier Flexible std)
-  ≈ $0.01/GB per `CLAUDE.md`; client mock `TIER_ECON` currently has them swapped (live
-  estimate is backend-computed and already correct).
+- ~~**Pricing rates**~~ — **fixed**: client `TIER_ECON` now has warm (Glacier IR) ≈ $0.03/GB
+  and cold (Glacier Flexible std) ≈ $0.01/GB per `CLAUDE.md`, in both `frontend/api.js` and
+  `web/src/lib/types.ts`.
+- ~~**Compaction reported "not implemented"** in `/v1/storage/tiers`~~ — **fixed**: it now
+  reports the real small-file/compacted counts, generation, and status from the manifest.
 - **Placeholders to make real**: `/v1/alerts` (no alert engine), `/v1/pipelines` (no
   introspection), `p99` in `/v1/metrics` (modeled — no latency field), `expensiveQueries`
   in `/v1/cost` (no query-history tracking).
