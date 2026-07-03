@@ -56,7 +56,6 @@ The prototype is the reference; `web/` is where the real product goes. Both rend
 3. **Real Arrow round-trip.** Backend emits Arrow IPC for `/v1/query`; confirm `arrow.ts` decode + feed columnar data into the virtualized table (and eventually uPlot). Today the decode path is built but untested against real Arrow bytes.
 4. **`web/` interactivity parity with the prototype:** Run button should re-execute the query (currently only opens the cold gate); query-box edits should refetch; histogram/footer already reactive.
 5. **uPlot over Arrow columns** — feed `x[]`/`y[]` straight from Arrow columns instead of materialized arrays (the real scale win).
-6. **Automated browser verification.** kane-cli token expired (`kane-cli login` is interactive). Once logged in, run a click-through of all 8 pages + switcher and assert no console errors. Until then, verification is build + typecheck + manual.
 7. **DuckDB-Wasm (phase 2)** — `duckdbWasm` feature flag exists; wire client-side re-aggregation/zoom over Arrow result sets (Grafana-beating interaction, on-brand with the engine).
 8. **Code-split `apache-arrow`** — it dominates the 100 KB gzip bundle; lazy-load it on the Logs route.
 
