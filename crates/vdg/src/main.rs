@@ -110,35 +110,6 @@ enum Command {
     },
 }
 
-/// One NDJSON input line. `attrs`/`trace_id` optional; `ts_millis` required.
-#[derive(serde::Deserialize)]
-struct JsonLog {
-    ts_millis: i64,
-    level: verdigris_core::model::Level,
-    service: String,
-    #[serde(default)]
-    status: Option<i32>,
-    message: String,
-    #[serde(default)]
-    trace_id: Option<String>,
-    #[serde(default)]
-    attrs: std::collections::BTreeMap<String, String>,
-}
-
-impl From<JsonLog> for verdigris_core::batch::LogRecord {
-    fn from(j: JsonLog) -> Self {
-        Self {
-            ts_millis: j.ts_millis,
-            level: j.level,
-            service: j.service,
-            status: j.status,
-            message: j.message,
-            trace_id: j.trace_id,
-            attrs: j.attrs,
-        }
-    }
-}
-
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum TierArg {
     Hot,
@@ -334,7 +305,7 @@ async fn run_ingest(
             text.lines()
                 .filter(|l| !l.trim().is_empty())
                 .map(|line| {
-                    serde_json::from_str::<JsonLog>(line)
+                    serde_json::from_str::<verdigris_ingest::wire::JsonLog>(line)
                         .map(LogRecord::from)
                         .with_context(|| format!("parsing NDJSON line: {line}"))
                 })

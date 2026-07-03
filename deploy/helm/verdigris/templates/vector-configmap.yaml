@@ -1,4 +1,5 @@
 {{- if .Values.vector.enabled }}
+{{- $sink := .Values.vector.sinkEndpoint | default (printf "http://%s:%v/v1/ingest" (include "verdigris.fullname" .) (.Values.service.port | int)) }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,9 +9,8 @@ metadata:
     app.kubernetes.io/component: log-shipper
 data:
   vector.yaml: |
-    # SCAFFOLD config (see the DaemonSet header). Tails every pod's logs,
-    # reshapes them into the Verdigris log schema, and batches NDJSON to the
-    # ingest endpoint. Wire it up once vdg exposes an HTTP ingest route.
+    # Tails every pod's stdout/stderr, reshapes into the Verdigris ingest wire
+    # format, and batches NDJSON to POST /v1/ingest.
     data_dir: /vector-data-dir
     sources:
       k8s:
@@ -20,33 +20,33 @@ data:
       to_verdigris:
         type: remap
         inputs: [k8s]
-        # Map into the ingest Arrow schema:
-        #   ts, level, service, status, message, trace_id, attrs_json
+        # Emit exactly the ingest wire schema (verdigris_ingest::wire::JsonLog):
+        #   ts_millis (i64), level (str, parsed case-insensitively server-side),
+        #   service (str), status (int, optional), message (str),
+        #   trace_id (str, optional), attrs (map<str,str>, optional).
         source: |
-          .ts = to_unix_timestamp(now(), unit: "milliseconds")
-          .level = downcase(string!(.level) ?? "info")
-          .service = .kubernetes.container_name ?? "unknown"
-          .message = string!(.message) ?? ""
-          .status = to_int(.status) ?? 0
-          .trace_id = .trace_id ?? ""
-          .attrs_json = encode_json({
-            "namespace": .kubernetes.pod_namespace,
-            "pod": .kubernetes.pod_name,
-            "node": .kubernetes.pod_node_name
-          })
-          # keep only the schema fields
-          . = { "ts": .ts, "level": .level, "service": .service,
-                "status": .status, "message": .message,
-                "trace_id": .trace_id, "attrs_json": .attrs_json }
+          ts = to_unix_timestamp(.timestamp, unit: "milliseconds") ?? to_unix_timestamp(now(), unit: "milliseconds")
+          . = {
+            "ts_millis": ts,
+            "level": to_string(.level) ?? "info",
+            "service": to_string(.kubernetes.container_name) ?? "unknown",
+            "message": to_string(.message) ?? "",
+            "trace_id": to_string(.trace_id) ?? "",
+            "attrs": {
+              "namespace": to_string(.kubernetes.pod_namespace) ?? "",
+              "pod": to_string(.kubernetes.pod_name) ?? "",
+              "node": to_string(.kubernetes.pod_node_name) ?? ""
+            }
+          }
 
     sinks:
       verdigris:
         type: http
         inputs: [to_verdigris]
-        uri: {{ .Values.vector.sinkEndpoint | quote }}
+        uri: {{ $sink | quote }}
         method: post
         encoding:
-          codec: json          # newline-delimited JSON batches
+          codec: json          # newline-delimited JSON batches (NDJSON)
         framing:
           method: newline_delimited
         batch:

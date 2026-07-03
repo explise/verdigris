@@ -7,6 +7,7 @@
 pub mod encode;
 pub mod generate;
 pub mod schema;
+pub mod wire;
 
 use std::sync::Arc;
 

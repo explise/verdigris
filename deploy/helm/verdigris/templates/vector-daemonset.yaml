@@ -1,18 +1,12 @@
 {{- if .Values.vector.enabled }}
 # =============================================================================
-# SCAFFOLD — Vector log-shipping DaemonSet.
+# Vector log-shipping DaemonSet — the "step 1" ingestion path.
 #
-# This is the "step 1" ingestion path from the architecture diagram: a Vector
-# DaemonSet tails every pod's stdout/stderr and ships to the Verdigris ingest
-# service. It is DISABLED by default (vector.enabled=false) because the HTTP
-# ingest endpoint it targets does NOT exist yet — vdg ingest is currently
-# CLI-only (synthetic generator + NDJSON file). When `/v1/ingest` lands, set
-# vector.sinkEndpoint and flip vector.enabled=true. Until then this ships logs
-# nowhere useful; it exists as the deployment wiring, ready to activate.
+# Tails every pod's stdout/stderr and ships batched NDJSON to the Verdigris
+# `POST /v1/ingest` endpoint. Opt-in (vector.enabled=false by default) since
+# log shipping is a deployment choice. When sinkEndpoint is unset it defaults to
+# the in-cluster serve Service, so a bare `--set vector.enabled=true` works.
 # =============================================================================
-{{- if not .Values.vector.sinkEndpoint }}
-{{- fail "vector.enabled=true requires vector.sinkEndpoint — but note the Verdigris HTTP ingest endpoint is not built yet (see this template's header)." }}
-{{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:

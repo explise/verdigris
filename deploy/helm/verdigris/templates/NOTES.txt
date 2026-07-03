@@ -42,7 +42,9 @@ No seed data. Ingest with:  kubectl exec deploy/{{ include "verdigris.fullname" 
 
 {{- if .Values.vector.enabled }}
 
-WARNING: the Vector DaemonSet is enabled, but the Verdigris HTTP ingest endpoint
-it targets is not implemented yet — shipped logs will not be stored. See the
-DaemonSet template header and deploy/README.md.
+Vector DaemonSet is enabled — tailing pod logs and shipping to POST /v1/ingest
+({{ .Values.vector.sinkEndpoint | default "in-cluster serve Service" }}).
 {{- end }}
+
+Ship logs yourself anytime (NDJSON, one JSON object per line):
+  curl -X POST http://localhost:{{ .Values.service.port }}/v1/ingest --data-binary @logs.ndjson

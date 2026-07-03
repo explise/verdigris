@@ -81,19 +81,40 @@ kubectl exec deploy/vdg-verdigris -- vdg lifecycle --table logs   # prints the p
 # aws s3api put-bucket-lifecycle-configuration --bucket my-company-logs --lifecycle-configuration file://policy.json
 ```
 
-## The Vector DaemonSet is a scaffold (disabled)
+## Ship real logs (Vector DaemonSet)
 
-`vector.enabled=false` by default, on purpose. It tails every pod's
-stdout/stderr and is meant to POST batches to a Verdigris HTTP ingest endpoint —
-**which does not exist yet.** Today `vdg` ingests only via the CLI (synthetic
-generator + NDJSON file); there is no `/v1/ingest` route. The DaemonSet +
-`kubernetes_logs → remap → http` config are shipped as ready-to-activate wiring.
-When the ingest endpoint lands, set `vector.sinkEndpoint` and flip the flag. Until
-then, seed data with the CLI:
+`vdg serve` exposes `POST /v1/ingest` — it accepts NDJSON (one JSON object per
+line), a single JSON object, or a JSON array, routes each record by severity to
+a tier, writes Parquet, and updates the manifest. The wire schema is
+`ts_millis, level, service, message` (required) + optional `status, trace_id,
+attrs`; `level` is parsed case-insensitively (`error`/`ERROR`/`warning`/…).
+
+Enable the Vector DaemonSet to tail every pod's stdout/stderr and ship to it —
+off by default (opt-in), `sinkEndpoint` defaults to the in-cluster serve Service:
+
+```bash
+helm upgrade vdg deploy/helm/verdigris --reuse-values --set vector.enabled=true
+```
+
+Or push logs directly:
+
+```bash
+kubectl exec deploy/vdg-verdigris -- sh -c \
+  'printf "%s\n" "{\"ts_millis\":$(date +%s000),\"level\":\"info\",\"service\":\"demo\",\"message\":\"hello\"}" \
+   | curl -s -X POST http://localhost:8080/v1/ingest --data-binary @-'
+```
+
+Synthetic data (no shipper) still works too:
 
 ```bash
 kubectl exec deploy/vdg-verdigris -- vdg ingest --table logs --generate 20000
 ```
+
+> Single-writer caveat: `/v1/ingest` serializes writes within a process, but
+> multiple serve replicas ingesting to the same S3 table would still race on the
+> JSON manifest (real Iceberg commits fix this — a known gap). For S3 + Vector
+> today, keep ingest on a single writer (e.g. `replicaCount: 1`, or a dedicated
+> ingest Deployment) until Iceberg lands.
 
 ## Validate the chart without a cluster
 

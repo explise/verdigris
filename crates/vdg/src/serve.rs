@@ -1,9 +1,10 @@
 //! `vdg serve` — the HTTP shell. Hosts the static frontend AND the `/v1/*` API
 //! that `frontend/api.js` calls when `USE_MOCKS = false`.
 //!
-//! Endpoints backed by REAL data: /v1/query, /v1/query/estimate,
-//! /v1/storage/tiers, /v1/settings, and the volume/cost figures in /v1/metrics
-//! and /v1/cost (computed from the manifest + cost model). Endpoints we can't
+//! Endpoints backed by REAL data: /v1/ingest (writes logs to the store),
+//! /v1/query, /v1/query/estimate, /v1/storage/tiers, /v1/settings, and the
+//! volume/cost figures in /v1/metrics and /v1/cost (computed from the manifest
+//! + cost model). Endpoints we can't
 //! back yet (alerts, pipelines, time-series metrics) return shape-correct
 //! placeholders so the dashboards render — each marked `placeholder: true`.
 //! `tail()` stays client-side in the frontend, so there is no SSE endpoint.
@@ -21,16 +22,23 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
+use verdigris_core::batch::{BatchPolicy, LogRecord};
 use verdigris_core::config::{Config, StorageConfig};
 use verdigris_core::cost::{self, RetrievalMode};
 use verdigris_core::manifest::Manifest;
 use verdigris_core::model::Tier;
+use verdigris_ingest::wire::JsonLog;
 use verdigris_storage::Store;
 
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<Config>,
     table: Arc<String>,
+    /// Serializes ingest writes within this process. The manifest is read-
+    /// modify-written, so concurrent `POST /v1/ingest` calls (e.g. a Vector
+    /// DaemonSet fanning in) must not interleave. Cross-process/replica
+    /// concurrency still needs Iceberg commits — a known, documented gap.
+    ingest_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// An error response: a status code + a JSON `{ "error": ... }` body. Defaults to
@@ -92,11 +100,13 @@ pub async fn serve(cfg: Config, table: String, port: u16, frontend: PathBuf) -> 
     let state = AppState {
         cfg: Arc::new(cfg),
         table: Arc::new(table),
+        ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     let app = Router::new()
         .route("/v1/query", post(h_query))
         .route("/v1/query/estimate", post(h_estimate))
+        .route("/v1/ingest", post(h_ingest))
         .route("/v1/metrics", get(h_metrics))
         .route("/v1/alerts", get(h_alerts))
         .route("/v1/storage/tiers", get(h_storage))
@@ -113,6 +123,7 @@ pub async fn serve(cfg: Config, table: String, port: u16, frontend: PathBuf) -> 
     println!("verdigris serving on http://localhost:{port}");
     println!("  frontend: {}", frontend.display());
     println!("  api:      http://localhost:{port}/v1/query");
+    println!("  ingest:   POST http://localhost:{port}/v1/ingest  (NDJSON logs)");
     println!("  remember to set USE_MOCKS = false in frontend/api.js");
     axum::serve(listener, app).await.context("http server")?;
     Ok(())
@@ -210,6 +221,82 @@ async fn histogram(
             })
         })
         .collect())
+}
+
+// ───────────────────────── ingest ─────────────────────────
+
+/// Parse an ingest request body into records. Accepts three shapes so any
+/// sender works: NDJSON (one JSON object per line — what Vector's http sink
+/// emits), a single JSON object, or a JSON array of objects. Malformed lines
+/// are skipped and counted rather than failing the whole batch — a log shipper
+/// shouldn't lose 999 good lines to one bad one. Returns
+/// `(records, skipped, first_error)`.
+fn parse_ingest_body(body: &str) -> (Vec<LogRecord>, usize, Option<String>) {
+    let trimmed = body.trim_start();
+    let mut records = Vec::new();
+    let mut skipped = 0usize;
+    let mut first_err: Option<String> = None;
+
+    if trimmed.starts_with('[') {
+        // A single JSON array of records.
+        match serde_json::from_str::<Vec<JsonLog>>(trimmed) {
+            Ok(logs) => records.extend(logs.into_iter().map(LogRecord::from)),
+            Err(e) => {
+                skipped += 1;
+                first_err = Some(e.to_string());
+            }
+        }
+    } else {
+        // NDJSON (or a single object, which is just one line).
+        for (i, line) in body.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<JsonLog>(line) {
+                Ok(j) => records.push(j.into()),
+                Err(e) => {
+                    skipped += 1;
+                    if first_err.is_none() {
+                        first_err = Some(format!("line {}: {e}", i + 1));
+                    }
+                }
+            }
+        }
+    }
+    (records, skipped, first_err)
+}
+
+/// `POST /v1/ingest` — accept logs and write them to the store (routing each by
+/// severity to a tier, batching to Parquet, updating the manifest). This is the
+/// real ingestion path the Vector/Fluent-Bit DaemonSet ships to.
+async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
+    let (records, skipped, first_err) = parse_ingest_body(&body);
+    if records.is_empty() {
+        return Err(AppError::bad_request(first_err.unwrap_or_else(|| {
+            "no valid log records in request body (expected NDJSON, a JSON object, or a JSON array)"
+                .to_string()
+        })));
+    }
+    let ingested = records.len();
+
+    // Serialize writes: the manifest is read-modify-written, so concurrent
+    // ingests in this process must not interleave. Held only for the batch.
+    let _guard = st.ingest_lock.lock().await;
+
+    let s = store(&st)?;
+    let ingestor = verdigris_ingest::Ingestor::new(s, st.table.as_str());
+    let written = ingestor
+        .ingest(records, &st.cfg.routing, BatchPolicy::default())
+        .await?;
+    let bytes: u64 = written.iter().map(|f| f.bytes).sum();
+
+    Ok(Json(json!({
+        "ingested": ingested,
+        "skipped": skipped,
+        "filesWritten": written.len(),
+        "bytesWritten": bytes,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -452,4 +539,48 @@ async fn h_pipelines(State(st): State<AppState>) -> ApiResult {
         "ingestLag": format!("{lag_secs}s"),
         "parquetRolls": rolls,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use verdigris_core::model::Level;
+
+    #[test]
+    fn ndjson_parses_and_skips_bad_lines() {
+        let body = "{\"ts_millis\":1,\"level\":\"error\",\"service\":\"auth\",\"message\":\"boom\"}\n\
+                    not json\n\
+                    {\"ts_millis\":2,\"level\":\"INFO\",\"service\":\"api\",\"status\":200,\"message\":\"ok\"}";
+        let (recs, skipped, err) = parse_ingest_body(body);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(skipped, 1);
+        assert!(err.unwrap().starts_with("line 2:"));
+        assert_eq!(recs[0].level, Level::Error);
+        assert_eq!(recs[1].status, Some(200));
+    }
+
+    #[test]
+    fn json_array_parses() {
+        let body = "[{\"ts_millis\":1,\"level\":\"debug\",\"service\":\"x\",\"message\":\"a\"},\
+                     {\"ts_millis\":2,\"level\":\"warn\",\"service\":\"y\",\"message\":\"b\"}]";
+        let (recs, skipped, _) = parse_ingest_body(body);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(skipped, 0);
+        assert_eq!(recs[0].level, Level::Debug);
+    }
+
+    #[test]
+    fn single_object_parses() {
+        let (recs, skipped, _) =
+            parse_ingest_body("{\"ts_millis\":1,\"service\":\"x\",\"message\":\"m\"}");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(skipped, 0);
+        assert_eq!(recs[0].level, Level::Info); // defaulted
+    }
+
+    #[test]
+    fn empty_body_yields_no_records() {
+        let (recs, _, _) = parse_ingest_body("   \n  \n");
+        assert!(recs.is_empty());
+    }
 }

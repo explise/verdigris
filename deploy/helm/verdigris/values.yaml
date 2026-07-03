@@ -129,14 +129,13 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
-# --- Vector log-shipping DaemonSet (SCAFFOLD — disabled) --------------------
-# NOTE: this is intentionally off. It tails every pod's stdout/stderr and is
-# meant to ship to a Verdigris HTTP ingest endpoint — which does NOT exist yet
-# (ingest is currently CLI-only: synthetic generator + NDJSON file). Enabling
-# this today ships logs nowhere useful. It's shipped as a wiring reference for
-# when `/v1/ingest` lands. See deploy/README.md.
+# --- Vector log-shipping DaemonSet ------------------------------------------
+# Tails every pod's stdout/stderr and ships batched NDJSON to POST /v1/ingest.
+# Opt-in (off by default) — log shipping is a deployment choice. `sinkEndpoint`
+# defaults to the in-cluster serve Service, so `--set vector.enabled=true` alone
+# is enough. See deploy/README.md.
 vector:
   enabled: false
   image: timberio/vector:0.40.0-debian
-  # Where Vector should POST batched logs once the ingest endpoint exists.
-  sinkEndpoint: ""   # e.g. http://vdg-verdigris:8080/v1/ingest  (not built yet)
+  # Override to POST logs elsewhere; empty = the in-cluster serve Service.
+  sinkEndpoint: ""   # e.g. http://vdg-verdigris:8080/v1/ingest

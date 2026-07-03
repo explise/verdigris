@@ -3763,6 +3763,7 @@ dependencies = [
  "bytes",
  "object_store",
  "parquet",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

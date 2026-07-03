@@ -125,9 +125,9 @@ in-memory, or S3/MinIO — no recompile to switch.
   `deploy/helm/verdigris` — one `helm install` brings up serve+UI. Two paths: a
   zero-config local-fs demo (auto-seeded via initContainer) and EKS+S3 (IRSA auth,
   stateless replicas, seed hook Job). Lints clean; renders validated for both.
-  **Remaining:** the Vector/Fluent-Bit DaemonSet is shipped as a *disabled scaffold*
-  — it's blocked on a real HTTP ingest endpoint (`/v1/ingest`), which doesn't exist
-  yet (ingest is still CLI-only). See `deploy/README.md`.
+  The Vector DaemonSet is now **functional** (opt-in): it tails pod logs and ships
+  NDJSON to the real `POST /v1/ingest` endpoint (see below); `sinkEndpoint` defaults
+  to the in-cluster serve Service. See `deploy/README.md`.
 - **Step 7 — Frontend.** `frontend/` (vanilla) is wired and served. `web/` (Vite + SolidJS
   + TS + uPlot — the production rebuild, see `STATUS.md`) is mock-only and not yet served
   by `vdg`.
@@ -142,8 +142,12 @@ in-memory, or S3/MinIO — no recompile to switch.
   from real DataFusion-on-S3 runs.
 - **DataFusion-in-sim** — prove single-partition deterministic execution under madsim
   (the open ADR-001 question).
-- **Real ingestion sources** — OTLP receiver + Vector/Fluent-Bit sinks. Today ingest is
-  only synthetic generator + NDJSON file.
+- **Real ingestion sources** — _HTTP done._ `POST /v1/ingest` accepts NDJSON / a JSON
+  object / a JSON array (shared `verdigris_ingest::wire::JsonLog` format, case-insensitive
+  `level`), routes by severity, writes Parquet, updates the manifest; writes are
+  serialized per-process by a mutex. The Vector DaemonSet ships to it. **Still TODO:** a
+  native OTLP receiver, and cross-replica ingest safety (needs Iceberg commits — the
+  per-process mutex doesn't cover multiple serve pods writing one S3 table).
 - **Fast text search** over columnar Parquet — bloom filters / inverted index for
   "grep this stack trace".
 - **Schema evolution** beyond the `attrs_json` blob.
