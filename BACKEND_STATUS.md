@@ -120,8 +120,14 @@ in-memory, or S3/MinIO — no recompile to switch.
 ## What's left to do
 
 ### Remaining build steps
-- **Step 6 — Helm / packaging.** One `helm install` on EKS. Not started. Container image,
-  chart, and the Vector/Fluent-Bit DaemonSet wiring.
+- **Step 6 — Helm / packaging.** _Mostly done._ Multi-stage `Dockerfile` (builds
+  `vdg --features serve`, slim non-root runtime) + a Helm chart at
+  `deploy/helm/verdigris` — one `helm install` brings up serve+UI. Two paths: a
+  zero-config local-fs demo (auto-seeded via initContainer) and EKS+S3 (IRSA auth,
+  stateless replicas, seed hook Job). Lints clean; renders validated for both.
+  **Remaining:** the Vector/Fluent-Bit DaemonSet is shipped as a *disabled scaffold*
+  — it's blocked on a real HTTP ingest endpoint (`/v1/ingest`), which doesn't exist
+  yet (ingest is still CLI-only). See `deploy/README.md`.
 - **Step 7 — Frontend.** `frontend/` (vanilla) is wired and served. `web/` (Vite + SolidJS
   + TS + uPlot — the production rebuild, see `STATUS.md`) is mock-only and not yet served
   by `vdg`.

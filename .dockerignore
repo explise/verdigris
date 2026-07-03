@@ -1,0 +1,10 @@
+# Keep the build context tiny and the image clean.
+target/
+data/
+web/node_modules/
+web/dist/
+.git/
+**/.DS_Store
+docs/
+*.md
+!config/verdigris.toml

@@ -1,0 +1,142 @@
+# Default values for the Verdigris chart.
+# ---------------------------------------------------------------------------
+# Two ways to run:
+#
+#   1. Zero-config demo (default): storage.backend=local + persistence + seed.
+#      `helm install vdg deploy/helm/verdigris` gives you a queryable UI with
+#      synthetic logs, no AWS needed. Single replica (local fs is not shared).
+#
+#   2. Production on EKS + S3: set storage.backend=s3, point at your bucket, and
+#      attach an IRSA role via serviceAccount.annotations. Then the pods are
+#      stateless and you can scale replicaCount freely.
+# ---------------------------------------------------------------------------
+
+image:
+  repository: verdigris
+  tag: ""            # defaults to .Chart.appVersion when empty
+  pullPolicy: IfNotPresent
+pullSecrets: []
+
+# Logical table (key prefix in the store) that vdg serves and seeds.
+table: logs
+
+# Number of query/serve pods. Only honored for storage.backend=s3 — the local
+# backend is forced to 1 (a pod's filesystem is not shared).
+replicaCount: 1
+
+# --- Storage backend --------------------------------------------------------
+storage:
+  # "local" = filesystem (demo; needs persistence or an emptyDir).
+  # "s3"    = S3 / MinIO (production; the actual product).
+  backend: local
+
+  # Used when backend=local. Path inside the container.
+  localPath: /app/data
+
+  s3:
+    bucket: ""                 # REQUIRED when backend=s3
+    region: us-east-1
+    prefix: ""                 # optional key prefix within the bucket
+    endpoint: ""               # set for MinIO (e.g. http://minio:9000); omit for real AWS
+    allowHttp: false           # true for MinIO over plain HTTP
+    # Credentials. Preferred on EKS: leave these empty and use IRSA
+    # (serviceAccount.annotations). Only set these for MinIO / static creds,
+    # in which case wire them via an existing Secret rather than plaintext.
+    existingSecret: ""         # Secret with keys AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+    accessKeyId: ""            # (discouraged) inline; prefer existingSecret or IRSA
+    secretAccessKey: ""
+
+# Query engine dial (compute decoupled from storage).
+query:
+  modeledMibpsPerCore: 250.0
+  cores: 4
+
+# Severity -> tier placement (severity decides placement, never price).
+routing:
+  error: hot
+  warn: warm
+  info: warm
+  debug: cold
+
+# Age-based lifecycle (rendered into an S3 lifecycle policy by `vdg lifecycle`).
+lifecycle:
+  hotToWarmDays: 3
+  warmToColdDays: 30
+  expireDays: 400
+
+# --- Persistence (storage.backend=local only) -------------------------------
+persistence:
+  enabled: true
+  # If false, an emptyDir is used (data is lost on pod restart).
+  storageClass: ""
+  accessMode: ReadWriteOnce
+  size: 10Gi
+  existingClaim: ""
+
+# --- Seed: put synthetic logs in the store so the UI has data ---------------
+# For backend=local it runs as an initContainer (same pod, shared volume).
+# For backend=s3 it runs once as a post-install Job/hook.
+seed:
+  enabled: true
+  records: 20000
+
+serviceAccount:
+  create: true
+  name: ""
+  # On EKS, attach an IRSA role that can read/write the S3 bucket:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/verdigris-s3
+  annotations: {}
+
+service:
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: verdigris.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+# HTTP probes hit "/" (the served frontend), which is up once serve is ready.
+probes:
+  enabled: true
+
+podAnnotations: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# --- Vector log-shipping DaemonSet (SCAFFOLD — disabled) --------------------
+# NOTE: this is intentionally off. It tails every pod's stdout/stderr and is
+# meant to ship to a Verdigris HTTP ingest endpoint — which does NOT exist yet
+# (ingest is currently CLI-only: synthetic generator + NDJSON file). Enabling
+# this today ships logs nowhere useful. It's shipped as a wiring reference for
+# when `/v1/ingest` lands. See deploy/README.md.
+vector:
+  enabled: false
+  image: timberio/vector:0.40.0-debian
+  # Where Vector should POST batched logs once the ingest endpoint exists.
+  sinkEndpoint: ""   # e.g. http://vdg-verdigris:8080/v1/ingest  (not built yet)

@@ -1,0 +1,23 @@
+apiVersion: v2
+name: verdigris
+description: >-
+  S3-native, plug-and-play log storage and query engine. Logs are written as
+  compacted Parquet to your own S3 bucket and queried in place (no rehydration)
+  via DataFusion. One `helm install` brings up the query API + UI on EKS.
+type: application
+
+# Chart version tracks the chart itself; appVersion tracks the vdg binary.
+version: 0.1.0
+appVersion: "0.0.1"
+
+home: https://github.com/explise/verdigris
+sources:
+  - https://github.com/explise/verdigris
+keywords:
+  - logs
+  - observability
+  - s3
+  - parquet
+  - datafusion
+maintainers:
+  - name: Anurag Bhatt

@@ -1,0 +1,48 @@
+Verdigris is installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Storage backend: {{ .Values.storage.backend }}
+{{- if eq .Values.storage.backend "s3" }}
+  bucket: {{ .Values.storage.s3.bucket }}{{ with .Values.storage.s3.prefix }}  prefix: {{ . }}{{ end }}
+  region: {{ .Values.storage.s3.region }}
+  {{- if .Values.serviceAccount.annotations }}
+  credentials: via ServiceAccount annotations (IRSA)
+  {{- else if .Values.storage.s3.existingSecret }}
+  credentials: via Secret "{{ .Values.storage.s3.existingSecret }}"
+  {{- else if .Values.storage.s3.accessKeyId }}
+  credentials: inline (consider IRSA or an existingSecret instead)
+  {{- else }}
+  credentials: default AWS chain (env / instance profile)
+  {{- end }}
+{{- else }}
+  path: {{ .Values.storage.localPath }} ({{ if .Values.persistence.enabled }}PVC {{ .Values.persistence.size }}{{ else }}emptyDir — data lost on restart{{ end }})
+{{- end }}
+
+Open the UI / query API:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "verdigris.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+
+Then browse:  http://localhost:{{ .Values.service.port }}/
+Query API:    curl -s localhost:{{ .Values.service.port }}/v1/query -H 'content-type: application/json' -d '{"sql":"error"}'
+
+{{- if .Values.ingress.enabled }}
+
+Ingress is enabled at:
+{{- range .Values.ingress.hosts }}
+  http://{{ .host }}
+{{- end }}
+{{- end }}
+
+{{- if .Values.seed.enabled }}
+
+Seed: {{ .Values.seed.records }} synthetic records{{ if eq .Values.storage.backend "s3" }} (post-install Job){{ else }} (init container){{ end }} — the UI has data on first load.
+{{- else }}
+
+No seed data. Ingest with:  kubectl exec deploy/{{ include "verdigris.fullname" . }} -- vdg ingest --table {{ .Values.table }} --generate 20000
+{{- end }}
+
+{{- if .Values.vector.enabled }}
+
+WARNING: the Vector DaemonSet is enabled, but the Verdigris HTTP ingest endpoint
+it targets is not implemented yet — shipped logs will not be stored. See the
+DaemonSet template header and deploy/README.md.
+{{- end }}

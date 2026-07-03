@@ -1,0 +1,152 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "verdigris.fullname" . }}
+  labels:
+    {{- include "verdigris.labels" . | nindent 4 }}
+spec:
+  {{- if eq .Values.storage.backend "local" }}
+  # Local filesystem is not shared across pods — pin to a single replica.
+  replicas: 1
+  strategy:
+    type: Recreate
+  {{- else }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "verdigris.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Roll pods when the rendered config changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "verdigris.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "verdigris.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if and .Values.seed.enabled (eq .Values.storage.backend "local") }}
+      initContainers:
+        # Seed synthetic logs into the local store on first boot so the UI has
+        # data. Idempotent: skips if the table already has a manifest.
+        - name: seed
+          image: {{ include "verdigris.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              if vdg manifest --table {{ .Values.table | quote }} >/dev/null 2>&1; then
+                echo "table {{ .Values.table }} already seeded — skipping";
+              else
+                echo "seeding {{ .Values.seed.records }} synthetic records into {{ .Values.table }}";
+                vdg ingest --table {{ .Values.table | quote }} --generate {{ .Values.seed.records }};
+              fi
+          env:
+            - name: VERDIGRIS_CONFIG
+              value: /etc/verdigris/verdigris.toml
+          volumeMounts:
+            - name: config
+              mountPath: /etc/verdigris
+              readOnly: true
+            - name: data
+              mountPath: {{ .Values.storage.localPath }}
+      {{- end }}
+      containers:
+        - name: verdigris
+          image: {{ include "verdigris.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - serve
+            - --port
+            - {{ .Values.service.port | quote }}
+            - --table
+            - {{ .Values.table | quote }}
+            - --frontend
+            - /app/frontend
+          env:
+            - name: VERDIGRIS_CONFIG
+              value: /etc/verdigris/verdigris.toml
+            {{- if eq .Values.storage.backend "s3" }}
+            {{- with .Values.storage.s3.region }}
+            - name: AWS_REGION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if and (not .Values.storage.s3.existingSecret) .Values.storage.s3.accessKeyId }}
+            - name: AWS_ACCESS_KEY_ID
+              value: {{ .Values.storage.s3.accessKeyId | quote }}
+            - name: AWS_SECRET_ACCESS_KEY
+              value: {{ .Values.storage.s3.secretAccessKey | quote }}
+            {{- end }}
+            {{- end }}
+          {{- if and (eq .Values.storage.backend "s3") .Values.storage.s3.existingSecret }}
+          envFrom:
+            # Expects keys AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+            - secretRef:
+                name: {{ .Values.storage.s3.existingSecret }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          {{- if .Values.probes.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/verdigris
+              readOnly: true
+            {{- if eq .Values.storage.backend "local" }}
+            - name: data
+              mountPath: {{ .Values.storage.localPath }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "verdigris.fullname" . }}-config
+        {{- if eq .Values.storage.backend "local" }}
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "verdigris.pvcName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}

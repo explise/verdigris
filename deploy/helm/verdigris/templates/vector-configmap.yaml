@@ -1,0 +1,57 @@
+{{- if .Values.vector.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "verdigris.fullname" . }}-vector
+  labels:
+    {{- include "verdigris.labels" . | nindent 4 }}
+    app.kubernetes.io/component: log-shipper
+data:
+  vector.yaml: |
+    # SCAFFOLD config (see the DaemonSet header). Tails every pod's logs,
+    # reshapes them into the Verdigris log schema, and batches NDJSON to the
+    # ingest endpoint. Wire it up once vdg exposes an HTTP ingest route.
+    data_dir: /vector-data-dir
+    sources:
+      k8s:
+        type: kubernetes_logs
+
+    transforms:
+      to_verdigris:
+        type: remap
+        inputs: [k8s]
+        # Map into the ingest Arrow schema:
+        #   ts, level, service, status, message, trace_id, attrs_json
+        source: |
+          .ts = to_unix_timestamp(now(), unit: "milliseconds")
+          .level = downcase(string!(.level) ?? "info")
+          .service = .kubernetes.container_name ?? "unknown"
+          .message = string!(.message) ?? ""
+          .status = to_int(.status) ?? 0
+          .trace_id = .trace_id ?? ""
+          .attrs_json = encode_json({
+            "namespace": .kubernetes.pod_namespace,
+            "pod": .kubernetes.pod_name,
+            "node": .kubernetes.pod_node_name
+          })
+          # keep only the schema fields
+          . = { "ts": .ts, "level": .level, "service": .service,
+                "status": .status, "message": .message,
+                "trace_id": .trace_id, "attrs_json": .attrs_json }
+
+    sinks:
+      verdigris:
+        type: http
+        inputs: [to_verdigris]
+        uri: {{ .Values.vector.sinkEndpoint | quote }}
+        method: post
+        encoding:
+          codec: json          # newline-delimited JSON batches
+        framing:
+          method: newline_delimited
+        batch:
+          max_events: 1000
+          timeout_secs: 5
+        request:
+          retry_attempts: 5
+{{- end }}
