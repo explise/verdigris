@@ -1,0 +1,23 @@
+[package]
+name = "verdigris-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Ingest path: records -> Arrow -> Parquet bytes -> object store, plus the
+# (stand-in) manifest write. Arrow/Parquet encoding lives here, not in core, so
+# core stays light and sans-I/O. All bytes leave through the object_store seam.
+[dependencies]
+verdigris-core.workspace = true
+verdigris-storage.workspace = true
+object_store.workspace = true
+arrow.workspace = true
+parquet.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

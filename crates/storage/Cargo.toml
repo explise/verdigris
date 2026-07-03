@@ -1,0 +1,19 @@
+[package]
+name = "verdigris-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Object-store seam: one `ObjectStore` trait, swappable backends
+# (local filesystem / S3 / in-memory) selected by config.
+[dependencies]
+verdigris-core.workspace = true
+object_store.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tracing.workspace = true

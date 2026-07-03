@@ -1,0 +1,38 @@
+# Verdigris configuration — default profile.
+#
+# Out of the box this runs FULLY OFFLINE: logs land on the local filesystem,
+# queries are modeled. Switch `backend` to "s3" to point at real S3 or a local
+# MinIO; nothing else in the binary changes.
+
+[storage]
+backend = "local"
+path = "./data"
+
+# --- S3 / MinIO example (uncomment and set backend = "s3") -------------------
+# backend = "s3"
+# bucket = "verdigris"
+# region = "us-east-1"
+# endpoint = "http://localhost:9000"   # MinIO; omit for real AWS S3
+# allow_http = true                    # MinIO over plain HTTP
+# access_key_id = "minioadmin"         # or leave unset to use AWS env/profile
+# secret_access_key = "minioadmin"
+# prefix = ""
+
+[query]
+# Query speed is a provisioned dial, decoupled from storage.
+modeled_mibps_per_core = 250.0
+cores = 4
+
+# Severity-based write-time routing: which tier each level lands in.
+# Severity decides placement (prefix / storage class), never price.
+[routing]
+error = "hot"
+warn = "warm"
+info = "warm"
+debug = "cold"
+
+# Age-based lifecycle: rendered into an S3 lifecycle policy (`vdg lifecycle`).
+[lifecycle]
+hot_to_warm_days = 3
+warm_to_cold_days = 30
+expire_days = 400

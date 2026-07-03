@@ -1,0 +1,36 @@
+[package]
+name = "verdigris-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Query seam: the `ScanExecutor` boundary. Default build uses the
+# deterministic ModeledExecutor (pure Rust, no heavy deps, offline).
+# Real execution is DataFusion (pure Rust, builds on the same object_store
+# crate we standardize on) and is opt-in behind the `datafusion` feature so
+# the default build stays fast and offline. DuckDB is intentionally NOT used:
+# it is native C++ and opaque to the deterministic simulator (see ADR-001).
+[features]
+default = []
+datafusion = ["dep:datafusion", "dep:object_store", "dep:serde_json"]
+
+[dependencies]
+verdigris-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+# Only needed by the (gated) DataFusion engine; must be the same object_store
+# version DataFusion uses so Arc<dyn ObjectStore> unifies.
+object_store = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dependencies.datafusion]
+version = "54"
+optional = true
+default-features = true
+
+# Test-only: the executor tests use the tokio test harness.
+[dev-dependencies]
+tokio.workspace = true

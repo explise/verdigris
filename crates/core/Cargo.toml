@@ -1,0 +1,22 @@
+[package]
+name = "verdigris-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Sans-I/O control plane: pure logic + seam trait definitions.
+# MUST NOT depend on tokio, object_store, or any real I/O crate.
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+# toml is parsing-only here (pure, no I/O) — file reading lives in the shell.
+toml.workspace = true
+rand.workspace = true
+
+# Test-only: the async seam tests use the tokio test harness. Production code in
+# this crate stays free of tokio.
+[dev-dependencies]
+tokio.workspace = true

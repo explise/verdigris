@@ -1,0 +1,9 @@
+# Rust build output
+/target
+
+# Local data written by the default (offline) storage backend
+/data
+
+# Local overrides
+/config/local.toml
+.env

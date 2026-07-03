@@ -1,0 +1,38 @@
+[package]
+name = "vdg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "vdg"
+path = "src/main.rs"
+
+# The shell: CLI, config loading, and the REAL seam implementations
+# (RealClock, etc.) that wire the sans-I/O core to the outside world.
+[dependencies]
+verdigris-core.workspace = true
+verdigris-storage.workspace = true
+verdigris-query.workspace = true
+verdigris-ingest.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+toml.workspace = true
+object_store.workspace = true
+bytes.workspace = true
+futures.workspace = true
+axum = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+
+[features]
+# Forward the datafusion feature so `cargo run --features datafusion` wires real execution.
+datafusion = ["verdigris-query/datafusion"]
+# `serve` brings up the HTTP API + static frontend; it needs the query engine.
+serve = ["datafusion", "dep:axum", "dep:tower-http"]

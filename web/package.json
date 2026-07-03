@@ -1,0 +1,25 @@
+{
+  "name": "verdigris-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Verdigris UI — scale-oriented, Arrow-ready, multi-tenant (cloud + on-prem)",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@solidjs/router": "^0.14.7",
+    "@tanstack/solid-virtual": "^3.10.8",
+    "apache-arrow": "^17.0.0",
+    "solid-js": "^1.9.3",
+    "uplot": "^1.6.31"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10",
+    "vite-plugin-solid": "^2.10.2"
+  }
+}

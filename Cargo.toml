@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/storage",
+    "crates/query",
+    "crates/vdg", "crates/ingest",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/verdigris/verdigris"
+
+# Shared dependency versions live here; crates opt in with `dep.workspace = true`.
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "net", "signal"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+# Versions aligned with DataFusion 54 so our Arc<dyn ObjectStore> and Parquet
+# bytes interop cleanly with the query engine (object_store 0.13, arrow/parquet 58).
+object_store = { version = "0.13", features = ["aws"] }
+bytes = "1"
+rand = "0.8"
+futures = "0.3"
+arrow = "58"
+parquet = "58"
+serde_json = "1"
+
+verdigris-core = { path = "crates/core" }
+verdigris-storage = { path = "crates/storage" }
+verdigris-query = { path = "crates/query" }
+verdigris-ingest = { path = "crates/ingest" }

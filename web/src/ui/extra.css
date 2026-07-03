@@ -1,0 +1,37 @@
+/* Additions on top of the ported design system (app.css) for the Solid app:
+   org/env switcher, virtualized log table, and a couple of layout helpers. */
+
+/* org + env switcher in the sidebar brand */
+.switcher { position: relative; }
+.switcher .env { margin-top: 3px; font-size: 11.5px; color: var(--copper); font-family: var(--mono); background: none; border: none; padding: 0; cursor: pointer; display: inline-flex; gap: 4px; align-items: center; }
+.switcher .env:hover { color: var(--copper-bright); }
+.switcher .org { font-size: 10.5px; color: var(--ink-faint); margin-top: 1px; }
+.switcher .caret { font-size: 9px; opacity: .7; transition: transform .15s; }
+.switcher.open .caret { transform: rotate(180deg); }
+.switch-menu { position: absolute; top: 4px; left: 0; z-index: 60; background: var(--panel-2); border: 1px solid var(--line-hi); border-radius: var(--radius-sm); box-shadow: var(--shadow); padding: 6px; min-width: 230px; }
+.switch-menu .em-label { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-ghost); font-weight: 700; padding: 8px 10px 4px; }
+.switch-item { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-radius: 7px; cursor: pointer; font-size: 13px; color: var(--ink-dim); font-family: var(--mono); }
+.switch-item:hover { background: var(--panel-3); color: var(--ink); }
+.switch-item .region-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--copper-bright); flex: none; }
+.switch-item.sel { color: var(--copper-bright); }
+.switch-item .check { margin-left: auto; opacity: 0; }
+.switch-item.sel .check { opacity: 1; }
+
+/* virtualized log table */
+.vlog { flex: 1; min-height: 0; overflow: auto; position: relative; }
+.vlog-head { display: grid; grid-template-columns: 150px 86px 130px 1fr; position: sticky; top: 0; z-index: 3; background: var(--bg); border-bottom: 1px solid var(--line); }
+.vlog-head > div { padding: 12px 14px 10px; font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint); font-weight: 700; }
+.vrow { position: absolute; left: 0; right: 0; display: grid; grid-template-columns: 150px 86px 130px 1fr; align-items: center; font-family: var(--mono); font-size: 13px; border-bottom: 1px solid var(--line-soft); cursor: pointer; }
+.vrow:hover { background: var(--panel); }
+.vrow > div { padding: 0 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vrow .c-ts { color: var(--ink-dim); position: relative; }
+.vrow .c-ts::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--lvlc, transparent); }
+.vrow[data-lvl="ERROR"] { --lvlc: var(--error); } .vrow[data-lvl="WARN"] { --lvlc: var(--warn); }
+.vrow[data-lvl="INFO"] { --lvlc: var(--line-hi); } .vrow[data-lvl="DEBUG"] { --lvlc: var(--debug); }
+.vrow .c-lvl { font-weight: 700; font-size: 12px; }
+.vrow[data-lvl="ERROR"] .c-lvl { color: var(--error); } .vrow[data-lvl="WARN"] .c-lvl { color: var(--warn); }
+.vrow[data-lvl="INFO"] .c-lvl { color: var(--ink-dim); } .vrow[data-lvl="DEBUG"] .c-lvl { color: var(--debug); }
+.vrow .c-svc { color: var(--copper); } .vrow .c-msg { color: var(--ink); }
+
+.wire-badge { font-family: var(--mono); font-size: 11px; color: var(--copper); }
+.deploy-chip { font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; padding: 2px 7px; border-radius: 999px; background: var(--panel-3); color: var(--ink-dim); }

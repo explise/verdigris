@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Verdigris</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="app">
+  <!-- ───────── Sidebar (static shell; router only swaps .view) ───────── -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#04140f" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 7h16M4 12h16M4 17h11"/>
+        </svg>
+      </div>
+      <div>
+        <div class="name">Verdigris</div>
+        <button class="env" id="env-switch">prod-us-east-1 <span class="caret">▾</span></button>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav"><!-- built by app.js --></nav>
+
+    <div class="sidebar-foot">
+      <div class="bucket"><span class="dot"></span> s3://acme-logs-prod</div>
+      <div class="bucket-sub">data never leaves your account</div>
+    </div>
+  </aside>
+
+  <!-- ───────── Main view (router target) ───────── -->
+  <main class="main" id="view"></main>
+</div>
+
+<!-- modal mount -->
+<div class="scrim" id="scrim"></div>
+
+<script src="api.js"></script>
+<script src="charts.js"></script>
+<script src="pages.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
