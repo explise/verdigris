@@ -95,20 +95,25 @@ cargo run -- ingest --table logs --follow
 open http://localhost:8080
 ```
 
-Deploy on EKS + S3 with one `helm install` — see [Deployment](deployment.md).
+For the full step-by-step version of this loop, see the [Quickstart](getting-started.md).
+Deploy on EKS + S3 with one `helm install` — see [Install on EKS](install.md).
 
 ## Where to next
 
 <div class="grid cards" markdown>
 
-- :material-vector-arrange-below: **[Architecture](ARCHITECTURE.md)** — crates, the four
-  seams, write/read paths, tiering, the cost model, split-role deployment.
-- :material-api: **[HTTP API](API.md)** — every endpoint, request/response shapes, roles, auth.
-- :material-kubernetes: **[Deployment](deployment.md)** — the container image and Helm chart.
-- :material-flask-outline: **[Testing (DST)](dst-architecture.md)** — deterministic
-  simulation at trillion-row scale without running at scale.
-- :material-file-document-multiple-outline: **[Decision Records](adr/README.md)** — the
-  architecturally significant choices and their trade-offs.
+- :material-rocket-launch-outline: **[Quickstart](getting-started.md)** — the 5-minute
+  local loop: build, stream logs, open the UI, run a query.
+- :material-kubernetes: **[Install on EKS](install.md)** — production on your own S3
+  bucket with one `helm install`; IRSA, no static keys.
+- :material-upload-network: **[Sending logs](sending-logs.md)** — Vector, Fluent Bit, and
+  native OTLP/HTTP.
+- :material-database-search: **[Querying](querying.md)** — SQL, the search DSL, Arrow vs
+  JSON, and the live tail.
+- :material-cash-multiple: **[Cost & tiering](cost.md)** — storage priced by bytes,
+  compute as a dial, and the cold-scan cost estimator.
+- :material-vector-arrange-below: **[Internals](ARCHITECTURE.md)** — architecture, the
+  four seams, and deterministic simulation testing.
 
 </div>
 

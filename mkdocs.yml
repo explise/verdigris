@@ -63,12 +63,23 @@ validation:
 
 nav:
   - Home: index.md
-  - Architecture: ARCHITECTURE.md
-  - HTTP API: API.md
-  - Deployment: deployment.md
-  - Testing (DST): dst-architecture.md
-  - Decision Records:
-      - Overview: adr/README.md
-      - "ADR-0002 · Manifest as Iceberg stand-in": adr/0002-manifest-as-iceberg-standin.md
-      - "ADR-0003 · Ingest / query role split": adr/0003-ingest-query-role-split.md
+  - Get started:
+      - Quickstart: getting-started.md
+      - Install on EKS: install.md
+      - Sending logs: sending-logs.md
+  - Using Verdigris:
+      - Querying: querying.md
+      - Cost & tiering: cost.md
+      - Configuration: configuration.md
+      - FAQ: faq.md
+  - Reference:
+      - HTTP API: API.md
+  - Internals:
+      - Architecture: ARCHITECTURE.md
+      - Testing (DST): dst-architecture.md
+      - Deployment (chart internals): deployment.md
+      - Decision Records:
+          - Overview: adr/README.md
+          - "ADR-0002 · Manifest as Iceberg stand-in": adr/0002-manifest-as-iceberg-standin.md
+          - "ADR-0003 · Ingest / query role split": adr/0003-ingest-query-role-split.md
   - Contributing: contributing.md
