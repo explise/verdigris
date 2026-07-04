@@ -1,54 +1,466 @@
-/* Verdigris brand — oxidized-copper green/teal on a warm-dark canvas.
-   Tokens mirror frontend/styles.css so the docs site matches the product. */
+/* Verdigris docs — "warm paper" light theme.
+   Copper fresh-logs aging into verdigris: the visual system applied to the
+   real, S3-native / SQL / Helm-on-EKS product docs.
+
+   Fonts: Space Grotesk (headings), IBM Plex Sans (body), IBM Plex Mono (code).
+   Google Fonts are also requested by Material via theme.font; the @import here
+   guarantees Space Grotesk (which Material does not load) is available. */
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
 :root {
-  --vdg-bg: #0a0d0c;
-  --vdg-ink: #e9efea;
-  --vdg-copper: #2c9d85;
-  --vdg-copper-bright: #46c9ab;
-  --vdg-copper-soft: #6fded8;
-  --vdg-copper-deep: #0d3b32;
+  /* Warm-paper surfaces */
+  --vdg-paper:        #F3F1EA;  /* page background */
+  --vdg-card:         #FBFAF6;  /* cards / raised surfaces */
+  --vdg-panel:        #EDEAE0;  /* subtle sunk panel */
+  --vdg-ink:          #16211F;  /* primary text */
+  --vdg-ink-2:        #4a4d46;  /* secondary text */
+  --vdg-ink-3:        #5c5f57;  /* tertiary / muted */
+  --vdg-line:         #E1DDD1;  /* hairline */
+  --vdg-line-2:       #D8D4C8;  /* stronger hairline */
+
+  /* Brand accents — copper (fresh) aging to verdigris (settled) */
+  --vdg-copper:       #B06A3B;
+  --vdg-copper-light: #C98A55;  /* code-token copper */
+  --vdg-verdigris:    #2E8E7F;  /* primary */
+  --vdg-green:        #5C9A7A;
+  --vdg-green-deep:   #184F47;
+  --vdg-green-code:   #6FB6A9;  /* code-token green */
+
+  /* Dark code block surfaces (dark blocks on the light page) */
+  --vdg-code-bg:      #16211F;
+  --vdg-code-strip:   #1c2927;
+  --vdg-code-border:  #24312e;
+  --vdg-code-ink:     #cdd4d1;
 }
 
-/* Map Material's theme variables to the brand (slate scheme). */
-[data-md-color-scheme="slate"] {
-  --md-primary-fg-color: var(--vdg-copper);
-  --md-primary-fg-color--light: var(--vdg-copper-bright);
-  --md-primary-fg-color--dark: var(--vdg-copper-deep);
-  --md-accent-fg-color: var(--vdg-copper-bright);
-  --md-default-bg-color: var(--vdg-bg);
-  --md-typeset-a-color: var(--vdg-copper-bright);
-  --md-code-hl-string-color: var(--vdg-copper-soft);
+/* ── Map Material's variables to the brand (light "default" scheme) ─────── */
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color:        var(--vdg-verdigris);
+  --md-primary-fg-color--light: var(--vdg-green);
+  --md-primary-fg-color--dark:  var(--vdg-green-deep);
+  --md-primary-bg-color:        var(--vdg-paper);
+  --md-primary-bg-color--light: #eef4f1;
+
+  --md-accent-fg-color:         var(--vdg-verdigris);
+  --md-accent-fg-color--transparent: rgba(46, 142, 127, 0.1);
+
+  --md-default-bg-color:        var(--vdg-paper);
+  --md-default-fg-color:        var(--vdg-ink);
+  --md-default-fg-color--light: var(--vdg-ink-2);
+  --md-default-fg-color--lighter: var(--vdg-ink-3);
+
+  --md-typeset-color:           var(--vdg-ink);
+  --md-typeset-a-color:         var(--vdg-verdigris);
+
+  /* Footer & nav accents in settled verdigris */
+  --md-footer-bg-color:         var(--vdg-code-bg);
+  --md-footer-bg-color--dark:   #101a18;
 }
 
-/* Header + footer in deep patina rather than the default teal. */
-.md-header,
-.md-tabs {
-  background: linear-gradient(150deg, var(--vdg-copper), var(--vdg-copper-deep) 90%);
+/* ── Base surfaces ─────────────────────────────────────────────────────── */
+body,
+.md-main,
+.md-container {
+  background: var(--vdg-paper);
 }
 
-/* Landing hero used on the home page. */
+.md-typeset {
+  font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  color: var(--vdg-ink);
+}
+
+::selection {
+  background: var(--vdg-verdigris);
+  color: var(--vdg-paper);
+}
+
+/* ── Header: light paper with a copper→verdigris hairline underline ─────── */
+.md-header {
+  background: var(--vdg-card);
+  color: var(--vdg-ink);
+  border-bottom: 1px solid var(--vdg-line);
+  box-shadow: 0 1px 0 rgba(22, 33, 31, 0.03);
+}
+.md-header--shadow {
+  box-shadow: 0 2px 12px rgba(22, 33, 31, 0.06);
+}
+.md-header__title,
+.md-header__topic {
+  color: var(--vdg-ink);
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.md-header__button.md-logo img {
+  height: 1.7rem;
+  width: auto;
+}
+/* Thin aging gradient strip beneath the header. */
+.md-header::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  background: linear-gradient(90deg,
+    var(--vdg-copper) 0%,
+    var(--vdg-green) 40%,
+    var(--vdg-verdigris) 70%,
+    var(--vdg-green-deep) 100%);
+  opacity: 0.9;
+}
+
+/* Search widget on the light header. */
+.md-search__form {
+  background: var(--vdg-panel);
+  border: 1px solid var(--vdg-line);
+}
+.md-search__form:hover {
+  background: #e6e2d7;
+}
+[data-md-color-scheme="default"] .md-search__input::placeholder {
+  color: var(--vdg-ink-3);
+}
+[data-md-color-scheme="default"] .md-search__input,
+[data-md-color-scheme="default"] .md-search__icon {
+  color: var(--vdg-ink-2);
+}
+
+/* ── Headings in Space Grotesk ─────────────────────────────────────────── */
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3,
+.md-typeset h4,
+.md-typeset h5,
+.md-typeset h6 {
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--vdg-ink);
+}
+.md-typeset h1 {
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+.md-typeset h2 {
+  border-bottom: 1px solid var(--vdg-line);
+  padding-bottom: 0.3rem;
+}
+
+/* Links */
+.md-typeset a {
+  color: var(--vdg-verdigris);
+  text-decoration-color: rgba(46, 142, 127, 0.35);
+}
+.md-typeset a:hover {
+  color: var(--vdg-green-deep);
+}
+
+/* ── Navigation (left) + TOC (right) ───────────────────────────────────── */
+.md-nav {
+  color: var(--vdg-ink-2);
+}
+.md-nav__title {
+  color: var(--vdg-ink);
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.md-nav__link--active,
+.md-nav__link:focus,
+.md-nav__link:hover,
+.md-typeset .md-nav__link[for] {
+  color: var(--vdg-verdigris);
+}
+.md-nav__item .md-nav__link--active {
+  font-weight: 600;
+}
+/* TOC active marker */
+.md-nav--secondary .md-nav__link--active {
+  border-left: 2px solid var(--vdg-verdigris);
+  padding-left: 0.5rem;
+  margin-left: -0.6rem;
+}
+
+/* ── Inline code + dark code blocks ────────────────────────────────────── */
+.md-typeset code,
+.md-typeset kbd {
+  font-family: 'IBM Plex Mono', monospace;
+}
+/* Inline code: a warm panel chip. */
+.md-typeset :not(pre) > code {
+  background: var(--vdg-panel);
+  color: var(--vdg-green-deep);
+  border: 1px solid var(--vdg-line);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+}
+
+/* Fenced blocks: DARK ink slab on the light page — a signature of the design. */
+.md-typeset pre > code,
+.md-typeset .highlight pre,
+.md-typeset pre {
+  background: var(--vdg-code-bg);
+}
+.md-typeset .highlight,
+.md-typeset .highlighttable {
+  border: 1px solid var(--vdg-code-border);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(22, 33, 31, 0.08);
+}
+.md-typeset pre {
+  border-radius: 0;
+  margin: 1em 0;
+}
+.md-typeset pre > code {
+  color: var(--vdg-code-ink);
+  padding: 0.9rem 1rem;
+}
+.md-typeset .highlight > pre {
+  border-radius: 10px;
+}
+/* Standalone fenced block (no wrapper table): give it its own rounded frame. */
+.md-typeset > .highlight,
+.md-typeset details .highlight {
+  background: var(--vdg-code-bg);
+}
+/* Header strip for code with a filename / language label. */
+.md-typeset .highlighttable .filename,
+.md-typeset .highlight span.filename {
+  background: var(--vdg-code-strip);
+  color: var(--vdg-code-ink);
+  border-bottom: 1px solid var(--vdg-code-border);
+  font-family: 'IBM Plex Mono', monospace;
+}
+/* Copy button on dark blocks. */
+.md-typeset .highlight .md-clipboard {
+  color: rgba(205, 212, 209, 0.55);
+}
+.md-typeset .highlight .md-clipboard:hover {
+  color: var(--vdg-green-code);
+}
+/* Line numbers gutter on dark. */
+.md-typeset .highlighttable .linenos {
+  background: var(--vdg-code-strip);
+  color: rgba(205, 212, 209, 0.4);
+  border-right: 1px solid var(--vdg-code-border);
+}
+
+/* Syntax token accents — copper (fresh) & green (settled) on dark. */
+.md-typeset .highlight .k,   /* keyword */
+.md-typeset .highlight .kd,
+.md-typeset .highlight .kn,
+.md-typeset .highlight .kc,
+.md-typeset .highlight .ow { color: var(--vdg-copper-light); }
+
+.md-typeset .highlight .s,   /* strings */
+.md-typeset .highlight .s1,
+.md-typeset .highlight .s2,
+.md-typeset .highlight .sb,
+.md-typeset .highlight .se,
+.md-typeset .highlight .dl,
+.md-typeset .highlight .sd { color: var(--vdg-green-code); }
+
+.md-typeset .highlight .nf,  /* function / name accents */
+.md-typeset .highlight .nb,
+.md-typeset .highlight .nt { color: #8fc8bd; }
+
+.md-typeset .highlight .c,   /* comments */
+.md-typeset .highlight .c1,
+.md-typeset .highlight .cm,
+.md-typeset .highlight .cp { color: #7c8b87; font-style: italic; }
+
+.md-typeset .highlight .mi, /* numbers */
+.md-typeset .highlight .mf,
+.md-typeset .highlight .il { color: #d7a06b; }
+
+.md-typeset .highlight .o,  /* operators / punctuation */
+.md-typeset .highlight .p { color: #a9b4b0; }
+
+/* ── Admonitions / callouts: soft verdigris tint + rounded icon badge ───── */
+.md-typeset .admonition,
+.md-typeset details {
+  background: #E9F1ED;
+  border: 1px solid #CDE1D8;
+  border-left: 1px solid #CDE1D8;
+  border-radius: 10px;
+  box-shadow: none;
+  color: var(--vdg-ink);
+  font-size: 0.72rem;
+}
+.md-typeset .admonition-title,
+.md-typeset summary {
+  background: transparent;
+  color: var(--vdg-green-deep);
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+/* Replace Material's colored left bar with a rounded verdigris icon badge. */
+.md-typeset .admonition-title::before,
+.md-typeset summary::before {
+  background-color: #fff;
+  color: var(--vdg-verdigris);
+  border-radius: 6px;
+  width: 1.1rem;
+  height: 1.1rem;
+  top: 0.5rem;
+  left: 0.7rem;
+  padding: 0;
+  box-shadow: inset 0 0 0 1.5px var(--vdg-verdigris);
+  mask-position: center;
+  -webkit-mask-position: center;
+}
+.md-typeset .admonition-title,
+.md-typeset summary {
+  padding-left: 2.2rem;
+}
+/* Keep the accent bar itself verdigris across all admonition flavors. */
+.md-typeset .admonition,
+.md-typeset details,
+.md-typeset .note,
+.md-typeset .tip,
+.md-typeset .warning,
+.md-typeset .quote {
+  border-color: #CDE1D8;
+}
+/* "warning" gets a copper-tinted badge to signal caution without leaving palette. */
+.md-typeset .warning > .admonition-title,
+.md-typeset .warning > summary {
+  color: var(--vdg-copper);
+}
+.md-typeset .warning > .admonition-title::before,
+.md-typeset .warning > summary::before {
+  color: var(--vdg-copper);
+  box-shadow: inset 0 0 0 1.5px var(--vdg-copper);
+}
+
+/* ── Tables ────────────────────────────────────────────────────────────── */
+.md-typeset table:not([class]) {
+  background: var(--vdg-card);
+  border: 1px solid var(--vdg-line);
+  border-radius: 10px;
+  overflow: hidden;
+  font-size: 0.72rem;
+}
+.md-typeset table:not([class]) th {
+  background: var(--vdg-panel);
+  color: var(--vdg-ink);
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  border-bottom: 1px solid var(--vdg-line-2);
+}
+.md-typeset table:not([class]) td {
+  border-top: 1px solid var(--vdg-line);
+}
+.md-typeset table:not([class]) tr:hover {
+  background: rgba(46, 142, 127, 0.04);
+}
+
+/* ── Landing hero (index.md .vdg-hero) — light paper adaptation ─────────── */
 .vdg-hero {
-  padding: 2.2rem 0 1rem;
-  border-bottom: 1px solid rgba(111, 222, 216, 0.14);
-  margin-bottom: 1.4rem;
+  padding: 2.4rem 0 1.2rem;
+  border-bottom: 1px solid var(--vdg-line);
+  margin-bottom: 1.6rem;
+  position: relative;
 }
 .vdg-hero h1 {
-  font-size: 2.6rem;
-  line-height: 1.05;
-  margin: 0 0 0.3rem;
-  background: linear-gradient(120deg, var(--vdg-copper-soft), var(--vdg-copper));
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 2.8rem;
+  font-weight: 700;
+  line-height: 1.02;
+  letter-spacing: -0.035em;
+  margin: 0 0 0.35rem;
+  /* Copper → verdigris: fresh logs aging into settled patina. */
+  background: linear-gradient(100deg,
+    var(--vdg-copper) 0%,
+    var(--vdg-green) 45%,
+    var(--vdg-verdigris) 100%);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
 }
 .vdg-hero .tagline {
-  font-size: 1.05rem;
-  color: var(--vdg-copper-soft);
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-size: 1.1rem;
+  color: var(--vdg-ink-2);
   margin: 0;
 }
 
-/* Tier chips reused from the product palette. */
-.tier { font-weight: 600; border-radius: 4px; padding: 0.05em 0.45em; font-size: 0.85em; }
-.tier.hot  { color: #46c9ab; background: rgba(70, 201, 171, 0.12); }
-.tier.warm { color: #dca041; background: rgba(220, 160, 65, 0.12); }
-.tier.cold { color: #6b8f9e; background: rgba(107, 143, 158, 0.14); }
+/* ── Storage-tier chips (index.md) — warm-paper palette ────────────────── */
+.tier {
+  font-family: 'IBM Plex Mono', monospace;
+  font-weight: 600;
+  border-radius: 5px;
+  padding: 0.08em 0.5em;
+  font-size: 0.82em;
+  border: 1px solid transparent;
+}
+.tier.hot  { color: var(--vdg-copper);    background: rgba(176, 106, 59, 0.1);  border-color: rgba(176, 106, 59, 0.25); }
+.tier.warm { color: var(--vdg-green);      background: rgba(92, 154, 122, 0.12); border-color: rgba(92, 154, 122, 0.3); }
+.tier.cold { color: var(--vdg-green-deep); background: rgba(24, 79, 71, 0.1);    border-color: rgba(24, 79, 71, 0.25); }
+
+/* ── "Next steps" cards (.grid.cards) ──────────────────────────────────── */
+.md-typeset .grid.cards > ul > li,
+.md-typeset .grid.cards > :is(ul, ol) > li,
+.md-typeset .grid > .card {
+  background: var(--vdg-card);
+  border: 1px solid var(--vdg-line);
+  border-radius: 12px;
+  padding: 1rem 1.1rem;
+  transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+}
+.md-typeset .grid.cards > ul > li:hover,
+.md-typeset .grid.cards > :is(ul, ol) > li:hover,
+.md-typeset .grid > .card:hover {
+  transform: translateY(-2px);
+  border-color: var(--vdg-verdigris);
+  box-shadow: 0 6px 18px rgba(22, 33, 31, 0.08);
+}
+/* Card icons in copper→verdigris. */
+.md-typeset .grid.cards svg,
+.md-typeset .grid.cards .twemoji {
+  fill: var(--vdg-verdigris);
+  color: var(--vdg-verdigris);
+}
+.md-typeset .grid.cards > ul > li > p:first-child {
+  font-family: 'Space Grotesk', sans-serif;
+}
+/* Card link titles (the bold first line). */
+.md-typeset .grid.cards strong a {
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+/* ── Footer ────────────────────────────────────────────────────────────── */
+.md-footer-meta {
+  background: var(--vdg-code-strip);
+}
+
+/* ── Misc: horizontal rules, blockquotes ───────────────────────────────── */
+.md-typeset hr {
+  border-bottom: 1px solid var(--vdg-line);
+}
+.md-typeset blockquote {
+  border-left: 3px solid var(--vdg-verdigris);
+  color: var(--vdg-ink-2);
+}
+
+/* Buttons (e.g. .md-button) in brand verdigris. */
+.md-typeset .md-button {
+  border-radius: 8px;
+  border-color: var(--vdg-verdigris);
+  color: var(--vdg-verdigris);
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 500;
+}
+.md-typeset .md-button:hover,
+.md-typeset .md-button--primary {
+  background: var(--vdg-verdigris);
+  border-color: var(--vdg-verdigris);
+  color: var(--vdg-paper);
+}

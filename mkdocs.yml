@@ -19,11 +19,17 @@ site_dir: site
 theme:
   name: material
   language: en
+  logo: assets/logo.svg
+  favicon: assets/favicon.svg
   palette:
-    scheme: slate # dark, matching the brand's warm-dark canvas
+    # Light "warm paper" scheme; exact brand hues come from CSS overriding
+    # --md-primary-fg-color / --md-accent-fg-color in stylesheets/extra.css.
+    scheme: default
+    primary: teal
+    accent: teal
   font:
-    text: Inter
-    code: JetBrains Mono
+    text: IBM Plex Sans
+    code: IBM Plex Mono
   features:
     - navigation.sections
     - navigation.top
@@ -35,7 +41,6 @@ theme:
     - content.code.copy
     - content.code.annotate
   icon:
-    logo: material/layers-triple-outline
     repo: material/lock
 
 extra_css:

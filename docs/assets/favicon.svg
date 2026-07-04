@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="Verdigris">
+  <rect x="0" y="0" width="48" height="48" rx="10" fill="#16211F"/>
+  <rect x="8"  y="10"   width="26"  height="5.5" rx="2.75" fill="#B06A3B"/>
+  <rect x="37" y="9.75" width="5"   height="6"   rx="1.5"  fill="#B06A3B"/>
+  <rect x="8"  y="19.5" width="17"  height="5.5" rx="2.75" fill="#5C9A7A"/>
+  <rect x="8"  y="29"   width="24"  height="5.5" rx="2.75" fill="#2E8E7F"/>
+  <rect x="8"  y="38.5" width="13"  height="5.5" rx="2.75" fill="#184F47"/>
+</svg>
