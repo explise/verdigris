@@ -280,21 +280,80 @@
           ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>'
           : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>'}</div>
         <div class="amain">
-          <div class="atitle">${a.name} <span class="badge ${a.severity === "critical" ? "error" : a.severity === "warning" ? "warn" : "muted"}" style="margin-left:6px">${a.severity}</span></div>
+          <div class="atitle">${esc(a.name)} <span class="badge ${a.severity === "critical" ? "error" : a.severity === "warning" ? "warn" : "muted"}" style="margin-left:6px">${esc(a.severity)}</span></div>
           <div class="acond">${esc(a.cond)}</div>
         </div>
         <div class="ameta">
           <div class="badge ${a.state === "firing" ? "error" : "ok"}"><span class="dot" style="background:currentColor"></span>${a.state === "firing" ? "FIRING" : "OK"}</div>
-          <div style="margin-top:6px">now <b class="mono" style="color:${a.state === "firing" ? "var(--error)" : "var(--ink)"}">${a.value}</b> ${a.since !== "—" ? "· " + a.since : ""}</div>
-          <div class="muted mono" style="font-size:11px;margin-top:3px">${a.channel}</div>
+          <div style="margin-top:6px">now <b class="mono" style="color:${a.state === "firing" ? "var(--error)" : "var(--ink)"}">${esc(a.value)}</b> ${a.since !== "—" ? "· " + esc(a.since) : ""}</div>
+          <div class="muted mono" style="font-size:11px;margin-top:3px">${esc(a.channel)}</div>
         </div>
+        ${a.id ? `<button class="alert-del" data-del="${esc(a.id)}" title="Delete rule" aria-label="Delete rule">×</button>` : ""}
       </div>`;
-      return `${head("Alerts", `${firing.length} firing · ${list.length} rules`, `<button class="btn primary">${ICON.plus} New alert</button>`)}
+      const form = `<form id="alert-form" class="card pad-lg" style="display:none;margin-bottom:18px">
+        <div style="display:grid;grid-template-columns:1fr 2fr;gap:10px;margin-bottom:10px">
+          <input class="input" id="af-name" placeholder="Rule name — e.g. High error volume">
+          <input class="input mono" id="af-sql" placeholder="SELECT count(*) AS v FROM logs WHERE level = 'ERROR'">
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <select class="input" id="af-cmp" style="width:auto"><option value="gt">&gt;</option><option value="ge">&ge;</option><option value="lt">&lt;</option><option value="le">&le;</option></select>
+          <input class="input mono" id="af-th" type="number" step="any" placeholder="threshold" style="width:130px">
+          <select class="input" id="af-sev" style="width:auto"><option value="critical">critical</option><option value="warning" selected>warning</option><option value="info">info</option></select>
+          <input class="input mono" id="af-hook" placeholder="webhook URL (optional)" style="flex:1;min-width:180px">
+          <button class="btn primary" type="submit">Create rule</button>
+        </div>
+        <div class="muted" style="font-size:11.5px;margin-top:8px">The query must return one number (a <code>v</code> column, or its first numeric column). It's evaluated every 15s against the live table; the value is compared to the threshold.</div>
+      </form>`;
+      return `${head("Alerts", `${firing.length} firing · ${list.length} rules`, `<button class="btn primary" id="new-alert">${ICON.plus} New alert</button>`)}
         <div class="view-body">
+          ${form}
           ${firing.length ? `<div class="card pad-lg" style="border-color:rgba(227,106,106,.3);background:linear-gradient(90deg,var(--error-soft),transparent 50%);margin-bottom:18px">
-            <div class="row"><span class="pulse-dot live"></span><b style="color:var(--error)">${firing.length} alerts firing</b><span class="muted">— paging ${[...new Set(firing.map((f) => f.channel))].join(", ")}</span></div></div>` : ""}
-          ${list.map(row).join("")}
+            <div class="row"><span class="pulse-dot live"></span><b style="color:var(--error)">${firing.length} alert${firing.length > 1 ? "s" : ""} firing</b></div></div>` : ""}
+          ${list.length ? list.map(row).join("") : `<div class="empty">No alert rules yet. Click <b>New alert</b> to add one.</div>`}
         </div>`;
+    },
+    mount(view) {
+      const rerender = async () => { view.innerHTML = await Alerts.render(view); Alerts.mount(view); };
+      const form = view.querySelector("#alert-form");
+      const newBtn = view.querySelector("#new-alert");
+      if (newBtn && form) newBtn.addEventListener("click", () => {
+        const open = form.style.display !== "none";
+        form.style.display = open ? "none" : "block";
+        if (!open) view.querySelector("#af-name").focus();
+      });
+      if (form) form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const val = (id) => (view.querySelector(id).value || "").trim();
+        const body = {
+          name: val("#af-name"),
+          sql: val("#af-sql"),
+          comparator: view.querySelector("#af-cmp").value,
+          threshold: parseFloat(val("#af-th")) || 0,
+          severity: view.querySelector("#af-sev").value,
+        };
+        const hook = val("#af-hook");
+        if (hook) body.webhook = hook;
+        if (!body.name || !body.sql) return;
+        const btn = form.querySelector("button[type=submit]");
+        btn.disabled = true; btn.textContent = "Creating…";
+        try {
+          const res = await api.createAlert(body);
+          if (res && res.error) {
+            btn.disabled = false; btn.textContent = "Create rule";
+            alert("Alert rejected: " + res.error);
+            return;
+          }
+          await rerender();
+        } catch (err) {
+          btn.disabled = false; btn.textContent = "Create rule";
+          alert("Failed to create alert: " + err);
+        }
+      });
+      view.querySelectorAll(".alert-del").forEach((b) => b.addEventListener("click", async () => {
+        if (!confirm("Delete this alert rule?")) return;
+        try { await api.deleteAlert(b.dataset.del); await rerender(); }
+        catch (err) { alert("Failed to delete: " + err); }
+      }));
     },
   };
 

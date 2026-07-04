@@ -20,3 +20,4 @@ rand.workspace = true
 # this crate stays free of tokio.
 [dev-dependencies]
 tokio.workspace = true
+serde_json.workspace = true

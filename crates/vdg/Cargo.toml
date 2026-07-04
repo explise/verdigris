@@ -35,11 +35,14 @@ tower-http = { workspace = true, optional = true }
 # builds light and offline.
 aws-config = { version = "1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
+# `serve`-only: the alert engine POSTs to a webhook on fire/resolve. rustls to
+# avoid a system OpenSSL dependency; minimal features to keep the build light.
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
 
 [features]
 # Forward the datafusion feature so `cargo run --features datafusion` wires real execution.
 datafusion = ["verdigris-query/datafusion"]
 # `serve` brings up the HTTP API + static frontend; it needs the query engine.
-serve = ["datafusion", "dep:axum", "dep:tower-http"]
+serve = ["datafusion", "dep:axum", "dep:tower-http", "dep:reqwest"]
 # `apply` enables `vdg lifecycle --apply` (real S3 PutBucketLifecycleConfiguration).
 apply = ["dep:aws-config", "dep:aws-sdk-s3"]

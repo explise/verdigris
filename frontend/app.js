@@ -22,7 +22,7 @@
       { id: "logs", label: "Logs" },
       { id: "tail", label: "Live tail" },
       { id: "dashboards", label: "Dashboards" },
-      { id: "alerts", label: "Alerts", count: 2 },
+      { id: "alerts", label: "Alerts" },
     ]},
     { group: "Operate", items: [
       { id: "storage", label: "Storage tiers" },

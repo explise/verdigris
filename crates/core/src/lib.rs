@@ -7,6 +7,7 @@
 //! what lets the whole control plane run deterministically under simulation.
 //! See `docs/dst-architecture.md`.
 
+pub mod alert;
 pub mod batch;
 pub mod clock;
 pub mod config;

@@ -35,6 +35,15 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use axum::extract::Path as AxPath;
+use axum::routing::delete;
+use object_store::path::Path as ObjPath;
+use object_store::ObjectStoreExt;
+use verdigris_core::alert::{
+    self, Alert, AlertRule, AlertStatus, AlertsDoc, Comparator, State as AlertState, Transition,
+};
 use verdigris_core::batch::{BatchPolicy, LogRecord};
 use verdigris_core::config::{Config, StorageConfig};
 use verdigris_core::cost::{self, RetrievalMode};
@@ -84,6 +93,11 @@ struct AppState {
     /// DaemonSet fanning in) must not interleave. Cross-process/replica
     /// concurrency still needs Iceberg commits — a known, documented gap.
     ingest_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes writes to the alerts doc — a scheduler tick and a concurrent
+    /// create/delete must not clobber each other's read-modify-write.
+    alerts_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Monotonic suffix for generated alert ids within this process.
+    alert_seq: Arc<AtomicU64>,
 }
 
 /// An error response: a status code + a JSON `{ "error": ... }` body. Defaults to
@@ -139,6 +153,187 @@ async fn manifest(st: &AppState) -> anyhow::Result<(Store, Manifest)> {
     Ok((s, m))
 }
 
+// ───────────────────────── alerting ─────────────────────────
+
+fn alerts_path(table: &str) -> ObjPath {
+    ObjPath::from(format!("{table}/_metadata/alerts.json"))
+}
+
+async fn load_alerts(s: &Store, table: &str) -> anyhow::Result<AlertsDoc> {
+    match s.get(&alerts_path(table)).await {
+        Ok(res) => {
+            let bytes = res.bytes().await?;
+            serde_json::from_slice(&bytes).context("parsing alerts.json")
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(AlertsDoc::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn save_alerts(s: &Store, table: &str, doc: &AlertsDoc) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(doc).context("serializing alerts.json")?;
+    s.put(&alerts_path(table), bytes.into()).await?;
+    Ok(())
+}
+
+/// Run a rule's SQL and pull out its single numeric result — the `v` column if
+/// present, else the first numeric column of the first row.
+async fn measure(s: &Store, table: &str, files: &[String], sql: &str) -> anyhow::Result<f64> {
+    let rows = verdigris_query::engine::query_table_json(s.clone(), table, files, sql).await?;
+    let Some(Value::Object(row)) = rows.into_iter().next() else {
+        return Ok(0.0);
+    };
+    if let Some(v) = row.get("v").and_then(Value::as_f64) {
+        return Ok(v);
+    }
+    for val in row.values() {
+        if let Some(n) = val.as_f64() {
+            return Ok(n);
+        }
+    }
+    Ok(0.0)
+}
+
+/// One evaluation pass over every enabled rule: measure, advance state, fire the
+/// webhook on OK↔Firing transitions, and persist. `lock` serializes this against
+/// concurrent create/delete so the read-modify-write of the doc is atomic.
+async fn evaluate_all(s: &Store, table: &str, lock: &tokio::sync::Mutex<()>) -> anyhow::Result<()> {
+    let _g = lock.lock().await;
+    let mut doc = load_alerts(s, table).await?;
+    if doc.alerts.is_empty() {
+        return Ok(());
+    }
+    let m = verdigris_ingest::Ingestor::new(s.clone(), table)
+        .load_manifest()
+        .await?;
+    let files: Vec<String> = m.files.iter().map(|f| f.path.clone()).collect();
+    let now = crate::now_millis() as u64;
+    for a in doc.alerts.iter_mut() {
+        if !a.rule.enabled {
+            continue;
+        }
+        let value = match measure(s, table, &files, &a.rule.sql).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(rule = %a.rule.name, error = %e, "alert eval failed");
+                continue;
+            }
+        };
+        let (next, transition) = alert::evaluate(&a.rule, &a.status, value, now);
+        a.status = next;
+        if matches!(transition, Transition::Fired | Transition::Resolved) {
+            tracing::info!(rule = %a.rule.name, ?transition, value, "alert transition");
+            if let Some(url) = a.rule.webhook.clone() {
+                let firing = matches!(transition, Transition::Fired);
+                let payload = json!({
+                    "alert": a.rule.name,
+                    "severity": a.rule.severity,
+                    "state": if firing { "firing" } else { "resolved" },
+                    "value": value,
+                    "threshold": a.rule.threshold,
+                });
+                tokio::spawn(async move {
+                    if let Err(e) = notify_webhook(&url, payload).await {
+                        tracing::warn!(error = %e, "alert webhook failed");
+                    }
+                });
+            }
+        }
+    }
+    save_alerts(s, table, &doc).await?;
+    Ok(())
+}
+
+async fn notify_webhook(url: &str, payload: Value) -> anyhow::Result<()> {
+    reqwest::Client::new()
+        .post(url)
+        .json(&payload)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// Seed two illustrative rules the first time a table is served, so the Alerts
+/// page shows a real firing + OK example instead of an empty screen. No-op once
+/// any rule exists.
+async fn seed_example_alerts(
+    s: &Store,
+    table: &str,
+    lock: &tokio::sync::Mutex<()>,
+) -> anyhow::Result<()> {
+    let _g = lock.lock().await;
+    if !load_alerts(s, table).await?.alerts.is_empty() {
+        return Ok(());
+    }
+    let now = crate::now_millis() as u64;
+    let mk = |id: &str, name: &str, sql: String, cmp: Comparator, threshold: f64, sev: &str| Alert {
+        rule: AlertRule {
+            id: id.to_string(),
+            name: name.to_string(),
+            sql,
+            comparator: cmp,
+            threshold,
+            severity: sev.to_string(),
+            webhook: None,
+            enabled: true,
+        },
+        status: AlertStatus::initial(now),
+    };
+    let doc = AlertsDoc {
+        alerts: vec![
+            mk(
+                "seed-error-volume",
+                "High error volume",
+                format!("SELECT count(*) AS v FROM {table} WHERE level = 'ERROR'"),
+                Comparator::Gt,
+                1000.0,
+                "critical",
+            ),
+            mk(
+                "seed-auth-5xx",
+                "Auth 5xx surge",
+                format!("SELECT count(*) AS v FROM {table} WHERE service = 'auth' AND status >= 500"),
+                Comparator::Gt,
+                100_000.0,
+                "warning",
+            ),
+        ],
+    };
+    save_alerts(s, table, &doc).await
+}
+
+fn humanize_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+fn fmt_num(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+fn webhook_host(url: &str) -> String {
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url)
+        .to_string()
+}
+
 fn parse_tier(s: &str) -> Option<Tier> {
     match s {
         "hot" => Some(Tier::Hot),
@@ -171,7 +366,29 @@ pub async fn serve(
         cfg: Arc::new(cfg),
         table: Arc::new(table),
         ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
+        alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
+        alert_seq: Arc::new(AtomicU64::new(0)),
     };
+
+    // Alert evaluator. On a writer role (the single manifest writer owns alert
+    // state), seed illustrative rules the first time, evaluate once immediately
+    // so the first GET has real state, then re-evaluate on a fixed cadence.
+    if role.serves_writes() {
+        if let Ok(s) = store(&state) {
+            let table = state.table.clone();
+            let lock = state.alerts_lock.clone();
+            let _ = seed_example_alerts(&s, table.as_str(), &lock).await;
+            let _ = evaluate_all(&s, table.as_str(), &lock).await;
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    if let Err(e) = evaluate_all(&s, table.as_str(), &lock).await {
+                        tracing::warn!(error = %e, "alert scheduler tick failed");
+                    }
+                }
+            });
+        }
+    }
 
     // Build the `/v1/*` surface for this role. Auth (if enabled) wraps ONLY this
     // sub-router, so the static frontend and /config.json below stay open.
@@ -192,7 +409,8 @@ pub async fn serve(
             .route("/v1/query", post(h_query))
             .route("/v1/query/estimate", post(h_estimate))
             .route("/v1/metrics", get(h_metrics))
-            .route("/v1/alerts", get(h_alerts))
+            .route("/v1/alerts", get(h_alerts).post(h_alert_create))
+            .route("/v1/alerts/{id}", delete(h_alert_delete))
             .route("/v1/storage/tiers", get(h_storage))
             .route("/v1/cost", get(h_cost))
             .route("/v1/pipelines", get(h_pipelines))
@@ -818,9 +1036,110 @@ async fn h_cost(State(st): State<AppState>) -> ApiResult {
     })))
 }
 
-async fn h_alerts(State(_st): State<AppState>) -> ApiResult {
-    // No alerting engine yet (future work).
-    Ok(Json(json!([])))
+async fn h_alerts(State(st): State<AppState>) -> ApiResult {
+    let s = store(&st)?;
+    let doc = load_alerts(&s, st.table.as_str()).await?;
+    let now = crate::now_millis() as u64;
+    let out: Vec<Value> = doc
+        .alerts
+        .iter()
+        .map(|a| {
+            let firing = matches!(a.status.state, AlertState::Firing);
+            let since = if firing && a.status.last_eval_ms != 0 {
+                humanize_ms(now.saturating_sub(a.status.since_ms))
+            } else {
+                "—".to_string()
+            };
+            let channel = a
+                .rule
+                .webhook
+                .as_deref()
+                .map(webhook_host)
+                .unwrap_or_else(|| "—".to_string());
+            json!({
+                "id": a.rule.id,
+                "name": a.rule.name,
+                "state": if firing { "firing" } else { "ok" },
+                "severity": a.rule.severity,
+                "cond": format!("{}  {} {}", a.rule.sql, a.rule.comparator.symbol(), fmt_num(a.rule.threshold)),
+                "value": fmt_num(a.status.value),
+                "since": since,
+                "channel": channel,
+                "enabled": a.rule.enabled,
+            })
+        })
+        .collect();
+    Ok(Json(Value::Array(out)))
+}
+
+fn default_comparator() -> Comparator {
+    Comparator::Gt
+}
+fn default_alert_severity() -> String {
+    "warning".to_string()
+}
+
+#[derive(Deserialize)]
+struct NewAlert {
+    name: String,
+    /// SQL returning one number (its `v` column, or first numeric column).
+    sql: String,
+    #[serde(default = "default_comparator")]
+    comparator: Comparator,
+    threshold: f64,
+    #[serde(default = "default_alert_severity")]
+    severity: String,
+    #[serde(default)]
+    webhook: Option<String>,
+}
+
+async fn h_alert_create(
+    State(st): State<AppState>,
+    Json(req): Json<NewAlert>,
+) -> Result<Response, AppError> {
+    if req.name.trim().is_empty() || req.sql.trim().is_empty() {
+        return Err(AppError::bad_request("name and sql are required"));
+    }
+    let s = store(&st)?;
+    let _g = st.alerts_lock.lock().await;
+    let mut doc = load_alerts(&s, st.table.as_str()).await?;
+    let now = crate::now_millis() as u64;
+    let seq = st.alert_seq.fetch_add(1, Ordering::Relaxed);
+    let rule = AlertRule {
+        id: format!("alert-{now}-{seq}"),
+        name: req.name,
+        sql: req.sql,
+        comparator: req.comparator,
+        threshold: req.threshold,
+        severity: req.severity,
+        webhook: req.webhook.filter(|w| !w.trim().is_empty()),
+        enabled: true,
+    };
+    // Evaluate once now — this both validates the SQL (a broken query → 400) and
+    // seeds the rule's initial firing/OK state so the UI shows it immediately.
+    let m = verdigris_ingest::Ingestor::new(s.clone(), st.table.as_str())
+        .load_manifest()
+        .await?;
+    let files: Vec<String> = m.files.iter().map(|f| f.path.clone()).collect();
+    let value = measure(&s, st.table.as_str(), &files, &rule.sql)
+        .await
+        .map_err(AppError::bad_request)?;
+    let (status, _t) = alert::evaluate(&rule, &AlertStatus::initial(now), value, now);
+    let id = rule.id.clone();
+    doc.alerts.push(Alert { rule, status });
+    save_alerts(&s, st.table.as_str(), &doc).await?;
+    Ok((StatusCode::CREATED, Json(json!({ "id": id }))).into_response())
+}
+
+async fn h_alert_delete(State(st): State<AppState>, AxPath(id): AxPath<String>) -> ApiResult {
+    let s = store(&st)?;
+    let _g = st.alerts_lock.lock().await;
+    let mut doc = load_alerts(&s, st.table.as_str()).await?;
+    let before = doc.alerts.len();
+    doc.alerts.retain(|a| a.rule.id != id);
+    let removed = doc.alerts.len() != before;
+    save_alerts(&s, st.table.as_str(), &doc).await?;
+    Ok(Json(json!({ "removed": removed })))
 }
 
 async fn h_pipelines(State(st): State<AppState>) -> ApiResult {

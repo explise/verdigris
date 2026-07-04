@@ -2702,6 +2702,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -3769,6 +3770,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -4754,6 +4756,7 @@ dependencies = [
  "clap",
  "futures",
  "object_store",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -4775,6 +4778,7 @@ dependencies = [
  "async-trait",
  "rand 0.8.6",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "toml",
@@ -4959,6 +4963,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

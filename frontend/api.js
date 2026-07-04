@@ -151,6 +151,24 @@
       };
     },
 
+    async createAlert(body) {
+      if (!USE_MOCKS)
+        return fetch(`${BASE}/v1/alerts`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }).then((r) => r.json());
+      await wait(80);
+      return { id: "mock-" + Date.now() };
+    },
+
+    async deleteAlert(id) {
+      if (!USE_MOCKS)
+        return fetch(`${BASE}/v1/alerts/${encodeURIComponent(id)}`, { method: "DELETE" }).then((r) => r.json());
+      await wait(60);
+      return { removed: true };
+    },
+
     async alerts() {
       if (!USE_MOCKS) return fetch(`${BASE}/v1/alerts`).then((r) => r.json());
       await wait(90);
