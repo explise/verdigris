@@ -154,7 +154,7 @@ body,
   text-decoration-color: rgba(46, 142, 127, 0.35);
 }
 .md-typeset a:hover {
-  color: var(--vdg-green-deep);
+  color: var(--vdg-verdigris);
 }
 
 /* ── Navigation (left) + TOC (right) ───────────────────────────────────── */
@@ -191,7 +191,7 @@ body,
 /* Inline code: a warm panel chip. */
 .md-typeset :not(pre) > code {
   background: var(--vdg-panel);
-  color: var(--vdg-green-deep);
+  color: var(--vdg-verdigris);
   border: 1px solid var(--vdg-line);
   border-radius: 4px;
   padding: 0.1em 0.35em;
@@ -293,7 +293,7 @@ body,
 .md-typeset .admonition-title,
 .md-typeset summary {
   background: transparent;
-  color: var(--vdg-green-deep);
+  color: var(--vdg-verdigris);
   font-family: 'Space Grotesk', sans-serif;
   font-weight: 600;
   letter-spacing: -0.01em;
@@ -326,15 +326,15 @@ body,
 .md-typeset .quote {
   border-color: #CDE1D8;
 }
-/* "warning" gets a copper-tinted badge to signal caution without leaving palette. */
+/* Keep every admonition flavor on the same verdigris accent for consistency. */
 .md-typeset .warning > .admonition-title,
 .md-typeset .warning > summary {
-  color: var(--vdg-copper);
+  color: var(--vdg-verdigris);
 }
 .md-typeset .warning > .admonition-title::before,
 .md-typeset .warning > summary::before {
-  color: var(--vdg-copper);
-  box-shadow: inset 0 0 0 1.5px var(--vdg-copper);
+  color: var(--vdg-verdigris);
+  box-shadow: inset 0 0 0 1.5px var(--vdg-verdigris);
 }
 
 /* ── Tables ────────────────────────────────────────────────────────────── */
