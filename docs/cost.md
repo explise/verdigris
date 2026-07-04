@@ -1,9 +1,8 @@
 # Cost & tiering
 
-The cost model *is* the product. Two ideas, borrowed deliberately from studying Datadog Flex
-Logs, and carried through the whole system:
+The cost model *is* the product. Two ideas carried through the whole system:
 
-1. **Storage is priced by bytes in S3** — effectively free relative to SaaS log vendors.
+1. **Storage is priced by bytes in S3** — effectively free relative to hosted log services.
    Severity only decides which prefix / storage class a log lands in. Placement, never price.
 2. **Query speed is a separately provisioned dial (compute), decoupled from storage.** Want
    fast? Provision more query cores. Want cheap? Fewer cores, slower scans from colder tiers.

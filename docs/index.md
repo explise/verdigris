@@ -7,7 +7,7 @@
 </div>
 
 **Verdigris** is a plug-and-play, S3-native log storage and query engine written in Rust —
-a self-hostable Datadog alternative for teams who want their log data to stay in **their
+a self-hostable log platform for teams who want their log data to stay in **their
 own cloud account**. Logs are written as compacted Parquet to the customer's own S3 bucket
 and queried **in place**: no per-GB ingestion margin, no rehydration toll, no proprietary
 query language.
@@ -60,7 +60,7 @@ never price.
 
 Storage tiers: <span class="tier hot">hot</span> <span class="tier warm">warm</span>
 <span class="tier cold">cold</span> — decided at write time by severity, aged across S3
-storage classes by lifecycle policy. See [Architecture](ARCHITECTURE.md) for the full
+storage classes by lifecycle policy. See [Cost & tiering](cost.md) for the full
 breakdown.
 
 ## Highlights
@@ -75,8 +75,6 @@ breakdown.
   the millions of tiny Parquet files streaming logs produce.
 - **Concurrency-safe commits** — content-addressed files + optimistic (compare-and-swap)
   manifest commits, so multiple writers never corrupt or lose data.
-- **Deterministic by construction** — nondeterminism lives only behind four seams, so
-  trillion-row scale is testable in [simulation](dst-architecture.md), not just production.
 - **One `helm install`, done** — a single binary + Helm chart brings up ingest, query, UI,
   and tiering on EKS. Data lands in your bucket via IRSA — no static keys.
 
@@ -112,8 +110,8 @@ Deploy on EKS + S3 with one `helm install` — see [Install on EKS](install.md).
   JSON, and the live tail.
 - :material-cash-multiple: **[Cost & tiering](cost.md)** — storage priced by bytes,
   compute as a dial, and the cold-scan cost estimator.
-- :material-vector-arrange-below: **[Internals](ARCHITECTURE.md)** — architecture, the
-  four seams, and deterministic simulation testing.
+- :material-cog-outline: **[Configuration](configuration.md)** — storage, tiers,
+  severity routing, and API authentication.
 
 </div>
 

@@ -7,7 +7,7 @@
 site_name: Verdigris
 site_description: >-
   S3-native log storage & query engine in Rust — the layer your infrastructure
-  leaves behind. A self-hostable Datadog alternative that keeps log data in your
+  leaves behind. A self-hostable log platform that keeps log data in your
   own cloud account.
 site_url: https://explise.github.io/verdigris/
 docs_dir: docs

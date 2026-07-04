@@ -26,7 +26,7 @@ Rows carry these fields:
 
 ## The search DSL
 
-The search bar speaks a Datadog-ish query language. The grammar (v1):
+The search bar speaks a concise, familiar query language. The grammar (v1):
 
 ```text
 query   := term* ( '|' command )*
