@@ -62,6 +62,16 @@ export interface Alert {
   cond: string; value: string; since: string; channel: string;
 }
 
+/** Payload to create an alert rule: a SQL query returning one number, compared
+    to a threshold. Mirrors the backend's `POST /v1/alerts` body. */
+export interface NewAlert {
+  name: string; sql: string;
+  comparator: "gt" | "ge" | "lt" | "le";
+  threshold: number;
+  severity: "critical" | "warning" | "info";
+  webhook?: string;
+}
+
 export interface Tier {
   id: TierId; name: string; class: string;
   bytesGB: number; objects: string; perMonth: number; age: string; pct: number;

@@ -4,7 +4,7 @@
    pages render identically whether data is mocked or live.
    ═══════════════════════════════════════════════════════════════════ */
 import type {
-  QueryResult, EstimateResult, Metrics, Alert, Storage, Cost, Pipelines, Settings, LogRow, Level, TierId,
+  QueryResult, EstimateResult, Metrics, Alert, NewAlert, Storage, Cost, Pipelines, Settings, LogRow, Level, TierId,
 } from "./types";
 import { TIER_ECON } from "./types";
 
@@ -80,6 +80,14 @@ export const mock = {
         p99: { value: "1.24", unit: "s", delta: -4.2 }, stored: { value: "412", unit: "GB", delta: 2.1 },
       },
     };
+  },
+  async createAlert(_body: NewAlert): Promise<{ id: string }> {
+    await wait(80);
+    return { id: "mock-" + Date.now() };
+  },
+  async deleteAlert(_id: string): Promise<{ removed: boolean }> {
+    await wait(60);
+    return { removed: true };
   },
   async alerts(): Promise<Alert[]> {
     await wait(80);

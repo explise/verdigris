@@ -11,10 +11,10 @@
    ═══════════════════════════════════════════════════════════════════ */
 import { getConfig } from "@/config/runtime";
 import type { Scope } from "./transport";
-import { json, queryTable, eventSourceUrl } from "./transport";
+import { json, send, queryTable, eventSourceUrl } from "./transport";
 import { mock } from "./mock";
 import type {
-  QueryResult, QueryStats, HistogramBucket, EstimateResult, Metrics, Alert, Storage, Cost, Pipelines, Settings, LogRow, TierId,
+  QueryResult, QueryStats, HistogramBucket, EstimateResult, Metrics, Alert, NewAlert, Storage, Cost, Pipelines, Settings, LogRow, TierId,
 } from "./types";
 
 /** Backend rows carry attributes as a JSON string (`attrs_json`, the schema-
@@ -41,6 +41,8 @@ export interface Api {
   tail(onMsg: (e: LogRow) => void, every?: number): { stop(): void };
   metrics(): Promise<Metrics>;
   alerts(): Promise<Alert[]>;
+  createAlert(body: NewAlert): Promise<{ id: string }>;
+  deleteAlert(id: string): Promise<{ removed: boolean }>;
   storage(): Promise<Storage>;
   cost(): Promise<Cost>;
   pipelines(): Promise<Pipelines>;
@@ -94,6 +96,8 @@ export function createApi(scope: Scope): Api {
     },
     metrics() { return live ? json<Metrics>("/metrics", scope) : mock.metrics(); },
     alerts() { return live ? json<Alert[]>("/alerts", scope) : mock.alerts(); },
+    createAlert(body) { return live ? send<{ id: string }>("POST", "/alerts", scope, body) : mock.createAlert(body); },
+    deleteAlert(id) { return live ? send<{ removed: boolean }>("DELETE", `/alerts/${encodeURIComponent(id)}`, scope) : mock.deleteAlert(id); },
     storage() { return live ? json<Storage>("/storage/tiers", scope) : mock.storage(); },
     cost() { return live ? json<Cost>("/cost", scope) : mock.cost(); },
     pipelines() { return live ? json<Pipelines>("/pipelines", scope) : mock.pipelines(); },

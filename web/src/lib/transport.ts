@@ -56,6 +56,20 @@ export async function json<T>(path: string, scope: Scope, body?: unknown): Promi
   return res.json() as Promise<T>;
 }
 
+/** Explicit-method JSON request (POST/DELETE/…). Surfaces the backend's
+    `{ error }` message on a non-2xx so callers can show why a mutation failed
+    (e.g. a rejected alert query). */
+export async function send<T>(method: string, path: string, scope: Scope, body?: unknown): Promise<T> {
+  const res = await fetch(url(path, scope), {
+    method,
+    headers: { "content-type": "application/json", accept: "application/json", ...authHeader() },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error((data && (data as { error?: string }).error) || `${path} → ${res.status}`);
+  return data as T;
+}
+
 /** The `/v1/query` envelope, wire-agnostic. In Arrow mode the rows arrive as an
     Arrow-IPC body and stats/histogram ride in response headers (still one round
     trip); in JSON mode all three are in the body. Falls back to JSON if the
