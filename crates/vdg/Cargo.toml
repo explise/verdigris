@@ -30,9 +30,16 @@ bytes.workspace = true
 futures.workspace = true
 axum = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
+# `apply`-only: object_store has no lifecycle API, so pushing the S3 lifecycle
+# policy needs the real AWS SDK. Optional + off by default to keep the standard
+# builds light and offline.
+aws-config = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
 
 [features]
 # Forward the datafusion feature so `cargo run --features datafusion` wires real execution.
 datafusion = ["verdigris-query/datafusion"]
 # `serve` brings up the HTTP API + static frontend; it needs the query engine.
 serve = ["datafusion", "dep:axum", "dep:tower-http"]
+# `apply` enables `vdg lifecycle --apply` (real S3 PutBucketLifecycleConfiguration).
+apply = ["dep:aws-config", "dep:aws-sdk-s3"]

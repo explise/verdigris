@@ -16,6 +16,42 @@ pub struct Config {
     pub query: QueryConfig,
     pub routing: RoutingConfig,
     pub lifecycle: LifecycleConfig,
+    pub auth: AuthConfig,
+}
+
+/// Optional bearer-token auth for the `/v1/*` HTTP API. Off by default so the
+/// local/offline loop and existing tests are unchanged. When enabled, every
+/// `/v1/*` request must carry `Authorization: Bearer <token>`; the static
+/// frontend and `/config.json` (which the UI needs pre-auth) stay open.
+///
+/// The token may be set here or, preferably in production, via the
+/// `VERDIGRIS_API_TOKEN` environment variable (which overrides this field so the
+/// secret never has to live in a config file). See `Config::resolved_auth_token`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    pub enabled: bool,
+    pub token: Option<String>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token: None,
+        }
+    }
+}
+
+impl Config {
+    /// The effective API token: `VERDIGRIS_API_TOKEN` if set (non-empty), else the
+    /// configured `auth.token`. Returns `None` if neither is present.
+    pub fn resolved_auth_token(&self) -> Option<String> {
+        std::env::var("VERDIGRIS_API_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.auth.token.clone())
+    }
 }
 
 /// Severity-based write-time routing: which tier (and thus prefix / storage
@@ -189,5 +225,24 @@ mod tests {
             _ => panic!("expected s3"),
         }
         assert_eq!(c.query.cores, 8);
+    }
+
+    #[test]
+    fn auth_defaults_off_and_parses() {
+        // Absent [auth] section -> disabled, no token.
+        let c = Config::default();
+        assert!(!c.auth.enabled);
+        assert!(c.auth.token.is_none());
+
+        let toml = r#"
+            [auth]
+            enabled = true
+            token = "s3cr3t"
+        "#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert!(c.auth.enabled);
+        assert_eq!(c.auth.token.as_deref(), Some("s3cr3t"));
+        // With no env override, the resolved token is the configured one.
+        assert_eq!(c.resolved_auth_token().as_deref(), Some("s3cr3t"));
     }
 }

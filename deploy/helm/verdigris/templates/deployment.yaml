@@ -1,68 +1,101 @@
+{{- /*
+Topology depends on the storage backend:
+
+  * local (demo)            → ONE Deployment, role "all", replicas 1, with the
+                             seed initContainer + PVC. A pod's filesystem is not
+                             shared, so it cannot scale.
+
+  * s3 + ingest.dedicated   → TWO Deployments:
+      (default for s3)         - <fullname>-ingest : role "ingest", replicas 1
+                                 (the single writer — multiple writers would race
+                                 on the JSON manifest until real Iceberg commits).
+                               - <fullname>         : role "query",  replicas N
+                                 (stateless read/UI tier, scales with replicaCount).
+
+  * s3 + not dedicated      → ONE Deployment, role "all", replicas 1 (safe single
+                             writer that also serves queries).
+*/ -}}
+{{- $fullname := include "verdigris.fullname" . -}}
+{{- $isS3 := eq .Values.storage.backend "s3" -}}
+{{- $dedicated := and $isS3 .Values.ingest.dedicated -}}
+{{- $workloads := list -}}
+{{- if $dedicated -}}
+  {{- $workloads = list
+        (dict "name" (printf "%s-ingest" $fullname) "role" "ingest" "replicas" 1)
+        (dict "name" $fullname "role" "query" "replicas" (.Values.replicaCount | int)) -}}
+{{- else -}}
+  {{- /* local demo, or s3 without a dedicated writer: one single-writer pod. */ -}}
+  {{- $workloads = list (dict "name" $fullname "role" "all" "replicas" 1) -}}
+{{- end -}}
+{{- range $w := $workloads }}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "verdigris.fullname" . }}
+  name: {{ $w.name }}
   labels:
-    {{- include "verdigris.labels" . | nindent 4 }}
+    {{- include "verdigris.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $w.role }}
 spec:
-  {{- if eq .Values.storage.backend "local" }}
-  # Local filesystem is not shared across pods — pin to a single replica.
-  replicas: 1
+  replicas: {{ $w.replicas }}
+  {{- if eq $.Values.storage.backend "local" }}
+  # Local filesystem is not shared across pods — Recreate avoids two pods racing
+  # on the same volume during a rollout.
   strategy:
     type: Recreate
-  {{- else }}
-  replicas: {{ .Values.replicaCount }}
   {{- end }}
   selector:
     matchLabels:
-      {{- include "verdigris.selectorLabels" . | nindent 6 }}
+      {{- include "verdigris.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: {{ $w.role }}
   template:
     metadata:
       annotations:
         # Roll pods when the rendered config changes.
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        {{- with .Values.podAnnotations }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") $ | sha256sum }}
+        {{- with $.Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       labels:
-        {{- include "verdigris.selectorLabels" . | nindent 8 }}
+        {{- include "verdigris.selectorLabels" $ | nindent 8 }}
+        app.kubernetes.io/component: {{ $w.role }}
     spec:
-      {{- with .Values.pullSecrets }}
+      {{- with $.Values.pullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: {{ include "verdigris.serviceAccountName" . }}
+      serviceAccountName: {{ include "verdigris.serviceAccountName" $ }}
       securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{- with .Values.nodeSelector }}
+        {{- toYaml $.Values.podSecurityContext | nindent 8 }}
+      {{- with $.Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- with $.Values.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.tolerations }}
+      {{- with $.Values.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if and .Values.seed.enabled (eq .Values.storage.backend "local") }}
+      {{- if and $.Values.seed.enabled (eq $.Values.storage.backend "local") }}
       initContainers:
         # Seed synthetic logs into the local store on first boot so the UI has
         # data. Idempotent: skips if the table already has a manifest.
         - name: seed
-          image: {{ include "verdigris.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          image: {{ include "verdigris.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
           securityContext:
-            {{- toYaml .Values.securityContext | nindent 12 }}
+            {{- toYaml $.Values.securityContext | nindent 12 }}
           command: ["/bin/sh", "-c"]
           args:
             - |
-              if vdg manifest --table {{ .Values.table | quote }} >/dev/null 2>&1; then
-                echo "table {{ .Values.table }} already seeded — skipping";
+              if vdg manifest --table {{ $.Values.table | quote }} >/dev/null 2>&1; then
+                echo "table {{ $.Values.table }} already seeded — skipping";
               else
-                echo "seeding {{ .Values.seed.records }} synthetic records into {{ .Values.table }}";
-                vdg ingest --table {{ .Values.table | quote }} --generate {{ .Values.seed.records }};
+                echo "seeding {{ $.Values.seed.records }} synthetic records into {{ $.Values.table }}";
+                vdg ingest --table {{ $.Values.table | quote }} --generate {{ $.Values.seed.records }};
               fi
           env:
             - name: VERDIGRIS_CONFIG
@@ -72,81 +105,86 @@ spec:
               mountPath: /etc/verdigris
               readOnly: true
             - name: data
-              mountPath: {{ .Values.storage.localPath }}
+              mountPath: {{ $.Values.storage.localPath }}
       {{- end }}
       containers:
         - name: verdigris
-          image: {{ include "verdigris.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          image: {{ include "verdigris.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
           securityContext:
-            {{- toYaml .Values.securityContext | nindent 12 }}
+            {{- toYaml $.Values.securityContext | nindent 12 }}
           args:
             - serve
+            - --role
+            - {{ $w.role }}
             - --port
-            - {{ .Values.service.port | quote }}
+            - {{ $.Values.service.port | quote }}
             - --table
-            - {{ .Values.table | quote }}
+            - {{ $.Values.table | quote }}
             - --frontend
-            - /app/frontend
+            - /app/web
           env:
             - name: VERDIGRIS_CONFIG
               value: /etc/verdigris/verdigris.toml
-            {{- if eq .Values.storage.backend "s3" }}
-            {{- with .Values.storage.s3.region }}
+            {{- if eq $.Values.storage.backend "s3" }}
+            {{- with $.Values.storage.s3.region }}
             - name: AWS_REGION
               value: {{ . | quote }}
             {{- end }}
-            {{- if and (not .Values.storage.s3.existingSecret) .Values.storage.s3.accessKeyId }}
+            {{- if and (not $.Values.storage.s3.existingSecret) $.Values.storage.s3.accessKeyId }}
             - name: AWS_ACCESS_KEY_ID
-              value: {{ .Values.storage.s3.accessKeyId | quote }}
+              value: {{ $.Values.storage.s3.accessKeyId | quote }}
             - name: AWS_SECRET_ACCESS_KEY
-              value: {{ .Values.storage.s3.secretAccessKey | quote }}
+              value: {{ $.Values.storage.s3.secretAccessKey | quote }}
             {{- end }}
             {{- end }}
-          {{- if and (eq .Values.storage.backend "s3") .Values.storage.s3.existingSecret }}
+          {{- if and (eq $.Values.storage.backend "s3") $.Values.storage.s3.existingSecret }}
           envFrom:
             # Expects keys AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
             - secretRef:
-                name: {{ .Values.storage.s3.existingSecret }}
+                name: {{ $.Values.storage.s3.existingSecret }}
           {{- end }}
           ports:
             - name: http
-              containerPort: {{ .Values.service.port }}
+              containerPort: {{ $.Values.service.port }}
               protocol: TCP
-          {{- if .Values.probes.enabled }}
+          {{- if $.Values.probes.enabled }}
+          # /healthz is served in every role (200, no auth). The ingest role
+          # serves no web root, so probes must not hit `/`.
           readinessProbe:
             httpGet:
-              path: /
+              path: /healthz
               port: http
             initialDelaySeconds: 3
             periodSeconds: 10
           livenessProbe:
             httpGet:
-              path: /
+              path: /healthz
               port: http
             initialDelaySeconds: 10
             periodSeconds: 20
           {{- end }}
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            {{- toYaml $.Values.resources | nindent 12 }}
           volumeMounts:
             - name: config
               mountPath: /etc/verdigris
               readOnly: true
-            {{- if eq .Values.storage.backend "local" }}
+            {{- if eq $.Values.storage.backend "local" }}
             - name: data
-              mountPath: {{ .Values.storage.localPath }}
+              mountPath: {{ $.Values.storage.localPath }}
             {{- end }}
       volumes:
         - name: config
           configMap:
-            name: {{ include "verdigris.fullname" . }}-config
-        {{- if eq .Values.storage.backend "local" }}
+            name: {{ include "verdigris.fullname" $ }}-config
+        {{- if eq $.Values.storage.backend "local" }}
         - name: data
-          {{- if .Values.persistence.enabled }}
+          {{- if $.Values.persistence.enabled }}
           persistentVolumeClaim:
-            claimName: {{ include "verdigris.pvcName" . }}
+            claimName: {{ include "verdigris.pvcName" $ }}
           {{- else }}
           emptyDir: {}
           {{- end }}
         {{- end }}
+{{- end }}

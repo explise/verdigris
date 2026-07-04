@@ -1,0 +1,75 @@
+# MkDocs Material config for the public Verdigris documentation site.
+#
+# The docs SOURCE lives here with the code (so it never drifts); only the
+# RENDERED HTML in `site/` is published to GitHub Pages — the source stays
+# private. Build:  mkdocs build      Preview:  mkdocs serve
+# Publish:        mkdocs gh-deploy   (pushes built HTML to a gh-pages branch)
+site_name: Verdigris
+site_description: >-
+  S3-native log storage & query engine in Rust — the layer your infrastructure
+  leaves behind. A self-hostable Datadog alternative that keeps log data in your
+  own cloud account.
+# Update to your Pages URL once the docs repo exists (placeholder for now):
+site_url: https://example.github.io/verdigris/
+docs_dir: docs
+site_dir: site
+
+# Code is private, so no source-repo link in the header. (Add repo_url later if
+# you publish a public mirror.)
+
+theme:
+  name: material
+  language: en
+  palette:
+    scheme: slate # dark, matching the brand's warm-dark canvas
+  font:
+    text: Inter
+    code: JetBrains Mono
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+  icon:
+    logo: material/layers-triple-outline
+    repo: material/lock
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.details
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+
+# Don't fail the build on cross-links that point at repo files not in the site.
+validation:
+  links:
+    absolute_links: ignore
+    unrecognized_links: ignore
+
+nav:
+  - Home: index.md
+  - Architecture: ARCHITECTURE.md
+  - HTTP API: API.md
+  - Deployment: deployment.md
+  - Testing (DST): dst-architecture.md
+  - Decision Records:
+      - Overview: adr/README.md
+      - "ADR-0002 · Manifest as Iceberg stand-in": adr/0002-manifest-as-iceberg-standin.md
+      - "ADR-0003 · Ingest / query role split": adr/0003-ingest-query-role-split.md
+  - Contributing: contributing.md

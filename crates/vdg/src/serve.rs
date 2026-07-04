@@ -1,23 +1,36 @@
 //! `vdg serve` — the HTTP shell. Hosts the static frontend AND the `/v1/*` API
 //! that `frontend/api.js` calls when `USE_MOCKS = false`.
 //!
-//! Endpoints backed by REAL data: /v1/ingest (writes logs to the store),
-//! /v1/query, /v1/query/estimate, /v1/storage/tiers, /v1/settings, and the
-//! volume/cost figures in /v1/metrics and /v1/cost (computed from the manifest
-//! + cost model). Endpoints we can't
-//! back yet (alerts, pipelines, time-series metrics) return shape-correct
-//! placeholders so the dashboards render — each marked `placeholder: true`.
-//! `tail()` stays client-side in the frontend, so there is no SSE endpoint.
+//! Endpoints backed by REAL data: /v1/ingest and /v1/otlp/logs (write logs to the
+//! store), /v1/query, /v1/query/estimate, /v1/storage/tiers, /v1/settings,
+//! /v1/tail (live SSE), and the volume/cost figures in /v1/metrics and /v1/cost
+//! (computed from the manifest + cost model). Endpoints we can't back yet
+//! (alerts, pipelines, time-series metrics) return shape-correct placeholders so
+//! the dashboards render — each marked `placeholder: true`.
+//!
+//! The router is built per `--role`: `all` (everything), `ingest` (only the write
+//! endpoints, so exactly ONE node is the manifest writer), or `query` (read/UI
+//! endpoints; write endpoints answer 405). Optional bearer-token auth (config
+//! `[auth]`) gates the `/v1/*` surface; the static frontend and `/config.json`
+//! stay open so the UI can boot pre-auth.
 
+use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
@@ -29,6 +42,38 @@ use verdigris_core::manifest::Manifest;
 use verdigris_core::model::Tier;
 use verdigris_ingest::wire::JsonLog;
 use verdigris_storage::Store;
+
+/// Which HTTP surface this node exposes (from `vdg serve --role`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Everything: read + write endpoints + static frontend.
+    All,
+    /// Only the write endpoints (`/v1/ingest`, `/v1/otlp/logs`). Run exactly one
+    /// of these as the single manifest writer.
+    Ingest,
+    /// Read/UI endpoints + static frontend; write endpoints return 405. Run N of
+    /// these as stateless readers.
+    Query,
+}
+
+impl From<crate::RoleArg> for Role {
+    fn from(r: crate::RoleArg) -> Self {
+        match r {
+            crate::RoleArg::All => Role::All,
+            crate::RoleArg::Ingest => Role::Ingest,
+            crate::RoleArg::Query => Role::Query,
+        }
+    }
+}
+
+impl Role {
+    fn serves_reads(self) -> bool {
+        matches!(self, Role::All | Role::Query)
+    }
+    fn serves_writes(self) -> bool {
+        matches!(self, Role::All | Role::Ingest)
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -53,6 +98,13 @@ impl AppError {
     fn bad_request(e: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            message: e.to_string(),
+        }
+    }
+
+    fn with_status(status: StatusCode, e: impl std::fmt::Display) -> Self {
+        Self {
+            status,
             message: e.to_string(),
         }
     }
@@ -96,37 +148,179 @@ fn parse_tier(s: &str) -> Option<Tier> {
     }
 }
 
-pub async fn serve(cfg: Config, table: String, port: u16, frontend: PathBuf) -> anyhow::Result<()> {
+pub async fn serve(
+    cfg: Config,
+    table: String,
+    port: u16,
+    frontend: PathBuf,
+    role: Role,
+) -> anyhow::Result<()> {
+    // Resolve the effective API token BEFORE moving cfg into the shared state.
+    let auth_token = if cfg.auth.enabled {
+        match cfg.resolved_auth_token() {
+            Some(t) => Some(Arc::new(t)),
+            None => anyhow::bail!(
+                "[auth].enabled is true but no token is set — set auth.token or VERDIGRIS_API_TOKEN"
+            ),
+        }
+    } else {
+        None
+    };
+
     let state = AppState {
         cfg: Arc::new(cfg),
         table: Arc::new(table),
         ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
-    let app = Router::new()
-        .route("/v1/query", post(h_query))
-        .route("/v1/query/estimate", post(h_estimate))
-        .route("/v1/ingest", post(h_ingest))
-        .route("/v1/metrics", get(h_metrics))
-        .route("/v1/alerts", get(h_alerts))
-        .route("/v1/storage/tiers", get(h_storage))
-        .route("/v1/cost", get(h_cost))
-        .route("/v1/pipelines", get(h_pipelines))
-        .route("/v1/settings", get(h_settings))
-        .fallback_service(ServeDir::new(&frontend))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    // Build the `/v1/*` surface for this role. Auth (if enabled) wraps ONLY this
+    // sub-router, so the static frontend and /config.json below stay open.
+    let mut api = Router::new();
+    if role.serves_writes() {
+        api = api
+            .route("/v1/ingest", post(h_ingest))
+            .route("/v1/otlp/logs", post(h_otlp));
+    } else {
+        // query-role: the write endpoints exist but are disabled (405), so a
+        // misrouted writer gets a clear method error, not a 404.
+        api = api
+            .route("/v1/ingest", post(write_disabled))
+            .route("/v1/otlp/logs", post(write_disabled));
+    }
+    if role.serves_reads() {
+        api = api
+            .route("/v1/query", post(h_query))
+            .route("/v1/query/estimate", post(h_estimate))
+            .route("/v1/metrics", get(h_metrics))
+            .route("/v1/alerts", get(h_alerts))
+            .route("/v1/storage/tiers", get(h_storage))
+            .route("/v1/cost", get(h_cost))
+            .route("/v1/pipelines", get(h_pipelines))
+            .route("/v1/settings", get(h_settings))
+            .route("/v1/tail", get(h_tail));
+    }
+    if let Some(token) = auth_token.clone() {
+        api = api.layer(middleware::from_fn_with_state(token, require_bearer));
+    }
+
+    // Static frontend + pre-auth config are added AFTER the auth layer so they are
+    // never gated (the UI must load them to render a login state at all).
+    let mut app = api;
+    // Liveness/readiness probe: 200 in EVERY role and OUTSIDE the auth layer
+    // (kubelet carries no token). The ingest role serves no web root, so k8s
+    // probes must target this endpoint rather than `/`.
+    app = app.route("/healthz", get(h_healthz));
+    if role.serves_reads() {
+        app = app
+            // Runtime deployment config the `web/` SPA reads at boot. Pins it to
+            // this backend: live (no mocks), JSON wire, single-tenant on-prem so
+            // transport talks to the flat /v1/* surface. The vanilla `frontend/`
+            // ignores it.
+            .route("/config.json", get(h_config))
+            // Static frontend + SPA fallback. A request matching no real file
+            // serves index.html so the path-routed SPA (`/:org/:env/logs` on
+            // refresh / deep link) boots and routes client-side. `ServeDir` forces
+            // that fallback to a 404 status; `flip_404_to_200` (scoped to this
+            // static sub-router only, so API status codes are untouched) rewrites
+            // it to 200. The hash-routed vanilla frontend is unaffected.
+            .fallback_service(static_frontend(&frontend));
+    }
+    let app = app.layer(CorsLayer::permissive()).with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .with_context(|| format!("binding port {port}"))?;
-    println!("verdigris serving on http://localhost:{port}");
-    println!("  frontend: {}", frontend.display());
-    println!("  api:      http://localhost:{port}/v1/query");
-    println!("  ingest:   POST http://localhost:{port}/v1/ingest  (NDJSON logs)");
+    println!("verdigris serving on http://localhost:{port} (role: {})", role_name(role));
+    if role.serves_reads() {
+        println!("  frontend: {}", frontend.display());
+        println!("  api:      http://localhost:{port}/v1/query");
+        println!("  tail:     GET  http://localhost:{port}/v1/tail  (SSE)");
+    }
+    if role.serves_writes() {
+        println!("  ingest:   POST http://localhost:{port}/v1/ingest    (NDJSON logs)");
+        println!("  otlp:     POST http://localhost:{port}/v1/otlp/logs (OTLP/JSON logs)");
+    }
+    if auth_token.is_some() {
+        println!("  auth:     bearer-token required on /v1/*");
+    }
     println!("  remember to set USE_MOCKS = false in frontend/api.js");
     axum::serve(listener, app).await.context("http server")?;
     Ok(())
+}
+
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::All => "all",
+        Role::Ingest => "ingest",
+        Role::Query => "query",
+    }
+}
+
+/// Liveness/readiness probe: always 200, no auth, in every role. k8s probes and
+/// health checks target this (the ingest role serves no web root to hit).
+async fn h_healthz() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({ "status": "ok" })))
+}
+
+/// Placeholder handler for write endpoints on a query-role node: 405 with the
+/// standard `{"error":...}` body.
+async fn write_disabled() -> AppError {
+    AppError::with_status(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "write endpoints are disabled on a query-role node (run an ingest/all-role node to write)",
+    )
+}
+
+/// Bearer-token auth middleware for the `/v1/*` surface. Applied only when
+/// `[auth].enabled` is set. Missing/wrong token → 401 `{"error":...}`.
+async fn require_bearer(
+    State(token): State<Arc<String>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let presented = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(str::trim);
+    if presented == Some(token.as_str()) {
+        next.run(req).await
+    } else {
+        AppError::with_status(StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
+            .into_response()
+    }
+}
+
+/// The static-frontend service: real files from `frontend`, else index.html for
+/// SPA client-side routing. Isolated in its own `Router` so the 404→200 rewrite
+/// (see below) applies ONLY here, never to the `/v1/*` API status codes.
+fn static_frontend(frontend: &PathBuf) -> Router {
+    let index = frontend.join("index.html");
+    Router::new()
+        .fallback_service(
+            ServeDir::new(frontend).not_found_service(get(move || spa_index(index.clone()))),
+        )
+        .layer(axum::middleware::map_response(flip_404_to_200))
+}
+
+/// SPA fallback: serve index.html for any path that isn't a real static file, so
+/// client-side routes survive a hard refresh / deep link.
+async fn spa_index(index: PathBuf) -> Response {
+    match tokio::fs::read_to_string(&index).await {
+        Ok(html) => axum::response::Html(html).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "index.html not found").into_response(),
+    }
+}
+
+/// `ServeDir` pins its not-found fallback to a 404; for an SPA the fallback IS a
+/// valid page (index.html boots the router), so rewrite 404→200. Scoped to the
+/// static sub-router, so it can't mask a real API 4xx.
+async fn flip_404_to_200(mut res: Response) -> Response {
+    if res.status() == StatusCode::NOT_FOUND {
+        *res.status_mut() = StatusCode::OK;
+    }
+    res
 }
 
 // ───────────────────────── real endpoints ─────────────────────────
@@ -136,14 +330,26 @@ struct QueryReq {
     sql: String,
 }
 
-async fn h_query(State(st): State<AppState>, Json(req): Json<QueryReq>) -> ApiResult {
+/// True when the client's `Accept` header asks for the Arrow stream wire. The UI
+/// negotiates this (config `wire: "arrow"`); anything else gets the JSON envelope.
+fn wants_arrow(headers: &HeaderMap) -> bool {
+    headers
+        .get(ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("application/vnd.apache.arrow"))
+}
+
+async fn h_query(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<QueryReq>,
+) -> Result<Response, AppError> {
+    let arrow = wants_arrow(&headers);
     let (s, m) = manifest(&st).await?;
+
     if m.files.is_empty() {
-        return Ok(Json(json!({
-            "rows": [],
-            "stats": { "events": 0, "scannedBytes": 0, "elapsedMs": 0, "engine": "datafusion", "files": 0 },
-            "histogram": [],
-        })));
+        let stats = json!({ "events": 0, "scannedBytes": 0, "elapsedMs": 0, "engine": "datafusion", "files": 0 });
+        return Ok(query_response(arrow, Vec::new(), &stats, &Vec::new()));
     }
     let files: Vec<String> = m.files.iter().map(|f| f.path.clone()).collect();
 
@@ -157,11 +363,21 @@ async fn h_query(State(st): State<AppState>, Json(req): Json<QueryReq>) -> ApiRe
             .map_err(AppError::bad_request)?
     };
 
+    // Run the query once, in the negotiated wire (never both).
     let t0 = std::time::Instant::now();
-    let rows =
-        verdigris_query::engine::query_table_json(s.clone(), st.table.as_str(), &files, &sql)
-            .await
-            .map_err(AppError::bad_request)?;
+    let (arrow_body, json_rows) = if arrow {
+        let bytes =
+            verdigris_query::engine::query_table_arrow(s.clone(), st.table.as_str(), &files, &sql)
+                .await
+                .map_err(AppError::bad_request)?;
+        (bytes, Value::Null)
+    } else {
+        let rows =
+            verdigris_query::engine::query_table_json(s.clone(), st.table.as_str(), &files, &sql)
+                .await
+                .map_err(AppError::bad_request)?;
+        (Vec::new(), Value::Array(rows))
+    };
     let elapsed = t0.elapsed().as_millis() as u64;
 
     let (min_ts, max_ts) = time_range(&m);
@@ -173,18 +389,37 @@ async fn h_query(State(st): State<AppState>, Json(req): Json<QueryReq>) -> ApiRe
         .iter()
         .filter_map(|b| b.get("total").and_then(Value::as_i64))
         .sum();
+    let stats = json!({
+        "events": events,
+        "scannedBytes": m.total_bytes(),
+        "elapsedMs": elapsed,
+        "engine": "datafusion",
+        "files": files.len(),
+    });
 
-    Ok(Json(json!({
-        "rows": rows,
-        "stats": {
-            "events": events,
-            "scannedBytes": m.total_bytes(),
-            "elapsedMs": elapsed,
-            "engine": "datafusion",
-            "files": files.len(),
-        },
-        "histogram": histogram,
-    })))
+    if arrow {
+        Ok(query_response(true, arrow_body, &stats, &histogram))
+    } else {
+        Ok(Json(json!({ "rows": json_rows, "stats": stats, "histogram": histogram })).into_response())
+    }
+}
+
+/// Build a `/v1/query` response in the requested wire. Arrow: the rows are the
+/// Arrow-IPC body and `stats`/`histogram` (small JSON) ride in response headers,
+/// so the whole envelope is still one round-trip. JSON: the usual body envelope.
+/// Same-origin (UI + API on one binary) means the client can read the custom
+/// headers without CORS `Access-Control-Expose-Headers`.
+fn query_response(arrow: bool, arrow_body: Vec<u8>, stats: &Value, histogram: &[Value]) -> Response {
+    if !arrow {
+        return Json(json!({ "rows": [], "stats": stats, "histogram": histogram })).into_response();
+    }
+    let hist = Value::Array(histogram.to_vec());
+    Response::builder()
+        .header(CONTENT_TYPE, "application/vnd.apache.arrow.stream")
+        .header("x-verdigris-stats", stats.to_string())
+        .header("x-verdigris-histogram", hist.to_string())
+        .body(Body::from(arrow_body))
+        .expect("building arrow response")
 }
 
 fn time_range(m: &Manifest) -> (i64, i64) {
@@ -294,6 +529,37 @@ async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
     Ok(Json(json!({
         "ingested": ingested,
         "skipped": skipped,
+        "filesWritten": written.len(),
+        "bytesWritten": bytes,
+    })))
+}
+
+/// `POST /v1/otlp/logs` — a native OTLP/HTTP JSON logs receiver. Maps the OTel
+/// LogRecords onto the same canonical `LogRecord` shape and reuses the exact
+/// ingest write path (routing + BatchPolicy) and per-process `ingest_lock` as
+/// `/v1/ingest`. OTLP/JSON only (no protobuf/gRPC) to keep deps light.
+async fn h_otlp(State(st): State<AppState>, body: String) -> ApiResult {
+    let records = verdigris_ingest::otlp::parse_otlp_json(&body).map_err(AppError::bad_request)?;
+    if records.is_empty() {
+        return Err(AppError::bad_request(
+            "no log records in OTLP request (expected resourceLogs[].scopeLogs[].logRecords[])",
+        ));
+    }
+    let ingested = records.len();
+
+    // Same serialization guarantee as /v1/ingest: the manifest is read-modify-
+    // written, so concurrent writes in this process must not interleave.
+    let _guard = st.ingest_lock.lock().await;
+
+    let s = store(&st)?;
+    let ingestor = verdigris_ingest::Ingestor::new(s, st.table.as_str());
+    let written = ingestor
+        .ingest(records, &st.cfg.routing, BatchPolicy::default())
+        .await?;
+    let bytes: u64 = written.iter().map(|f| f.bytes).sum();
+
+    Ok(Json(json!({
+        "ingested": ingested,
         "filesWritten": written.len(),
         "bytesWritten": bytes,
     })))
@@ -417,6 +683,39 @@ async fn h_settings(State(st): State<AppState>) -> ApiResult {
             { "match": "level = 'INFO'",  "tier": st.cfg.routing.info.as_str() },
             { "match": "level = 'DEBUG'", "tier": st.cfg.routing.debug.as_str() },
         ],
+    })))
+}
+
+/// `GET /config.json` — runtime deployment config for the `web/` SPA. Only the
+/// fields that differ from the app's baked-in defaults need be sent; the client
+/// deep-merges over `DEFAULT_CONFIG` (see `web/src/config/runtime.ts`). We pin it
+/// to THIS backend: live data, JSON wire, single-tenant on-prem (flat `/v1/*`),
+/// with one org/env derived from the served table + storage bucket.
+async fn h_config(State(st): State<AppState>) -> ApiResult {
+    let (bucket, region) = match &st.cfg.storage {
+        StorageConfig::S3 { bucket, region, .. } => {
+            (format!("s3://{bucket}"), region.clone().unwrap_or_default())
+        }
+        StorageConfig::Local { path } => (format!("local://{}", path.display()), "local".to_string()),
+        StorageConfig::Memory => ("memory://".to_string(), "local".to_string()),
+    };
+    let table = st.table.as_str();
+
+    Ok(Json(json!({
+        "mode": "onprem",
+        "apiBaseUrl": "",
+        "useMocks": false,
+        // Query rows travel as Arrow IPC (columnar); the client transparently
+        // falls back to the JSON envelope if a response isn't Arrow.
+        "wire": "arrow",
+        "auth": { "kind": "none" },
+        "orgs": [ { "id": "local", "name": "Verdigris" } ],
+        "environments": [ {
+            "id": table,
+            "label": table,
+            "region": region,
+            "bucket": bucket,
+        } ],
     })))
 }
 
@@ -546,6 +845,101 @@ async fn h_pipelines(State(st): State<AppState>) -> ApiResult {
         "ingestLag": format!("{lag_secs}s"),
         "parquetRolls": rolls,
     })))
+}
+
+// ───────────────────────── live tail (SSE) ─────────────────────────
+
+/// Interval between manifest polls for the live tail.
+const TAIL_POLL: Duration = Duration::from_secs(1);
+/// Max rows emitted per poll, so a bursty table can't flood the stream.
+const TAIL_MAX_ROWS: usize = 100;
+
+/// State carried across `unfold` steps of the tail stream.
+struct TailState {
+    st: AppState,
+    /// Newest ts (epoch millis) already emitted; only strictly-newer rows follow.
+    last_ts: i64,
+    /// Rows fetched but not yet emitted (one SSE event each).
+    queue: VecDeque<Value>,
+}
+
+/// `GET /v1/tail` — a live tail as `text/event-stream`. Each `data:` line is one
+/// JSON log row (`{ts, level, service, message, trace_id, status, attrs_json}`).
+/// It polls the newest manifest file every second and emits rows newer than the
+/// last one seen; only the newest file is scanned, so it can't run away.
+async fn h_tail(State(st): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // Start from "now" (the current manifest max) so a fresh connection streams
+    // only newly-arriving rows, not the whole backlog.
+    let last_ts = match manifest(&st).await {
+        Ok((_s, m)) => m.files.iter().map(|f| f.max_ts).max().unwrap_or(0),
+        Err(_) => crate::now_millis(),
+    };
+
+    let init = TailState {
+        st,
+        last_ts,
+        queue: VecDeque::new(),
+    };
+
+    let stream = futures::stream::unfold(init, |mut s| async move {
+        loop {
+            // Drain any already-fetched rows one event at a time.
+            if let Some(row) = s.queue.pop_front() {
+                let ev = Event::default().data(row.to_string());
+                return Some((Ok::<Event, Infallible>(ev), s));
+            }
+            // Otherwise wait, then poll the newest file for fresh rows.
+            tokio::time::sleep(TAIL_POLL).await;
+            match tail_poll(&s.st, s.last_ts).await {
+                Ok((rows, new_last)) => {
+                    s.last_ts = new_last.max(s.last_ts);
+                    s.queue.extend(rows);
+                }
+                Err(_) => { /* transient (e.g. manifest mid-write): retry next tick */ }
+            }
+            if s.queue.is_empty() {
+                // Nothing new: emit a comment so the connection stays warm and the
+                // loop yields back to the client.
+                let ev = Event::default().comment("keepalive");
+                return Some((Ok::<Event, Infallible>(ev), s));
+            }
+        }
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Fetch rows newer than `since_ts` from the table's newest file. Returns the
+/// rows (as query-shaped JSON) and the max ts seen (epoch millis).
+async fn tail_poll(st: &AppState, since_ts: i64) -> anyhow::Result<(Vec<Value>, i64)> {
+    let (s, m) = manifest(st).await?;
+    let Some(newest) = m.files.iter().max_by_key(|f| f.max_ts) else {
+        return Ok((Vec::new(), since_ts));
+    };
+    let files = vec![newest.path.clone()];
+    let table = st.table.as_str();
+
+    // `arrow_cast(ts, 'Int64')` surfaces the underlying epoch-millis so we can
+    // both filter (`ts > since`) and advance `last_ts` deterministically.
+    let sql = format!(
+        "SELECT arrow_cast(ts, 'Int64') AS ts_millis, \
+                ts, level, service, status, message, trace_id, attrs_json \
+         FROM {table} WHERE ts > to_timestamp_millis({since_ts}) \
+         ORDER BY ts ASC LIMIT {TAIL_MAX_ROWS}"
+    );
+    let mut rows = verdigris_query::engine::query_table_json(s, table, &files, &sql).await?;
+
+    let mut max_ts = since_ts;
+    for r in &mut rows {
+        if let Some(v) = r.get("ts_millis").and_then(Value::as_i64) {
+            max_ts = max_ts.max(v);
+        }
+        // Drop the internal helper column so the emitted contract is clean.
+        if let Some(obj) = r.as_object_mut() {
+            obj.remove("ts_millis");
+        }
+    }
+    Ok((rows, max_ts))
 }
 
 #[cfg(test)]

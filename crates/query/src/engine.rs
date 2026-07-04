@@ -14,6 +14,9 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::compute::cast;
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::json::ArrayWriter;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
@@ -105,4 +108,74 @@ pub async fn query_table_json(
         return Ok(vec![]);
     }
     serde_json::from_slice(&buf).context("parsing json rows")
+}
+
+/// Run a query and return the rows encoded as an **Arrow IPC stream** — the
+/// columnar wire the UI can decode near-zero-copy (vs parsing millions of JSON
+/// objects). Same in-place read path as [`query_table_json`]; only the output
+/// encoding differs. An empty result set yields an empty buffer (no rows), which
+/// the client treats as zero matches.
+pub async fn query_table_arrow(
+    store: Arc<dyn ObjectStore>,
+    table: &str,
+    files: &[String],
+    sql: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let batches = collect_batches(store, table, files, sql).await?;
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    // DataFusion 54's Parquet reader yields Arrow `Utf8View`/`BinaryView` columns,
+    // a type too new for many IPC decoders (e.g. apache-arrow JS in the web UI),
+    // which reject it outright. Cast view columns down to plain `Utf8`/`Binary` so
+    // the Arrow wire is broadly decodable. (The JSON path is unaffected — it
+    // serializes views to strings fine.)
+    let batches = batches
+        .iter()
+        .map(deview_batch)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let schema = batches[0].schema();
+    let mut buf = Vec::new();
+    {
+        let mut writer =
+            StreamWriter::try_new(&mut buf, schema.as_ref()).context("arrow stream writer")?;
+        for b in &batches {
+            writer.write(b).context("arrow-encoding batch")?;
+        }
+        writer.finish().context("finishing arrow stream")?;
+    }
+    Ok(buf)
+}
+
+/// Cast any `Utf8View`/`BinaryView` columns of a batch down to `Utf8`/`Binary`.
+/// Other columns pass through untouched. Returns the batch unchanged if it has no
+/// view columns (the common case once Parquet stores non-view types).
+fn deview_batch(batch: &RecordBatch) -> anyhow::Result<RecordBatch> {
+    let schema = batch.schema();
+    let mut changed = false;
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (i, field) in schema.fields().iter().enumerate() {
+        let target = match field.data_type() {
+            DataType::Utf8View => Some(DataType::Utf8),
+            DataType::BinaryView => Some(DataType::Binary),
+            _ => None,
+        };
+        match target {
+            Some(dt) => {
+                changed = true;
+                columns.push(cast(batch.column(i), &dt).context("casting view column")?);
+                fields.push(Field::new(field.name(), dt, field.is_nullable()));
+            }
+            None => {
+                columns.push(batch.column(i).clone());
+                fields.push(field.as_ref().clone());
+            }
+        }
+    }
+    if !changed {
+        return Ok(batch.clone());
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .context("rebuilding de-viewed batch")
 }

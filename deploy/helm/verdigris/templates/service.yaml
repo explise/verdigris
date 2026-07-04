@@ -1,9 +1,19 @@
+{{- /*
+Main Service fronts the query/serve tier (UI + /v1/query). Its selector is
+pinned to the serving component so it never accidentally targets the ingest
+pods, the Vector DaemonSet, or the seed Job:
+  * s3 + dedicated ingest → component "query"
+  * otherwise (local, or s3 single-writer) → component "all"
+*/ -}}
+{{- $dedicated := and (eq .Values.storage.backend "s3") .Values.ingest.dedicated -}}
+{{- $serveComponent := ternary "query" "all" $dedicated -}}
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "verdigris.fullname" . }}
   labels:
     {{- include "verdigris.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $serveComponent }}
 spec:
   type: {{ .Values.service.type }}
   ports:
@@ -13,3 +23,26 @@ spec:
       name: http
   selector:
     {{- include "verdigris.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $serveComponent }}
+{{- if $dedicated }}
+---
+# Dedicated ingest Service — fronts the single writer pod. Vector (and any other
+# log shipper) POSTs to this so writes never hit the scalable query replicas.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "verdigris.fullname" . }}-ingest
+  labels:
+    {{- include "verdigris.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingest
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "verdigris.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: ingest
+{{- end }}

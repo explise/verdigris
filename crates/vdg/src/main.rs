@@ -2,6 +2,8 @@
 //! real world (real clock, real object store). Everything nondeterministic lives
 //! at this layer; the crates below it stay simulation-friendly.
 
+#[cfg(feature = "apply")]
+mod lifecycle_apply;
 mod realclock;
 #[cfg(feature = "serve")]
 mod serve;
@@ -65,9 +67,16 @@ enum Command {
         table: String,
     },
     /// Print the S3 lifecycle policy (age-based hot→warm→cold→expire) for a table.
+    /// With `--apply`, PUT it onto the configured S3 bucket instead of only
+    /// printing (requires an S3 backend and building with `--features apply`).
     Lifecycle {
         #[arg(long, default_value = "logs")]
         table: String,
+        /// Apply the policy to the bucket via S3 PutBucketLifecycleConfiguration
+        /// (credentials resolve through the standard AWS chain / IRSA). Without
+        /// this flag the policy is only printed.
+        #[arg(long)]
+        apply: bool,
     },
     /// Compact a table's many small Parquet files into fewer ~target-sized files.
     Compact {
@@ -94,6 +103,12 @@ enum Command {
         /// Directory of static frontend files to serve at `/`.
         #[arg(long, default_value = "frontend")]
         frontend: PathBuf,
+        /// Which surface this node exposes. `all` = everything (default). `ingest`
+        /// = only the write endpoints (`/v1/ingest`, `/v1/otlp/logs`) — run ONE of
+        /// these as the single manifest writer. `query` = read/UI endpoints only;
+        /// write endpoints return 405 — run N of these as stateless readers.
+        #[arg(long, value_enum, default_value = "all")]
+        role: RoleArg,
     },
     /// Model a scan over `--scan-gib` of a tier and print the cost estimate.
     /// (Placeholder for the real query path; exercises the executor + cost seams.)
@@ -108,6 +123,15 @@ enum Command {
         #[arg(long, value_enum, default_value = "standard")]
         retrieval: RetrievalArg,
     },
+}
+
+/// Which HTTP surface `vdg serve` exposes. Lets the deploy chart run one ingest
+/// writer + N stateless query readers so replicas don't race on the JSON manifest.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum RoleArg {
+    All,
+    Ingest,
+    Query,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -213,8 +237,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Manifest { table } => {
             run_manifest(&cfg, &table).await?;
         }
-        Command::Lifecycle { table } => {
-            run_lifecycle(&cfg, &table)?;
+        Command::Lifecycle { table, apply } => {
+            run_lifecycle(&cfg, &table, apply).await?;
         }
         Command::Compact { table, target_mb } => {
             run_compact(&cfg, &table, target_mb).await?;
@@ -226,8 +250,9 @@ async fn main() -> anyhow::Result<()> {
             port,
             table,
             frontend,
+            role,
         } => {
-            run_serve(cfg, table, port, frontend).await?;
+            run_serve(cfg, table, port, frontend, role).await?;
         }
         Command::Query {
             scan_gib,
@@ -366,12 +391,17 @@ async fn run_compact(cfg: &Config, table: &str, target_mb: u64) -> anyhow::Resul
     Ok(())
 }
 
-fn run_lifecycle(cfg: &Config, table: &str) -> anyhow::Result<()> {
+async fn run_lifecycle(cfg: &Config, table: &str, apply: bool) -> anyhow::Result<()> {
     let policy = verdigris_core::lifecycle::policy_for(table, &cfg.lifecycle);
     println!("{}", serde_json::to_string_pretty(&policy)?);
+
+    if apply {
+        return apply_lifecycle(&cfg.storage, &policy).await;
+    }
+
     match &cfg.storage {
         verdigris_core::config::StorageConfig::S3 { bucket, .. } => {
-            eprintln!("\n# apply to the bucket with:");
+            eprintln!("\n# apply to the bucket with `vdg lifecycle --apply` (needs --features apply), or:");
             eprintln!("#   aws s3api put-bucket-lifecycle-configuration --bucket {bucket} \\");
             eprintln!("#     --lifecycle-configuration file://lifecycle.json");
         }
@@ -380,6 +410,24 @@ fn run_lifecycle(cfg: &Config, table: &str) -> anyhow::Result<()> {
         ),
     }
     Ok(())
+}
+
+#[cfg(feature = "apply")]
+async fn apply_lifecycle(
+    storage: &verdigris_core::config::StorageConfig,
+    policy: &verdigris_core::lifecycle::LifecyclePolicy,
+) -> anyhow::Result<()> {
+    lifecycle_apply::apply(storage, policy).await
+}
+
+#[cfg(not(feature = "apply"))]
+async fn apply_lifecycle(
+    _storage: &verdigris_core::config::StorageConfig,
+    _policy: &verdigris_core::lifecycle::LifecyclePolicy,
+) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "lifecycle --apply requires the AWS SDK: rebuild with `cargo build --features apply`"
+    )
 }
 
 /// Current wall-clock time in epoch millis (shell-only; core stays sans-I/O).
@@ -432,12 +480,24 @@ async fn run_sql(_cfg: &Config, _table: &str, _query: &str) -> anyhow::Result<()
 }
 
 #[cfg(feature = "serve")]
-async fn run_serve(cfg: Config, table: String, port: u16, frontend: PathBuf) -> anyhow::Result<()> {
-    serve::serve(cfg, table, port, frontend).await
+async fn run_serve(
+    cfg: Config,
+    table: String,
+    port: u16,
+    frontend: PathBuf,
+    role: RoleArg,
+) -> anyhow::Result<()> {
+    serve::serve(cfg, table, port, frontend, role.into()).await
 }
 
 #[cfg(not(feature = "serve"))]
-async fn run_serve(_cfg: Config, _table: String, _port: u16, _frontend: PathBuf) -> anyhow::Result<()> {
+async fn run_serve(
+    _cfg: Config,
+    _table: String,
+    _port: u16,
+    _frontend: PathBuf,
+    _role: RoleArg,
+) -> anyhow::Result<()> {
     anyhow::bail!("serve requires the serve feature: rebuild with `cargo run --features serve -- serve`")
 }
 

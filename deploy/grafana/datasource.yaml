@@ -1,0 +1,51 @@
+# Grafana datasource provisioning for Verdigris.
+#
+# Verdigris exposes a flat REST API (see crates/vdg/src/serve.rs). There is no
+# native Grafana datasource plugin; instead we drive it through the community
+# **Infinity** datasource (yesoreyeram-infinity-datasource), which can POST JSON
+# to an arbitrary endpoint and map the JSON response into Grafana frames.
+#
+# Install this file into Grafana's provisioning directory (default
+# /etc/grafana/provisioning/datasources/) and make sure the Infinity plugin is
+# installed. See deploy/grafana/README.md for the full walkthrough.
+#
+# The `url` below is the base address of the Verdigris `vdg serve` HTTP service.
+# The dashboard's Infinity queries use RELATIVE paths (e.g. /v1/query) that are
+# resolved against this base. Change it to match how you reach Verdigris:
+#   - in-cluster Service (default): http://vdg-verdigris:8080
+#     (Service name is `<release>-verdigris`; `helm install vdg ...` => vdg-verdigris)
+#   - kubectl port-forward:         http://localhost:8080
+#   - ingress:                      https://verdigris.example.com
+
+apiVersion: 1
+
+datasources:
+  - name: Verdigris
+    uid: verdigris-infinity
+    type: yesoreyeram-infinity-datasource
+    access: proxy
+    # Base URL of the Verdigris serve service. Override per environment.
+    url: http://vdg-verdigris:8080
+    isDefault: false
+    editable: true
+    jsonData:
+      # Auth: the Verdigris API is currently unauthenticated. It is gaining
+      # OPTIONAL bearer auth; when that lands, switch auth_method to
+      # 'bearerToken' and provide the token via secureJsonData below.
+      auth_method: none
+      # 'none' means Infinity will not block any host. If you want to lock the
+      # datasource to only call Verdigris, uncomment and list the exact base(s):
+      # allowedHosts:
+      #   - http://vdg-verdigris:8080
+      #
+      # ── Optional bearer auth (uncomment when the API enforces it) ──
+      # auth_method: bearerToken
+      #
+      # Alternatively, send a raw Authorization header instead of using
+      # auth_method (works with any custom scheme):
+      # httpHeaderName1: Authorization
+    # secureJsonData:
+    #   # Used when auth_method: bearerToken
+    #   bearerToken: ${VERDIGRIS_TOKEN}
+    #   # Or, when using the raw httpHeaderName1 approach above:
+    #   httpHeaderValue1: Bearer ${VERDIGRIS_TOKEN}

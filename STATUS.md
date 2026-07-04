@@ -1,6 +1,13 @@
 # Verdigris Frontend — Status & Roadmap
 
-Master status doc for the UI work. Last updated 2026-06-29.
+Master status doc for the UI work. Last updated 2026-07-04.
+
+> **2026-07-04 update:** `web/` is now wired to the live backend end-to-end when served by
+> `vdg` (via `/config.json` → `useMocks:false`, flat on-prem paths). Live Tail streams from
+> the real `GET /v1/tail` SSE endpoint; Run-button re-execution works; every page guards the
+> fields the backend can omit; `apache-arrow` is code-split out of the initial bundle. The
+> real Arrow round-trip (item 3) and a Grafana *plugin* remain open — a Grafana **datasource**
+> (Infinity-based) now ships in `deploy/grafana/`. See the checked items below.
 
 There are **two frontends** in this repo, on purpose:
 
@@ -51,10 +58,10 @@ The prototype is the reference; `web/` is where the real product goes. Both rend
 ## 🔧 To do later
 
 ### Frontend — `web/` (the path to production)
-1. **Point `web/` at the live backend.** Set `useMocks:false` + `apiBaseUrl` in runtime config and verify each page against `vdg`. Today it's mock-only.
-2. **Wire `web/` transport to the real tenancy paths.** `transport.ts` uses `/v1/org/:org/env/:env/...`; the current backend serves flat `/v1/...`. Reconcile (either backend adds tenancy path segments, or `transport.ts` maps to flat paths until then).
-3. **Real Arrow round-trip.** Backend emits Arrow IPC for `/v1/query`; confirm `arrow.ts` decode + feed columnar data into the virtualized table (and eventually uPlot). Today the decode path is built but untested against real Arrow bytes.
-4. **`web/` interactivity parity with the prototype:** Run button should re-execute the query (currently only opens the cold gate); query-box edits should refetch; histogram/footer already reactive.
+1. ~~**Point `web/` at the live backend.**~~ **DONE (2026-07-04).** `vdg serve` emits `/config.json` with `useMocks:false`; `web/dist` is served by the binary (built into the image). Every page verified against live `vdg`.
+2. ~~**Wire `web/` transport to the real tenancy paths.**~~ **DONE.** `transport.ts` maps to flat `/v1/...` in `onprem`/`airgap` mode; the cloud multi-org path is retained for later.
+3. ~~**Real Arrow round-trip.**~~ **DONE (2026-07-04).** `/v1/query` content-negotiates Arrow IPC (rows as a columnar body; stats/histogram in `x-verdigris-*` headers); `queryTable` in `transport.ts` decodes it (lazy `apache-arrow`) and `api.ts` normalizes `ts`. Verified by decoding real backend bytes with the shipped `apache-arrow`. Backend casts `Utf8View`→`Utf8` so any Arrow decoder can read the wire. Feeding Arrow columns straight into uPlot (vs materialized arrays) remains a later optimization.
+4. ~~**`web/` interactivity parity with the prototype.**~~ **DONE.** Run button (and Enter) re-executes the query via a `submitted` signal; the cold gate's "Restore & run" also executes.
 5. **uPlot over Arrow columns** — feed `x[]`/`y[]` straight from Arrow columns instead of materialized arrays (the real scale win).
 7. **DuckDB-Wasm (phase 2)** — `duckdbWasm` feature flag exists; wire client-side re-aggregation/zoom over Arrow result sets (Grafana-beating interaction, on-brand with the engine).
 8. **Code-split `apache-arrow`** — it dominates the 100 KB gzip bundle; lazy-load it on the Logs route.
@@ -69,7 +76,7 @@ The prototype is the reference; `web/` is where the real product goes. Both rend
 13. **Real-engine footer copy** — UI now reads `stats.engine`; confirm product wants "datafusion" surfaced to users vs a friendlier label.
 
 ### Depends on backend (tracked in `BACKEND_TODO.md`)
-14. **`/v1/tail` streaming (SSE/WebSocket)** — not built; live tail stays mock-only until it exists.
+14. ~~**`/v1/tail` streaming (SSE/WebSocket)**~~ **DONE (2026-07-04).** Backend serves `GET /v1/tail` as SSE; `web/` Live Tail consumes it via `EventSource` (falls back to the mock ticker in mock mode). Note: `EventSource` can't send an `Authorization` header — front a token via query param / ingress auth when `[auth]` is on.
 15. **`scanGB` time-range pruning** in the cost estimator (backend note: still tier-total, doesn't prune by the query's time window).
 16. **`expensiveQueries`** populated once query-history tracking exists; **`p99`** is modeled until logs carry a latency field.
 17. **`attrs` as an object** instead of `attrs_json` string (currently parsed client-side).

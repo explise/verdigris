@@ -12,6 +12,7 @@ export default function Alerts() {
       <ViewHead title="Alerts" sub="Rules evaluated continuously over the hot tier"
         actions={<button class="btn primary">+ New alert</button>} />
       <Show when={list()} fallback={<div class="empty">loading…</div>}>
+        <Show when={list()!.length} fallback={<div class="empty" style={{ padding: "64px" }}>No alerts configured yet — create one to start monitoring the hot tier.</div>}>
         <div class="view-body">
           <Show when={firing().length}>
             <div class="card pad-lg" style={{ "border-color": "rgba(227,106,106,.3)", background: "linear-gradient(90deg,var(--error-soft),transparent 50%)", "margin-bottom": "18px" }}>
@@ -36,6 +37,7 @@ export default function Alerts() {
             </div>
           )}</For>
         </div>
+        </Show>
       </Show>
     </>
   );

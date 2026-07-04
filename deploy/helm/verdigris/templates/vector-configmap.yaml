@@ -1,5 +1,10 @@
 {{- if .Values.vector.enabled }}
-{{- $sink := .Values.vector.sinkEndpoint | default (printf "http://%s:%v/v1/ingest" (include "verdigris.fullname" .) (.Values.service.port | int)) }}
+{{- /* Default sink: the dedicated ingest Service when one exists (s3 +
+       ingest.dedicated), else the single all-role serve Service. An explicit
+       vector.sinkEndpoint always wins. */ -}}
+{{- $dedicated := and (eq .Values.storage.backend "s3") .Values.ingest.dedicated -}}
+{{- $ingestHost := ternary (printf "%s-ingest" (include "verdigris.fullname" .)) (include "verdigris.fullname" .) $dedicated -}}
+{{- $sink := .Values.vector.sinkEndpoint | default (printf "http://%s:%v/v1/ingest" $ingestHost (.Values.service.port | int)) }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

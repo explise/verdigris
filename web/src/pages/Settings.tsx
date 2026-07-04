@@ -24,10 +24,10 @@ export default function Settings() {
         {(() => { setCompute(s()!.queryCompute); setCold(s()!.confirmColdScans); return null; })()}
         <div class="view-body" style={{ "max-width": "920px" }}>
           <Card class="pad-lg"><div style={{ "margin-bottom": "10px" }}><CardHead title="Storage" /></div>
-            <Row label="S3 bucket" hint="Source of truth. Verdigris never copies data out of it."><input class="input mono" value={s()!.bucket} style={{ width: "340px" }} /></Row>
-            <Row label="Region"><input class="input mono" value={s()!.region} style={{ width: "200px" }} /></Row>
-            <Row label="IAM role" hint="Assumed for query + lifecycle operations."><input class="input mono" value={s()!.iamRole} style={{ width: "420px" }} /></Row>
-            <Row label="Retention" hint="After this, objects expire (delete) via S3 lifecycle."><div class="row"><input class="input mono" value={s()!.retentionDays} style={{ width: "90px" }} /> <span class="muted">days</span></div></Row>
+            <Row label="S3 bucket" hint="Source of truth. Verdigris never copies data out of it."><input class="input mono" value={s()!.bucket ?? ""} placeholder="not configured" style={{ width: "340px" }} /></Row>
+            <Row label="Region"><input class="input mono" value={s()!.region ?? ""} placeholder="not configured" style={{ width: "200px" }} /></Row>
+            <Row label="IAM role" hint="Assumed for query + lifecycle operations."><input class="input mono" value={s()!.iamRole ?? ""} placeholder="not configured" style={{ width: "420px" }} /></Row>
+            <Row label="Retention" hint="After this, objects expire (delete) via S3 lifecycle."><div class="row"><input class="input mono" value={s()!.retentionDays ?? ""} style={{ width: "90px" }} /> <span class="muted">days</span></div></Row>
           </Card>
 
           <Card class="pad-lg"><div style={{ "margin": "16px 0 10px" }}><CardHead title="Query compute" hint="storage and compute are decoupled — this dial only changes speed" /></div>

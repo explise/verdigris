@@ -1,0 +1,29 @@
+Verdigris
+Copyright 2026 The Verdigris Authors
+
+This product includes software developed at
+The Verdigris Project (https://github.com/verdigris/verdigris).
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this file except in compliance with the License. You may obtain a copy of
+the License at http://www.apache.org/licenses/LICENSE-2.0.
+
+---------------------------------------------------------------------------
+Third-party components
+---------------------------------------------------------------------------
+
+Verdigris embeds and builds upon the following open-source projects. Each is
+distributed under its own license; this NOTICE is informational only.
+
+  - Apache Arrow / Apache Parquet (Apache-2.0) — columnar in-memory format and
+    the on-disk file format logs are written to.
+  - Apache DataFusion (Apache-2.0) — the SQL query engine that reads Parquet
+    directly from object storage.
+  - object_store (Apache-2.0 / MIT) — the storage abstraction over S3, local
+    filesystem, and in-memory backends.
+  - tokio, axum, tower-http (MIT) — the async runtime and HTTP server.
+  - madsim (Apache-2.0) — the deterministic simulator used for testing.
+
+A complete, machine-readable inventory of dependencies and their licenses is
+available from the Cargo manifests (`Cargo.toml`, `Cargo.lock`); run
+`cargo tree` or `cargo about` to generate it.

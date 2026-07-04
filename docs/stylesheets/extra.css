@@ -1,0 +1,54 @@
+/* Verdigris brand — oxidized-copper green/teal on a warm-dark canvas.
+   Tokens mirror frontend/styles.css so the docs site matches the product. */
+:root {
+  --vdg-bg: #0a0d0c;
+  --vdg-ink: #e9efea;
+  --vdg-copper: #2c9d85;
+  --vdg-copper-bright: #46c9ab;
+  --vdg-copper-soft: #6fded8;
+  --vdg-copper-deep: #0d3b32;
+}
+
+/* Map Material's theme variables to the brand (slate scheme). */
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: var(--vdg-copper);
+  --md-primary-fg-color--light: var(--vdg-copper-bright);
+  --md-primary-fg-color--dark: var(--vdg-copper-deep);
+  --md-accent-fg-color: var(--vdg-copper-bright);
+  --md-default-bg-color: var(--vdg-bg);
+  --md-typeset-a-color: var(--vdg-copper-bright);
+  --md-code-hl-string-color: var(--vdg-copper-soft);
+}
+
+/* Header + footer in deep patina rather than the default teal. */
+.md-header,
+.md-tabs {
+  background: linear-gradient(150deg, var(--vdg-copper), var(--vdg-copper-deep) 90%);
+}
+
+/* Landing hero used on the home page. */
+.vdg-hero {
+  padding: 2.2rem 0 1rem;
+  border-bottom: 1px solid rgba(111, 222, 216, 0.14);
+  margin-bottom: 1.4rem;
+}
+.vdg-hero h1 {
+  font-size: 2.6rem;
+  line-height: 1.05;
+  margin: 0 0 0.3rem;
+  background: linear-gradient(120deg, var(--vdg-copper-soft), var(--vdg-copper));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.vdg-hero .tagline {
+  font-size: 1.05rem;
+  color: var(--vdg-copper-soft);
+  margin: 0;
+}
+
+/* Tier chips reused from the product palette. */
+.tier { font-weight: 600; border-radius: 4px; padding: 0.05em 0.45em; font-size: 0.85em; }
+.tier.hot  { color: #46c9ab; background: rgba(70, 201, 171, 0.12); }
+.tier.warm { color: #dca041; background: rgba(220, 160, 65, 0.12); }
+.tier.cold { color: #6b8f9e; background: rgba(107, 143, 158, 0.14); }

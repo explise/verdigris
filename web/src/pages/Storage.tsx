@@ -11,7 +11,7 @@ function TierCard(props: { t: Tier }) {
       <div class="tname"><span class={`badge ${props.t.id}`}><span class="dot" style={{ background: "currentColor" }} />{props.t.name}</span></div>
       <div class="tclass">{props.t.class}</div>
       <div class="tbig">{fmtBytes(props.t.bytesGB)}</div>
-      <div class="muted" style={{ "font-size": "11.5px", "margin-bottom": "8px" }}>{props.t.age}</div>
+      <div class="muted" style={{ "font-size": "11.5px", "margin-bottom": "8px" }}>{props.t.age || "—"}</div>
       <div class="trow"><span>Objects</span><span>{props.t.objects}</span></div>
       <div class="trow"><span>Storage / mo</span><span>{usd(props.t.perMonth)}</span></div>
     </div>
@@ -35,7 +35,10 @@ export default function Storage() {
       <Show when={s()} fallback={<div class="empty">loading…</div>}>
         <div class="view-body">
           <div class="tier-flow" style={{ "margin-bottom": "22px" }}>
-            <TierCard t={s()!.tiers[0]} /><Arrow lbl="after 3d" /><TierCard t={s()!.tiers[1]} /><Arrow lbl="after 30d" /><TierCard t={s()!.tiers[2]} />
+            {/* render whatever tiers exist — don't assume exactly 3 */}
+            <For each={s()!.tiers}>{(t, i) => (
+              <>{i() > 0 && <Arrow lbl={i() === 1 ? "after 3d" : "after 30d"} />}<TierCard t={t} /></>
+            )}</For>
           </div>
           <div class="grid cols-2">
             <Card class="pad-lg">

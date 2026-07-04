@@ -40,10 +40,20 @@ Seed: {{ .Values.seed.records }} synthetic records{{ if eq .Values.storage.backe
 No seed data. Ingest with:  kubectl exec deploy/{{ include "verdigris.fullname" . }} -- vdg ingest --table {{ .Values.table }} --generate 20000
 {{- end }}
 
+{{- if and (eq .Values.storage.backend "s3") .Values.ingest.dedicated }}
+
+Topology (s3): 1 ingest writer (Deployment/Service {{ include "verdigris.fullname" . }}-ingest)
+  + {{ .Values.replicaCount }} query replica(s) behind svc/{{ include "verdigris.fullname" . }}.
+{{- end }}
+{{- if and (eq .Values.storage.backend "s3") .Values.lifecycle.autoApply }}
+
+S3 lifecycle policy is applied on install/upgrade by a hook Job
+(vdg lifecycle --table {{ .Values.table }} --apply).
+{{- end }}
 {{- if .Values.vector.enabled }}
 
 Vector DaemonSet is enabled — tailing pod logs and shipping to POST /v1/ingest
-({{ .Values.vector.sinkEndpoint | default "in-cluster serve Service" }}).
+({{ .Values.vector.sinkEndpoint | default (ternary (printf "%s-ingest Service" (include "verdigris.fullname" .)) "in-cluster serve Service" (and (eq .Values.storage.backend "s3") .Values.ingest.dedicated)) }}).
 {{- end }}
 
 Ship logs yourself anytime (NDJSON, one JSON object per line):

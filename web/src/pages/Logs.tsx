@@ -23,13 +23,23 @@ export default function Logs() {
   const [confirm, setConfirm] = createSignal(false);
   const [lang, setLang] = createSignal<"SQL" | "DSL">("SQL");
 
-  const [query] = createResource(() => api(), (a) => a.queryLogs({ sql: sql(), tiers: tiers() }));
+  // `submitted` is the query that has actually been RUN — the resource keys on it,
+  // so editing the box doesn't refetch until Run/Enter. A fresh object each time
+  // means Run always re-executes, even with unchanged text.
+  const [submitted, setSubmitted] = createSignal({ sql: sql(), tiers: tiers() });
+  const [query] = createResource(
+    () => ({ a: api(), q: submitted() }),
+    ({ a, q }) => a.queryLogs({ sql: q.sql, tiers: q.tiers }),
+  );
   const [est] = createResource(tiers, (t) => api().estimate(t));
+
+  const execute = () => setSubmitted({ sql: sql(), tiers: tiers() });
 
   const toggleTier = (id: TierId) =>
     setTiers((cur) => (cur.includes(id) ? (cur.length > 1 ? cur.filter((x) => x !== id) : cur) : [...cur, id]));
 
-  const run = () => { if (gate() && tiers().includes("cold")) setConfirm(true); /* else: re-run query */ };
+  // Cold scans go through the confirm gate first; everything else runs immediately.
+  const run = () => { if (gate() && tiers().includes("cold")) { setConfirm(true); return; } execute(); };
 
   // virtualized rows
   let scrollEl!: HTMLDivElement;
@@ -128,7 +138,7 @@ export default function Logs() {
             </div>
             <div class="modal-actions">
               <button class="btn" onClick={() => setConfirm(false)}>Cancel</button>
-              <button class="btn primary" style={{ background: "linear-gradient(160deg,var(--warn),#b8801f)" }} onClick={() => setConfirm(false)}>Restore &amp; run</button>
+              <button class="btn primary" style={{ background: "linear-gradient(160deg,var(--warn),#b8801f)" }} onClick={() => { setConfirm(false); execute(); }}>Restore &amp; run</button>
             </div>
           </div>
         </div>

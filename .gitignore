@@ -7,3 +7,6 @@
 # Local overrides
 /config/local.toml
 .env
+
+# MkDocs rendered output (the public site is published from CI, not committed)
+/site

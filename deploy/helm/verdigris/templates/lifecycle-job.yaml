@@ -1,0 +1,66 @@
+{{- if and (eq .Values.storage.backend "s3") .Values.lifecycle.autoApply }}
+# S3 tiering: apply the bucket lifecycle policy (hot→warm→cold→expire) on every
+# install/upgrade. `vdg lifecycle --apply` calls S3 PutBucketLifecycleConfiguration
+# using the pod's IRSA / env credentials — so a fresh install actually tiers
+# instead of requiring a manual `aws s3api` step. Gated behind lifecycle.autoApply.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "verdigris.fullname" . }}-lifecycle
+  labels:
+    {{- include "verdigris.labels" . | nindent 4 }}
+    app.kubernetes.io/component: lifecycle
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        {{- include "verdigris.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: lifecycle
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "verdigris.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: lifecycle
+          image: {{ include "verdigris.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - lifecycle
+            - --table
+            - {{ .Values.table | quote }}
+            - --apply
+          env:
+            - name: VERDIGRIS_CONFIG
+              value: /etc/verdigris/verdigris.toml
+            {{- with .Values.storage.s3.region }}
+            - name: AWS_REGION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if and (not .Values.storage.s3.existingSecret) .Values.storage.s3.accessKeyId }}
+            - name: AWS_ACCESS_KEY_ID
+              value: {{ .Values.storage.s3.accessKeyId | quote }}
+            - name: AWS_SECRET_ACCESS_KEY
+              value: {{ .Values.storage.s3.secretAccessKey | quote }}
+            {{- end }}
+          {{- if .Values.storage.s3.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.storage.s3.existingSecret }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/verdigris
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "verdigris.fullname" . }}-config
+{{- end }}

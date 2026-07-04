@@ -20,9 +20,21 @@ pullSecrets: []
 # Logical table (key prefix in the store) that vdg serves and seeds.
 table: logs
 
-# Number of query/serve pods. Only honored for storage.backend=s3 — the local
-# backend is forced to 1 (a pod's filesystem is not shared).
+# Number of query/serve pods. Only honored for storage.backend=s3 with a
+# dedicated ingest tier (the default) — it scales the stateless QUERY tier. The
+# writer stays a single pod regardless. The local backend is always forced to 1
+# (a pod's filesystem is not shared).
 replicaCount: 1
+
+# --- Ingest / query topology (storage.backend=s3) ---------------------------
+# When dedicated=true (default for s3), the chart renders a single-writer
+# `--role ingest` Deployment (replicas 1) plus a scalable `--role query`
+# Deployment (replicas = replicaCount). This keeps writes on one pod so they
+# never race on the JSON manifest, while queries/UI scale out. Set false to run
+# a single combined `--role all` writer (replicas 1) — still safe, but no scale.
+# Ignored for the local backend (always a single `--role all` pod).
+ingest:
+  dedicated: true
 
 # --- Storage backend --------------------------------------------------------
 storage:
@@ -63,6 +75,11 @@ lifecycle:
   hotToWarmDays: 3
   warmToColdDays: 30
   expireDays: 400
+  # When true (and backend=s3), a post-install/upgrade hook Job runs
+  # `vdg lifecycle --table <table> --apply`, which calls S3
+  # PutBucketLifecycleConfiguration via the pod's IRSA creds — so tiering is live
+  # on a fresh install with no manual `aws s3api` step. No-op for backend=local.
+  autoApply: true
 
 # --- Persistence (storage.backend=local only) -------------------------------
 persistence:
@@ -132,10 +149,11 @@ affinity: {}
 # --- Vector log-shipping DaemonSet ------------------------------------------
 # Tails every pod's stdout/stderr and ships batched NDJSON to POST /v1/ingest.
 # Opt-in (off by default) — log shipping is a deployment choice. `sinkEndpoint`
-# defaults to the in-cluster serve Service, so `--set vector.enabled=true` alone
-# is enough. See deploy/README.md.
+# defaults to the dedicated ingest Service when one exists (s3 + ingest.dedicated),
+# otherwise the single serve Service — so `--set vector.enabled=true` alone is
+# enough. See deploy/README.md.
 vector:
   enabled: false
   image: timberio/vector:0.40.0-debian
-  # Override to POST logs elsewhere; empty = the in-cluster serve Service.
-  sinkEndpoint: ""   # e.g. http://vdg-verdigris:8080/v1/ingest
+  # Override to POST logs elsewhere; empty = the in-cluster ingest/serve Service.
+  sinkEndpoint: ""   # e.g. http://vdg-verdigris-ingest:8080/v1/ingest

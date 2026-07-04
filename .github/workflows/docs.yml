@@ -1,0 +1,57 @@
+# Build the MkDocs site and publish it to GitHub Pages.
+#
+# This runs on a GitHub-hosted repo only. Two ways to use it, matching a
+# "public docs, private code" setup:
+#
+#   A) The docs live in their own PUBLIC GitHub repo (mkdocs.yml + docs/).
+#      Drop this file in that repo; every push to main rebuilds and deploys.
+#
+#   B) The code stays PRIVATE on your own host and you mirror just the docs
+#      (mkdocs.yml + docs/ + this workflow) to a small public GitHub repo — no
+#      source is exposed, only the rendered site.
+#
+# Enable once: repo Settings → Pages → "Build and deployment" → Source =
+# "GitHub Actions". The site then serves at https://<owner>.github.io/<repo>/.
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths: ["docs/**", "mkdocs.yml", ".github/workflows/docs.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; don't cancel an in-flight publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install mkdocs-material
+      # No --strict: a few docs cross-link to repo files (LICENSE, deploy/…) that
+      # aren't site pages; those are intentional and would fail strict mode.
+      - run: mkdocs build --site-dir _site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

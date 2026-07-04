@@ -6,6 +6,10 @@ const C = { copper: "#46c9ab", grid: "#1e2823" };
 
 export function AreaSVG(props: { data: number[]; color?: string; max?: number; h?: number }) {
   const h = props.h ?? 150, w = 560, pad = 8;
+  // Need ≥2 points to draw a line; anything less would divide by (n-1)=0.
+  if ((props.data?.length ?? 0) < 2) {
+    return <div class="empty" style={{ height: `${h}px`, display: "grid", "place-items": "center" }}>no data yet</div>;
+  }
   const color = props.color ?? C.copper;
   const max = props.max ?? (Math.max(...props.data) * 1.15 || 1);
   const n = () => props.data.length;
