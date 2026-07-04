@@ -2,8 +2,8 @@
 
 Verdigris ships as a single container image and a Helm chart, so a production install is
 one `helm install`. Data lands in **your own S3 bucket**; the pods are stateless and scale
-freely. This page covers the production path — the [Quickstart](getting-started.md) covers
-the local loop.
+freely. This page is the full production reference — the [Quickstart](getting-started.md) is
+the fast path from zero to logs in S3.
 
 !!! note "The whole promise"
     One binary, `helm install`, done — running against your bucket, with no static keys

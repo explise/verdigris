@@ -108,8 +108,8 @@ See [Cost & tiering](cost.md#the-lifecycle-policy).
 
 ## Authentication (`[auth]`)
 
-An optional bearer-token gate on the `/v1/*` HTTP API. **Off by default**, so the local loop
-and existing behavior are unchanged.
+An optional bearer-token gate on the `/v1/*` HTTP API. **Off by default** so a fresh install
+comes up without friction; turn it on for any real deployment.
 
 ```toml
 [auth]

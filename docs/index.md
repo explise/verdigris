@@ -78,30 +78,28 @@ breakdown.
 - **One `helm install`, done** — a single binary + Helm chart brings up ingest, query, UI,
   and tiering on EKS. Data lands in your bucket via IRSA — no static keys.
 
-## Quickstart
+## Deploy it
 
-Run the whole loop locally:
+Verdigris runs in **your** EKS cluster against **your** S3 bucket — one `helm install`:
 
 ```bash
-# 1. Start the server (first build pulls DataFusion, ~1.5 min).
-cargo run -p vdg --features serve -- serve --table logs
-
-# 2. In another terminal, keep synthetic logs flowing.
-cargo run -- ingest --table logs --follow
-
-# 3. Open the UI.
-open http://localhost:8080
+helm install vdg deploy/helm/verdigris \
+  --set image.repository=<registry>/verdigris --set image.tag=0.0.1 \
+  --set storage.backend=s3 \
+  --set storage.s3.bucket=my-company-logs \
+  --set-string serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<acct>:role/verdigris-s3
 ```
 
-For the full step-by-step version of this loop, see the [Quickstart](getting-started.md).
-Deploy on EKS + S3 with one `helm install` — see [Install on EKS](install.md).
+Then point your existing **Vector / Fluent Bit / OpenTelemetry** pipeline at it — no app
+changes — and your logs land as Parquet in your bucket, queried in place. Full walkthrough in
+the [Quickstart](getting-started.md); every chart value in [Install on EKS](install.md).
 
 ## Where to next
 
 <div class="grid cards" markdown>
 
-- :material-rocket-launch-outline: **[Quickstart](getting-started.md)** — the 5-minute
-  local loop: build, stream logs, open the UI, run a query.
+- :material-rocket-launch-outline: **[Quickstart](getting-started.md)** — deploy to your EKS
+  cluster, point your log pipeline at it, and query in place.
 - :material-kubernetes: **[Install on EKS](install.md)** — production on your own S3
   bucket with one `helm install`; IRSA, no static keys.
 - :material-upload-network: **[Sending logs](sending-logs.md)** — Vector, Fluent Bit, and

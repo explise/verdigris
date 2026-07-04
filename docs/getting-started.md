@@ -1,74 +1,66 @@
 # Quickstart
 
-Get the whole loop — ingest → tier → query → cost-estimate → browser UI — running
-on your laptop in about five minutes. No AWS, no S3: the default storage backend is
-your local filesystem, so everything here is fully offline.
+Verdigris runs **inside your own EKS cluster** and writes to **your own S3 bucket** — a
+drop-in replacement for your logging backend that never moves data out of your AWS account.
+This page takes you from nothing to logs landing in S3 and queried in place, in three steps:
+
+1. **Install** the chart into your cluster (pointed at your bucket).
+2. **Point your log pipeline** at it (Vector / Fluent Bit / OTLP — no app changes).
+3. **Query** in place — SQL or the search DSL, in the UI or over HTTP.
 
 !!! note "What you need"
-    A recent Rust toolchain (`cargo`). The first `serve` build pulls in DataFusion and
-    the HTTP stack, so budget ~1.5 minutes for it; subsequent runs are fast. The default
-    build has neither DataFusion nor the server (those are behind feature flags), which
-    keeps ordinary builds quick and dependency-light.
+    An EKS cluster, an S3 bucket you own, and an IRSA role that can read/write that bucket —
+    so **no static keys** live in the cluster. The container image + Helm chart are the only
+    artifacts. Just want to kick the tires without AWS? Jump to [Evaluate locally](#evaluate-locally).
 
-## 1. Start the server
+## 1. Install into your cluster
 
-`vdg serve` hosts both the `/v1/*` HTTP API and the static web UI on port `8080`.
-
-```bash
-# feature `serve` implies `datafusion` — you get the real query engine + HTTP API.
-cargo run -p vdg --features serve -- serve --table logs
-```
-
-By default this runs in the `all` role (read + write + UI on one process) against the
-local-filesystem store (`./data`). You'll see it print the URLs it's serving, including
-the ingest and tail endpoints.
-
-## 2. Stream some logs
-
-In a second terminal, keep synthetic logs flowing so time-relative queries like
-`last 1h` stay populated. `--follow` appends a fresh batch every few seconds, anchored
-to "now":
+Point the chart at your bucket and attach an IRSA role:
 
 ```bash
-cargo run -- ingest --table logs --follow
+helm install vdg deploy/helm/verdigris \
+  --set image.repository=<registry>/verdigris --set image.tag=0.0.1 \
+  --set storage.backend=s3 \
+  --set storage.s3.bucket=my-company-logs \
+  --set storage.s3.region=us-east-1 \
+  --set replicaCount=3 \
+  --set-string serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<acct>:role/verdigris-s3
 ```
 
-Prefer a one-shot load instead of a live stream? Generate a fixed number of records:
+The chart splits a single-writer **ingest** tier from a freely-scaled **query** tier, and — on
+an `s3` install — auto-applies the S3 lifecycle policy that ages logs hot → warm → cold. See
+[Install on EKS](install.md) for IAM, MinIO, and every value you can set.
+
+## 2. Point your log pipeline at it
+
+Verdigris ingests what your apps already emit — you don't change how they log. Turn on the
+bundled Vector DaemonSet that tails every pod's stdout/stderr:
 
 ```bash
-cargo run -- ingest --table logs --generate 20000
+helm upgrade vdg deploy/helm/verdigris --reuse-values --set vector.enabled=true
 ```
 
-Both write compacted Parquet into the table's tier prefixes and update the manifest.
-The synthetic generator is deterministic (seeded), so the same seed always produces the
-same logs.
+Already running Vector, Fluent Bit, or an OpenTelemetry Collector? Just add Verdigris as a
+sink — `POST /v1/ingest` for NDJSON, `POST /v1/otlp/logs` for native OTLP. See
+[Sending logs](sending-logs.md).
 
-!!! tip "Ingesting your own logs"
-    You're not limited to synthetic data. `vdg ingest --from <file.ndjson>` loads real
-    NDJSON logs (one JSON object per line), and once the server is up you can `POST`
-    logs straight to `/v1/ingest`. See [Sending logs](sending-logs.md).
+## 3. Query in place
 
-## 3. Open the UI
+Reach the UI/API through your ingress (or a quick port-forward):
 
 ```bash
-open http://localhost:8080
+kubectl port-forward svc/vdg-verdigris 8080:8080
+# UI + API at http://localhost:8080
 ```
 
-You get the log explorer: a query bar, a severity histogram, tier pills with a live
-cost estimate, and expandable rows. There's also a **Live tail** page that streams new
-rows as they arrive (backed by the `GET /v1/tail` SSE endpoint).
-
-## 4. Run your first query
-
-The query bar accepts **either** a concise search DSL **or** raw SQL — Verdigris detects
-which and compiles the DSL down to SQL. Try the DSL first:
+The query bar takes **either** a concise search DSL **or** raw SQL — Verdigris detects which
+and compiles the DSL to SQL. Try the DSL:
 
 ```text
 service:auth status>=500 | last 1h
 ```
 
-That means "records from the `auth` service with an HTTP-ish status ≥ 500, in the last
-hour." Then try raw SQL against the same table:
+…or raw SQL against the same table:
 
 ```sql
 SELECT level, service, count(*)
@@ -77,43 +69,43 @@ GROUP BY level, service
 ORDER BY 3 DESC
 ```
 
-Both read Parquet **in place** from the store — there is no rehydration step. See
-[Querying](querying.md) for the full DSL grammar and the SQL surface.
+Both read Parquet **in place** from your bucket — no rehydration, no data leaving your account.
+Records are routed by severity to hot/warm/cold prefixes at write time, and queries scan only
+the files the manifest lists. See [Querying](querying.md) for the full surface and
+[Cost & tiering](cost.md) for how the cold-scan estimator keeps queries cheap.
 
-### From the command line
+## Evaluate locally
 
-You can also query without the server, straight from the CLI (needs the `datafusion`
-feature):
+Want to see it work before touching a cluster? The same image runs a zero-config local demo —
+a filesystem backend seeded with synthetic logs, no AWS:
 
 ```bash
-cargo run --features datafusion -- sql --table logs \
-  "SELECT service, count(*) FROM logs GROUP BY service ORDER BY 2 DESC"
+helm install vdg deploy/helm/verdigris \
+  --set image.repository=<registry>/verdigris --set image.tag=0.0.1
+kubectl port-forward svc/vdg-verdigris 8080:8080   # http://localhost:8080
 ```
 
-## What just happened
+Or run the binary straight from a checkout (needs a Rust toolchain; the first `serve` build
+pulls in DataFusion, ~1.5 min):
 
-```
-  vdg ingest ──► Parquet + manifest in ./data/logs/{hot,warm,cold}/
-                     │
-  vdg serve ──► DataFusion reads those Parquet files in place ──► UI / API
+```bash
+cargo run -p vdg --features serve -- serve --table logs      # server + UI on :8080
+cargo run -- ingest --table logs --follow                    # stream synthetic logs
 ```
 
-Records were **routed by severity** to hot/warm/cold prefixes at write time (ERROR→hot,
-WARN/INFO→warm, DEBUG→cold by default), batched into Parquet, and recorded in a JSON
-manifest that acts as the table catalog. Queries register exactly the files the manifest
-lists and scan them directly.
+These are for evaluation only — production is the S3 path above.
 
 ## Where to next
 
 <div class="grid cards" markdown>
 
-- :material-kubernetes: **[Install on EKS](install.md)** — take the same binary to
-  production against your own S3 bucket, with a single `helm install`.
-- :material-upload-network: **[Sending logs](sending-logs.md)** — Vector, Fluent Bit,
-  and native OTLP/HTTP.
-- :material-database-search: **[Querying](querying.md)** — the search DSL, SQL, Arrow
-  vs JSON, and the live tail.
-- :material-cash-multiple: **[Cost & tiering](cost.md)** — how storage, compute, and
-  the cold-scan cost estimator fit together.
+- :material-kubernetes: **[Install on EKS](install.md)** — IAM/IRSA, the ingest/query split,
+  lifecycle auto-apply, and every chart value.
+- :material-upload-network: **[Sending logs](sending-logs.md)** — Vector, Fluent Bit, and
+  native OTLP/HTTP.
+- :material-database-search: **[Querying](querying.md)** — the search DSL, SQL, Arrow vs JSON,
+  and the live tail.
+- :material-cash-multiple: **[Cost & tiering](cost.md)** — storage, the compute dial, and the
+  cold-scan cost estimator.
 
 </div>
