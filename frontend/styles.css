@@ -28,6 +28,12 @@
   --glow:          rgba(70,201,171,.13);
   --glow-strong:   rgba(70,201,171,.22);
 
+  /* logo mark — oxidizes top→bottom (copper newest, verdigris ages down) */
+  --brand-copper: #C98A55;
+  --brand-verd-1: #6FB6A9;
+  --brand-verd-2: #3FA492;
+  --brand-verd-3: #245e55;
+
   /* semantic */
   --error:  #e36a6a;
   --error-soft: rgba(227,106,106,.14);
@@ -79,13 +85,18 @@ body {
 }
 .brand { display: flex; align-items: center; gap: 12px; padding: 6px 8px 16px; }
 .brand .logo {
-  width: 38px; height: 38px; border-radius: 11px; flex: none;
-  background: linear-gradient(150deg, var(--copper-bright), var(--copper) 55%, var(--copper-deep));
+  width: 36px; height: 36px; border-radius: 10px; flex: none;
+  background: var(--panel-3);
   display: grid; place-items: center;
-  box-shadow: 0 0 0 1px rgba(70,201,171,.25), 0 8px 22px -10px var(--glow-strong);
+  box-shadow: inset 0 0 0 1px var(--line-hi);
 }
-.brand .logo svg { width: 21px; height: 21px; }
-.brand .name { font-size: 17px; font-weight: 650; letter-spacing: -.01em; }
+.brand .logo svg { width: 30px; height: 30px; }
+.brand .name {
+  font-family: "Space Grotesk", var(--sans);
+  font-size: 18px; font-weight: 600; letter-spacing: -.02em;
+}
+.wm-a { color: var(--brand-copper); }
+.wm-b { color: var(--brand-verd-2); }
 .brand .env {
   margin-top: 3px; font-size: 11.5px; color: var(--copper); font-family: var(--mono);
   background: none; border: none; padding: 0; cursor: pointer; display: inline-flex; gap: 4px; align-items: center;

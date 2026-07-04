@@ -50,10 +50,16 @@ export function Sidebar() {
     <aside class="sidebar">
       <div class="brand">
         <div class="logo" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke="#04140f" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h11" /></svg>
+          <svg viewBox="0 0 48 48" fill="none">
+            <rect x="5" y="7" width="30" height="6" rx="3" fill="var(--brand-copper)" />
+            <rect x="38" y="6.5" width="5.5" height="7" rx="1.5" fill="var(--brand-copper)" />
+            <rect x="5" y="17" width="20" height="6" rx="3" fill="var(--brand-verd-1)" />
+            <rect x="5" y="27" width="28" height="6" rx="3" fill="var(--brand-verd-2)" />
+            <rect x="5" y="37" width="15" height="6" rx="3" fill="var(--brand-verd-3)" />
+          </svg>
         </div>
         <div>
-          <div class="name">Verdigris</div>
+          <div class="name"><span class="wm-a">verdi</span><span class="wm-b">gris</span></div>
           <Switcher />
         </div>
       </div>
