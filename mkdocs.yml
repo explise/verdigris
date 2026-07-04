@@ -9,8 +9,7 @@ site_description: >-
   S3-native log storage & query engine in Rust — the layer your infrastructure
   leaves behind. A self-hostable Datadog alternative that keeps log data in your
   own cloud account.
-# Update to your Pages URL once the docs repo exists (placeholder for now):
-site_url: https://example.github.io/verdigris/
+site_url: https://explise.github.io/verdigris/
 docs_dir: docs
 site_dir: site
 
