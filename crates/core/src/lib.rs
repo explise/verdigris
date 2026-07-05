@@ -19,6 +19,7 @@ pub mod manifest;
 pub mod model;
 pub mod rng;
 pub mod search;
+pub mod text;
 
 pub use batch::{BatchPolicy, Batcher, LogRecord};
 pub use clock::{Clock, Millis, SimClock};

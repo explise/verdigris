@@ -147,6 +147,7 @@ mod tests {
             tier,
             services: vec![],
             levels: vec![],
+            message_trigrams: None,
         }
     }
 
@@ -195,6 +196,12 @@ mod tests {
         assert_eq!(e.files_touched, 3);
     }
 
+    fn trigrams_of(text: &str) -> Option<crate::text::TrigramSet> {
+        let mut t = crate::text::TrigramSet::new();
+        t.insert_text(text);
+        Some(t)
+    }
+
     #[test]
     fn value_predicate_prunes_files_it_proves_empty() {
         use crate::manifest::Predicate;
@@ -203,15 +210,18 @@ mod tests {
         m.add(DataFile {
             path: "logs/hot/auth".into(), bytes: 1000, rows: 1, min_ts: 0, max_ts: 10,
             tier: Tier::Hot, services: vec!["auth".into()], levels: vec!["ERROR".into()],
+            message_trigrams: trigrams_of("connection timeout to db-primary"),
         });
         m.add(DataFile {
             path: "logs/hot/billing".into(), bytes: 3000, rows: 1, min_ts: 0, max_ts: 10,
             tier: Tier::Hot, services: vec!["billing".into()], levels: vec!["INFO".into()],
+            message_trigrams: trigrams_of("invoice generated"),
         });
         // A legacy file with no stats must always be scanned (no false prune).
         m.add(DataFile {
             path: "logs/hot/legacy".into(), bytes: 500, rows: 1, min_ts: 0, max_ts: 10,
             tier: Tier::Hot, services: vec![], levels: vec![],
+            message_trigrams: None,
         });
 
         // service:auth → the billing file is proven empty and skipped; auth + legacy stay.
@@ -220,6 +230,26 @@ mod tests {
         );
         assert_eq!(e.scan_bytes, 1000 + 500, "billing file pruned, legacy kept");
         assert_eq!(e.files_touched, 2);
+
+        // Free text `timeout` → only the auth file's trigrams admit it; the
+        // billing file is proven match-free, the stat-less legacy file stays.
+        let e = estimate_scan(
+            &m, &[Tier::Hot], None, &[Predicate::message_contains("timeout")],
+            1e9, RetrievalMode::Standard,
+        );
+        assert_eq!(e.scan_bytes, 1000 + 500, "free text pruned billing, kept legacy");
+        // A substring *inside* a word must not prune the file containing it.
+        let e = estimate_scan(
+            &m, &[Tier::Hot], None, &[Predicate::message_contains("imeou")],
+            1e9, RetrievalMode::Standard,
+        );
+        assert_eq!(e.scan_bytes, 1000 + 500, "in-word substring still matches auth file");
+        // A term too short to judge (< 3 chars) never prunes anything.
+        let e = estimate_scan(
+            &m, &[Tier::Hot], None, &[Predicate::message_contains("db")],
+            1e9, RetrievalMode::Standard,
+        );
+        assert_eq!(e.files_touched, 3, "short terms cannot prove absence");
 
         // No predicate → nothing pruned by value.
         let all = estimate_scan(&m, &[Tier::Hot], None, &[], 1e9, RetrievalMode::Standard);

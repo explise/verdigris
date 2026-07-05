@@ -65,13 +65,16 @@ pub fn looks_like_sql(input: &str) -> bool {
     t.starts_with("select") || t.starts_with("with")
 }
 
-/// Extract the file-prunable equality predicates (`service:auth`, `level:error`,
-/// `service==x`) from a DSL query's filter terms, for metadata-only file skipping
-/// shared by the estimator and the executor.
+/// Extract the file-prunable predicates from a DSL query's filter terms, for
+/// metadata-only file skipping shared by the estimator and the executor.
 ///
-/// Only pure equality on the stat-carrying columns (`service`, `level`) qualifies.
-/// Ranges (`status>=500`), negations (`level!=info`), free text, and attribute
-/// matches are ignored — none can prove a file value-free, so they must not prune.
+/// Two kinds qualify: pure equality on the stat-carrying columns (`service:auth`,
+/// `level:error`, `service==x`) and free-text terms (`timeout` → prunable via the
+/// per-file `message` trigram set). Ranges (`status>=500`), negations
+/// (`level!=info`), and attribute matches are ignored — none can prove a file
+/// value-free, so they must not prune. A free-text token containing a SQL LIKE
+/// wildcard (`%`/`_`) is also skipped: it reaches the engine as a wildcard, so
+/// its literal trigrams aren't a necessary condition for a match.
 /// Raw SQL returns empty (we don't parse arbitrary SQL predicates); its files are
 /// pruned by tier + time window only, which is always safe.
 ///
@@ -79,7 +82,7 @@ pub fn looks_like_sql(input: &str) -> bool {
 /// and how [`to_sql`] emits them, so the predicate compares against the recorded
 /// per-file stats correctly.
 pub fn stat_predicates(input: &str) -> Vec<crate::manifest::Predicate> {
-    use crate::manifest::{Predicate, StatColumn};
+    use crate::manifest::Predicate;
     if looks_like_sql(input) {
         return Vec::new();
     }
@@ -89,13 +92,22 @@ pub fn stat_predicates(input: &str) -> Vec<crate::manifest::Predicate> {
     for token in filter_part.split_whitespace() {
         if let Some((key, value)) = equality_term(token) {
             match key {
-                "service" => preds.push(Predicate { column: StatColumn::Service, value: value.to_string() }),
-                "level" => preds.push(Predicate { column: StatColumn::Level, value: value.to_uppercase() }),
+                "service" => preds.push(Predicate::service(value)),
+                "level" => preds.push(Predicate::level(value.to_uppercase())),
                 _ => {} // other columns have no per-file value stats
             }
+        } else if is_free_text(token) && !token.contains(['%', '_']) {
+            preds.push(Predicate::message_contains(token));
         }
     }
     preds
+}
+
+/// Does `token` translate as a bare free-text word (→ `message ILIKE '%…%'`)?
+/// Mirrors [`translate_term`]: anything carrying a comparison operator or a
+/// `field:` prefix is not free text.
+fn is_free_text(token: &str) -> bool {
+    !token.contains(['=', '>', '<', '!', ':'])
 }
 
 /// If `token` is a pure equality term (`key:value`, `key=value`, `key==value`),
@@ -290,17 +302,19 @@ mod tests {
     }
 
     #[test]
-    fn stat_predicates_extract_only_prunable_equality() {
-        use crate::manifest::{Predicate, StatColumn};
-        // service/level equality → predicates; level upper-cased to match storage.
+    fn stat_predicates_extract_only_prunable_terms() {
+        use crate::manifest::Predicate;
+        // service/level equality and free text → predicates; level upper-cased
+        // to match storage; free text prunes via the message trigram stats.
         let p = stat_predicates("service:auth level:error status>=500 timeout | last 1h");
         assert_eq!(
             p,
             vec![
-                Predicate { column: StatColumn::Service, value: "auth".into() },
-                Predicate { column: StatColumn::Level, value: "ERROR".into() },
+                Predicate::service("auth"),
+                Predicate::level("ERROR"),
+                Predicate::message_contains("timeout"),
             ],
-            "only service/level equality prune; status range, free text, `last` do not"
+            "service/level equality and free text prune; status range and `last` do not"
         );
         // `==` is equality too.
         assert_eq!(stat_predicates("service==billing"), vec![Predicate::service("billing")]);
@@ -311,5 +325,9 @@ mod tests {
         assert!(stat_predicates("SELECT * FROM logs WHERE service='auth'").is_empty());
         // A column without value stats (trace_id) yields no file-level predicate.
         assert!(stat_predicates("trace_id:4ac9d21").is_empty());
+        // A free-text token carrying a LIKE wildcard reaches the engine as a
+        // wildcard pattern — its literal trigrams must not prune.
+        assert!(stat_predicates("time%out").is_empty());
+        assert!(stat_predicates("dead_lock").is_empty());
     }
 }

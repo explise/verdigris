@@ -193,6 +193,7 @@ impl Ingestor {
             tier,
             services: stats.services,
             levels: stats.levels,
+            message_trigrams: Some(stats.message_trigrams),
         })
     }
 
@@ -322,6 +323,7 @@ impl Ingestor {
                         tier,
                         services: encode::distinct_strings(&batches, "service"),
                         levels: encode::distinct_strings(&batches, "level"),
+                        message_trigrams: Some(encode::message_trigrams(&batches)),
                     });
                     for f in &bin {
                         to_delete.push(f.path.clone());
@@ -470,6 +472,7 @@ mod tests {
             tier: Tier::Hot,
             services: vec![],
             levels: vec![],
+            message_trigrams: None,
         }
     }
 
@@ -548,6 +551,75 @@ mod tests {
         assert_eq!(select_files(&m, &[Tier::Hot], None, &[Predicate::service("auth")]).len(), 1);
         assert_eq!(select_files(&m, &[Tier::Hot], None, &[Predicate::service("billing")]).len(), 1);
         assert!(select_files(&m, &[Tier::Hot], None, &[Predicate::service("gateway")]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn free_text_prunes_files_and_survives_compaction() {
+        use verdigris_core::batch::LogRecord;
+        use verdigris_core::estimate::select_files;
+        use verdigris_core::manifest::Predicate;
+        use verdigris_core::model::{Level, Tier};
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ing = Ingestor::new(store, "logs");
+        let routing = RoutingConfig::default();
+        let policy = BatchPolicy { max_rows: 1000, max_bytes: usize::MAX };
+
+        let rec = |msg: &str| LogRecord {
+            ts_millis: 1, level: Level::Error, service: "auth".into(),
+            status: Some(500), message: msg.into(), trace_id: None, attrs: Default::default(),
+        };
+        // Two separate hot files with distinct message vocabularies.
+        ing.ingest(vec![rec("connection timeout to db-primary")], &routing, policy)
+            .await
+            .unwrap();
+        ing.ingest(vec![rec("NullPointerException at AuthFilter.java:42")], &routing, policy)
+            .await
+            .unwrap();
+
+        let m = ing.load_manifest().await.unwrap();
+        assert_eq!(m.files.len(), 2);
+        assert!(m.files.iter().all(|f| f.message_trigrams.is_some()));
+
+        // A term unique to one file scans only that file — including an in-word
+        // substring, matching `ILIKE '%…%'` semantics ("ointer" ⊂ "NullPointer").
+        assert_eq!(
+            select_files(&m, &[Tier::Hot], None, &[Predicate::message_contains("timeout")]).len(),
+            1
+        );
+        assert_eq!(
+            select_files(&m, &[Tier::Hot], None, &[Predicate::message_contains("ointer")]).len(),
+            1
+        );
+        // A term in no file scans nothing; a short term can't prune anything.
+        assert!(
+            select_files(&m, &[Tier::Hot], None, &[Predicate::message_contains("kubelet")])
+                .is_empty()
+        );
+        assert_eq!(
+            select_files(&m, &[Tier::Hot], None, &[Predicate::message_contains("db")]).len(),
+            2
+        );
+
+        // Compaction merges both files and recomputes the trigram set from the
+        // merged rows — both vocabularies still match, absent terms still prune.
+        ing.compact(10 * 1024 * 1024).await.unwrap();
+        let m = ing.load_manifest().await.unwrap();
+        assert_eq!(m.files.len(), 1, "one compacted hot file");
+        for term in ["timeout", "ointer"] {
+            assert_eq!(
+                select_files(&m, &[Tier::Hot], None, &[Predicate::message_contains(term)]).len(),
+                1,
+                "term {term:?} must survive compaction"
+            );
+        }
+        assert!(
+            select_files(&m, &[Tier::Hot], None, &[Predicate::message_contains("kubelet")])
+                .is_empty()
+        );
+        // The recorded stat also round-trips the manifest JSON (base64 bitmap).
+        let t = m.files[0].message_trigrams.as_ref().unwrap();
+        assert_eq!(t.contains_term("db-primary"), Some(true));
     }
 
     #[tokio::test]

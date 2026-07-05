@@ -11,6 +11,7 @@
 //! exactly the "metadata-scale without data-scale" mechanism from ADR-001.
 
 use crate::model::Tier;
+use crate::text::TrigramSet;
 use serde::{Deserialize, Serialize};
 
 /// A stat-carrying string column whose per-file distinct values are recorded in
@@ -22,21 +23,28 @@ pub enum StatColumn {
     Level,
 }
 
-/// An equality predicate on a stat column (`column = value`), used to skip files
-/// at plan time. Deliberately equality-only: ranges/negations can't safely prove
-/// a file is value-free, so they never prune.
+/// A file-prunable predicate, used to skip files at plan time. Only predicates
+/// that can *prove* a file match-free qualify: equality on a stat column, and
+/// free-text substring via the trigram set. Ranges/negations never prune.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Predicate {
-    pub column: StatColumn,
-    pub value: String,
+pub enum Predicate {
+    /// `column = value` — checked against the per-file distinct-value stats.
+    Equals { column: StatColumn, value: String },
+    /// `message ILIKE '%term%'` (the DSL's free-text term) — checked against the
+    /// per-file trigram set, which prunes only when some trigram of `term` was
+    /// provably never written to the file.
+    MessageContains(String),
 }
 
 impl Predicate {
     pub fn service(value: impl Into<String>) -> Self {
-        Self { column: StatColumn::Service, value: value.into() }
+        Self::Equals { column: StatColumn::Service, value: value.into() }
     }
     pub fn level(value: impl Into<String>) -> Self {
-        Self { column: StatColumn::Level, value: value.into() }
+        Self::Equals { column: StatColumn::Level, value: value.into() }
+    }
+    pub fn message_contains(term: impl Into<String>) -> Self {
+        Self::MessageContains(term.into())
     }
 }
 
@@ -58,6 +66,12 @@ pub struct DataFile {
     /// Distinct `level` values in this file (sorted, deduped). Empty = not recorded.
     #[serde(default)]
     pub levels: Vec<String>,
+    /// Character-trigram presence set over this file's `message` column (~6.3 KB
+    /// bitmap, base64 in JSON), letting a free-text search skip the file when a
+    /// trigram of the term is provably absent. `None` = not recorded (legacy
+    /// file, or a corrupt stat) — never prunes. See [`crate::text`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_trigrams: Option<TrigramSet>,
 }
 
 impl DataFile {
@@ -70,14 +84,21 @@ impl DataFile {
 
     /// Could this file contain a row satisfying every predicate in `preds`?
     ///
-    /// A file is skippable for a predicate only when it has recorded values for
-    /// that column **and** the wanted value is absent from them. A column with no
-    /// recorded values (legacy/unknown) never prunes. So a `false` here is a proof
-    /// the file holds no matching row — pruning never drops a real match.
+    /// A file is skippable for a predicate only when it has recorded stats for
+    /// that predicate **and** those stats prove the value absent. Missing stats
+    /// (legacy/unknown/corrupt) never prune, and neither does a term too short to
+    /// judge. So a `false` here is a proof the file holds no matching row —
+    /// pruning never drops a real match.
     pub fn may_match(&self, preds: &[Predicate]) -> bool {
-        preds.iter().all(|p| {
-            let vals = self.stat_values(p.column);
-            vals.is_empty() || vals.iter().any(|v| v == &p.value)
+        preds.iter().all(|p| match p {
+            Predicate::Equals { column, value } => {
+                let vals = self.stat_values(*column);
+                vals.is_empty() || vals.iter().any(|v| v == value)
+            }
+            Predicate::MessageContains(term) => match &self.message_trigrams {
+                None => true,
+                Some(t) => t.contains_term(term).unwrap_or(true),
+            },
         })
     }
 }
@@ -140,6 +161,7 @@ mod tests {
             tier: Tier::Hot,
             services: vec![],
             levels: vec![],
+            message_trigrams: None,
         });
         m.add(DataFile {
             path: "logs/hot/part-1.parquet".into(),
@@ -150,6 +172,7 @@ mod tests {
             tier: Tier::Hot,
             services: vec![],
             levels: vec![],
+            message_trigrams: None,
         });
         assert_eq!(m.total_bytes(), 3000);
         assert_eq!(m.total_rows(), 30);
@@ -170,6 +193,7 @@ mod tests {
             tier: Tier::Hot,
             services: vec!["auth".into(), "billing".into()],
             levels: vec!["ERROR".into()],
+            message_trigrams: None,
         };
         // Present value → keep.
         assert!(f.may_match(&[Predicate::service("auth")]));
@@ -184,5 +208,37 @@ mod tests {
         let legacy = DataFile { services: vec![], levels: vec![], ..f.clone() };
         assert!(legacy.may_match(&[Predicate::service("anything")]));
         assert!(legacy.may_match(&[Predicate::level("DEBUG")]));
+    }
+
+    #[test]
+    fn message_predicate_prunes_only_on_provable_trigram_absence() {
+        let mut trigrams = crate::text::TrigramSet::new();
+        trigrams.insert_text("connection timeout to db-primary");
+        let f = DataFile {
+            path: "logs/hot/part.parquet".into(),
+            bytes: 1,
+            rows: 1,
+            min_ts: 0,
+            max_ts: 1,
+            tier: Tier::Hot,
+            services: vec![],
+            levels: vec![],
+            message_trigrams: Some(trigrams),
+        };
+        // Present term (and an in-word substring, ILIKE semantics) → keep.
+        assert!(f.may_match(&[Predicate::message_contains("timeout")]));
+        assert!(f.may_match(&[Predicate::message_contains("nnect")]));
+        // Provably absent term → skip.
+        assert!(!f.may_match(&[Predicate::message_contains("kubelet")]));
+        // Too short to judge → keep (never prune on a guess).
+        assert!(f.may_match(&[Predicate::message_contains("db")]));
+        // Combines with equality predicates under AND.
+        assert!(!f.may_match(&[
+            Predicate::message_contains("timeout"),
+            Predicate::message_contains("kubelet"),
+        ]));
+        // No recorded trigrams (legacy file) → never pruned by free text.
+        let legacy = DataFile { message_trigrams: None, ..f.clone() };
+        assert!(legacy.may_match(&[Predicate::message_contains("kubelet")]));
     }
 }

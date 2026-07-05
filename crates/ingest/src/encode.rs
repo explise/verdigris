@@ -17,6 +17,7 @@ use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 use std::sync::Arc;
 use verdigris_core::batch::LogRecord;
+use verdigris_core::text::TrigramSet;
 
 /// Parquet writer settings shared by ingest and compaction: zstd + **bloom
 /// filters** on the string lookup columns. A bloom filter lets the reader skip
@@ -72,6 +73,27 @@ pub struct FileStats {
     pub services: Vec<String>,
     /// Distinct `level` values in the file (sorted, deduped) — plan-time file skip.
     pub levels: Vec<String>,
+    /// Trigram presence set over the `message` column — plan-time file skip for
+    /// free-text search (see `verdigris_core::text`).
+    pub message_trigrams: TrigramSet,
+}
+
+/// Trigram set of the `message` column across `batches` — like
+/// [`distinct_strings`], recomputed from the actual merged rows at compaction so
+/// a compacted file prunes free-text searches even if its inputs predate the stat.
+pub fn message_trigrams(batches: &[RecordBatch]) -> TrigramSet {
+    let mut t = TrigramSet::new();
+    for batch in batches {
+        let Some(col) = batch.column_by_name("message") else { continue };
+        if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+            for i in 0..arr.len() {
+                if arr.is_valid(i) {
+                    t.insert_text(arr.value(i));
+                }
+            }
+        }
+    }
+    t
 }
 
 /// Distinct non-null values of a Utf8 column across `batches` (sorted, deduped).
@@ -146,12 +168,15 @@ pub fn encode_parquet(records: &[LogRecord]) -> Result<(Vec<u8>, FileStats)> {
 
     // Distinct service/level values, so a `service:auth` / `level:error` query can
     // skip this whole file at plan time when the value is absent (sorted+deduped
-    // via BTreeSet — deterministic, no RNG/HashMap order).
+    // via BTreeSet — deterministic, no RNG/HashMap order), plus the message
+    // trigram set so free-text searches can skip the file the same way.
     let mut svc = std::collections::BTreeSet::new();
     let mut lvl = std::collections::BTreeSet::new();
+    let mut trigrams = TrigramSet::new();
     for r in records {
         svc.insert(r.service.clone());
         lvl.insert(r.level.as_str().to_string());
+        trigrams.insert_text(&r.message);
     }
 
     let stats = FileStats {
@@ -160,6 +185,7 @@ pub fn encode_parquet(records: &[LogRecord]) -> Result<(Vec<u8>, FileStats)> {
         max_ts,
         services: svc.into_iter().collect(),
         levels: lvl.into_iter().collect(),
+        message_trigrams: trigrams,
     };
     Ok((buf, stats))
 }
