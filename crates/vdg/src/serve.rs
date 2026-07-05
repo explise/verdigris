@@ -24,7 +24,7 @@ use anyhow::Context;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -44,6 +44,7 @@ use object_store::ObjectStoreExt;
 use verdigris_core::alert::{
     self, Alert, AlertRule, AlertStatus, AlertsDoc, Comparator, State as AlertState, Transition,
 };
+use verdigris_core::auth::{self, ApiToken, Role as AuthRole, TokensDoc};
 use verdigris_core::batch::{BatchPolicy, LogRecord};
 use verdigris_core::config::{Config, StorageConfig};
 use verdigris_core::cost::{self, RetrievalMode};
@@ -101,6 +102,10 @@ struct AppState {
     /// Backpressure: caps concurrent in-flight ingest requests so a flood sheds
     /// (429) instead of piling parsed bodies up in memory.
     ingest_sem: Arc<tokio::sync::Semaphore>,
+    /// In-memory cache of the persisted API-token catalog. Auth checks read this
+    /// (not the store) per request; issue/revoke write through + a refresh task
+    /// reloads it so revocations propagate across replicas.
+    tokens: Arc<tokio::sync::RwLock<TokensDoc>>,
 }
 
 /// An error response: a status code + a JSON `{ "error": ... }` body. Defaults to
@@ -353,12 +358,16 @@ pub async fn serve(
     frontend: PathBuf,
     role: Role,
 ) -> anyhow::Result<()> {
-    // Resolve the effective API token BEFORE moving cfg into the shared state.
-    let auth_token = if cfg.auth.enabled {
+    // Auth setup (BEFORE cfg moves into the shared state). `[auth].token` (or
+    // VERDIGRIS_API_TOKEN), when set, is the BOOTSTRAP ADMIN secret — use it to
+    // issue per-user tokens via POST /v1/auth/tokens; those persist in the store
+    // and can be revoked without a restart. We keep only its hash.
+    let auth_enabled = cfg.auth.enabled;
+    let bootstrap_admin_hash: Option<Arc<String>> = if auth_enabled {
         match cfg.resolved_auth_token() {
-            Some(t) => Some(Arc::new(t)),
+            Some(t) => Some(Arc::new(auth::hash_token(&t))),
             None => anyhow::bail!(
-                "[auth].enabled is true but no token is set — set auth.token or VERDIGRIS_API_TOKEN"
+                "[auth].enabled is true but no bootstrap token is set — set auth.token or VERDIGRIS_API_TOKEN (it becomes the admin token)"
             ),
         }
     } else {
@@ -369,6 +378,13 @@ pub async fn serve(
     let max_body = cfg.ingest.max_body_bytes;
     let max_inflight = cfg.ingest.max_inflight.max(1);
 
+    // Load the persisted token catalog into the in-memory cache.
+    let boot_store = verdigris_storage::build(&cfg.storage).ok();
+    let tokens_doc = match &boot_store {
+        Some(s) => load_tokens(s).await.unwrap_or_default(),
+        None => TokensDoc::default(),
+    };
+
     let state = AppState {
         cfg: Arc::new(cfg),
         table: Arc::new(table),
@@ -376,6 +392,7 @@ pub async fn serve(
         alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
         alert_seq: Arc::new(AtomicU64::new(0)),
         ingest_sem: Arc::new(tokio::sync::Semaphore::new(max_inflight)),
+        tokens: Arc::new(tokio::sync::RwLock::new(tokens_doc)),
     };
 
     // Alert evaluator. On a writer role (the single manifest writer owns alert
@@ -392,6 +409,22 @@ pub async fn serve(
                     tokio::time::sleep(Duration::from_secs(15)).await;
                     if let Err(e) = evaluate_all(&s, table.as_str(), &lock).await {
                         tracing::warn!(error = %e, "alert scheduler tick failed");
+                    }
+                }
+            });
+        }
+    }
+
+    // Refresh the token cache periodically so an issue/revoke (persisted by the
+    // writer) propagates to reader replicas within the interval.
+    if auth_enabled {
+        if let Ok(s) = store(&state) {
+            let tokens = state.tokens.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                    if let Ok(doc) = load_tokens(&s).await {
+                        *tokens.write().await = doc;
                     }
                 }
             });
@@ -425,8 +458,20 @@ pub async fn serve(
             .route("/v1/settings", get(h_settings))
             .route("/v1/tail", get(h_tail));
     }
-    if let Some(token) = auth_token.clone() {
-        api = api.layer(middleware::from_fn_with_state(token, require_bearer));
+    // Token management (issue/list/revoke) — admin-only, enforced by
+    // `required_role`. Only mounted when auth is on; otherwise there's no
+    // identity and it would be an open door.
+    if role.serves_reads() && auth_enabled {
+        api = api
+            .route("/v1/auth/tokens", get(h_token_list).post(h_token_create))
+            .route("/v1/auth/tokens/{id}", delete(h_token_revoke));
+    }
+    if auth_enabled {
+        let auth_state = AuthState {
+            tokens: state.tokens.clone(),
+            bootstrap_admin_hash: bootstrap_admin_hash.clone(),
+        };
+        api = api.layer(middleware::from_fn_with_state(auth_state, require_auth));
     }
 
     // Static frontend + pre-auth config are added AFTER the auth layer so they are
@@ -471,7 +516,7 @@ pub async fn serve(
         println!("  ingest:   POST http://localhost:{port}/v1/ingest    (NDJSON logs)");
         println!("  otlp:     POST http://localhost:{port}/v1/otlp/logs (OTLP/JSON logs)");
     }
-    if auth_token.is_some() {
+    if auth_enabled {
         println!("  auth:     bearer-token required on /v1/*");
     }
     println!("  remember to set USE_MOCKS = false in frontend/api.js");
@@ -504,23 +549,196 @@ async fn write_disabled() -> AppError {
 
 /// Bearer-token auth middleware for the `/v1/*` surface. Applied only when
 /// `[auth].enabled` is set. Missing/wrong token → 401 `{"error":...}`.
-async fn require_bearer(
-    State(token): State<Arc<String>>,
-    req: Request,
-    next: Next,
-) -> Response {
-    let presented = req
+// ───────────────────────── authn / authz ─────────────────────────
+
+/// Middleware state for [`require_auth`].
+#[derive(Clone)]
+struct AuthState {
+    tokens: Arc<tokio::sync::RwLock<TokensDoc>>,
+    /// SHA-256 of the bootstrap admin secret (`[auth].token`), if configured.
+    bootstrap_admin_hash: Option<Arc<String>>,
+}
+
+/// The role a request requires. Reads (including the POST-bodied `/v1/query`
+/// and `/v1/query/estimate`) need ReadOnly; writes (ingest/OTLP, alert
+/// create/delete) need ReadWrite; token management needs Admin.
+fn required_role(method: &Method, path: &str) -> AuthRole {
+    if path.starts_with("/v1/auth/") {
+        return AuthRole::Admin;
+    }
+    match *method {
+        Method::POST if path == "/v1/ingest" || path == "/v1/otlp/logs" || path == "/v1/alerts" => {
+            AuthRole::ReadWrite
+        }
+        Method::DELETE if path.starts_with("/v1/alerts/") => AuthRole::ReadWrite,
+        _ => AuthRole::ReadOnly,
+    }
+}
+
+/// The presented secret: `Authorization: Bearer …`, or — for streams the
+/// browser's `EventSource` opens (which can't set headers) — `?access_token=…`.
+fn presented_secret(req: &Request) -> Option<String> {
+    if let Some(t) = req
         .headers()
         .get(AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "))
-        .map(str::trim);
-    if presented == Some(token.as_str()) {
-        next.run(req).await
-    } else {
-        AppError::with_status(StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
-            .into_response()
+    {
+        return Some(t.trim().to_string());
     }
+    req.uri().query().and_then(|q| {
+        q.split('&')
+            .find_map(|kv| kv.strip_prefix("access_token="))
+            .map(|v| v.to_string())
+    })
+}
+
+/// Authenticate the token to a [`Role`], then authorize against the route's
+/// [`required_role`]. 401 for missing/invalid/revoked; 403 for a valid token
+/// without sufficient role.
+async fn require_auth(State(auth): State<AuthState>, req: Request, next: Next) -> Response {
+    let Some(secret) = presented_secret(&req) else {
+        return AppError::with_status(StatusCode::UNAUTHORIZED, "missing bearer token")
+            .into_response();
+    };
+    let role = {
+        let hash = auth::hash_token(&secret);
+        if auth
+            .bootstrap_admin_hash
+            .as_deref()
+            .is_some_and(|b| b.as_str() == hash)
+        {
+            Some(AuthRole::Admin)
+        } else {
+            auth.tokens.read().await.authenticate(&secret).map(|t| t.role)
+        }
+    };
+    let Some(role) = role else {
+        return AppError::with_status(StatusCode::UNAUTHORIZED, "invalid or revoked token")
+            .into_response();
+    };
+    let required = required_role(req.method(), req.uri().path());
+    if !role.permits(required) {
+        return AppError::with_status(
+            StatusCode::FORBIDDEN,
+            format!(
+                "this endpoint requires the '{}' role (your token is '{}')",
+                required.as_str(),
+                role.as_str()
+            ),
+        )
+        .into_response();
+    }
+    next.run(req).await
+}
+
+fn tokens_path() -> ObjPath {
+    ObjPath::from("_auth/tokens.json")
+}
+
+async fn load_tokens(s: &Store) -> anyhow::Result<TokensDoc> {
+    match s.get(&tokens_path()).await {
+        Ok(res) => {
+            let bytes = res.bytes().await?;
+            serde_json::from_slice(&bytes).context("parsing tokens.json")
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(TokensDoc::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn save_tokens(s: &Store, doc: &TokensDoc) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(doc).context("serializing tokens.json")?;
+    s.put(&tokens_path(), bytes.into()).await?;
+    Ok(())
+}
+
+/// A fresh 256-bit token secret as hex. Returned to the caller once; only its
+/// hash is ever stored.
+fn gen_secret() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn default_role() -> AuthRole {
+    AuthRole::ReadOnly
+}
+
+#[derive(Deserialize)]
+struct NewToken {
+    name: String,
+    #[serde(default = "default_role")]
+    role: AuthRole,
+}
+
+async fn h_token_create(
+    State(st): State<AppState>,
+    Json(req): Json<NewToken>,
+) -> Result<Response, AppError> {
+    if req.name.trim().is_empty() {
+        return Err(AppError::bad_request("name is required"));
+    }
+    let secret = gen_secret();
+    let now = crate::now_millis() as u64;
+    let seq = st.alert_seq.fetch_add(1, Ordering::Relaxed);
+    let token = ApiToken {
+        id: format!("tok-{now}-{seq}"),
+        name: req.name,
+        role: req.role,
+        hash: auth::hash_token(&secret),
+        created_ms: now,
+        revoked: false,
+    };
+    let id = token.id.clone();
+    let s = store(&st)?;
+    {
+        let mut doc = st.tokens.write().await;
+        doc.tokens.push(token);
+        save_tokens(&s, &doc).await?;
+    }
+    // The secret is shown ONCE — only its hash is persisted.
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": id,
+            "token": secret,
+            "note": "store this now — it is not shown again",
+        })),
+    )
+        .into_response())
+}
+
+async fn h_token_list(State(st): State<AppState>) -> ApiResult {
+    let doc = st.tokens.read().await;
+    let out: Vec<Value> = doc
+        .tokens
+        .iter()
+        .map(|t| {
+            json!({
+                "id": t.id, "name": t.name, "role": t.role,
+                "createdMs": t.created_ms, "revoked": t.revoked,
+            })
+        })
+        .collect();
+    Ok(Json(Value::Array(out)))
+}
+
+async fn h_token_revoke(State(st): State<AppState>, AxPath(id): AxPath<String>) -> ApiResult {
+    let s = store(&st)?;
+    let mut doc = st.tokens.write().await;
+    let mut revoked = false;
+    for t in doc.tokens.iter_mut() {
+        if t.id == id && !t.revoked {
+            t.revoked = true;
+            revoked = true;
+        }
+    }
+    if revoked {
+        save_tokens(&s, &doc).await?;
+    }
+    Ok(Json(json!({ "revoked": revoked })))
 }
 
 /// The static-frontend service: real files from `frontend`, else index.html for

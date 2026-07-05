@@ -28,6 +28,8 @@ toml.workspace = true
 object_store.workspace = true
 bytes.workspace = true
 futures.workspace = true
+# Generating API-token secrets (random bytes → hex).
+rand.workspace = true
 axum = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
 # `apply`-only: object_store has no lifecycle API, so pushing the S3 lifecycle

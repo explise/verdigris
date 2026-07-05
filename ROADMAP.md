@@ -146,18 +146,19 @@ comment admits it's "only as good as its calibration").
 
 ### M2 — Multi-tenancy, auth & security
 
-**M2.1 — Real authn/authz beyond one shared bearer token.**
-*Problem:* auth is a single static token compared with `==` for every `/v1/*` request
-(`serve.rs` `require_bearer`; token from `[auth].token` / `VERDIGRIS_API_TOKEN`).
-There are no users, no per-user tokens, no roles. `EventSource` can't even send the
-header, so SSE tail needs a query-param/ingress workaround (noted in `STATUS.md`).
-*Why it matters:* no security team signs off on a single shared secret with no
-rotation, no identity, and no revocation. This is a hard adoption blocker for anyone
-past a solo demo.
-*Acceptance:*
-- OIDC/SSO login (or at minimum issued, revocable per-user API tokens).
-- RBAC: at least read-only vs read-write vs admin, enforced server-side per route.
-- Token rotation without downtime; SSE authenticated cleanly.
+**M2.1 — Real authn/authz beyond one shared bearer token. ✅ DONE (2026-07-06) — per-user tokens + RBAC; OIDC deferred.**
+Shipped: `crates/core/src/auth.rs` (pure `Role` {ReadOnly<ReadWrite<Admin}, `ApiToken`,
+`TokensDoc`, SHA-256 `hash_token`, `authenticate` — unit-tested). Per-user API tokens are
+**issued/revoked at runtime** via `POST/GET/DELETE /v1/auth/tokens` (admin-only), persisted as
+`_auth/tokens.json` storing **hashes only** (verified: raw secret never hits the store), cached
+in memory with a 20s refresh so revocations propagate across replicas. `[auth].token` /
+`VERDIGRIS_API_TOKEN` becomes the **bootstrap admin** secret. **RBAC** is enforced by
+`require_auth` mapping (method, path) → required role: 401 missing/invalid/revoked, 403 valid
+but under-privileged (verified end-to-end: no-token 401, readonly can query but ingest→403 and
+token-create→403, revoke→instant 401). **SSE** authenticates via `?access_token=` (EventSource
+can't set headers). Rotation is issue-new + revoke-old, no restart.
+*Deferred:* OIDC/SSO federation (this is the "at minimum: issued revocable per-user tokens"
+path); per-token scoping to tables/tenants (pairs with M2.2); a `web/` login UI.
 *Effort: L · Priority: P0.*
 
 **M2.2 — Real tenant isolation (reconcile flat backend vs `/:org/:env` UI).**
