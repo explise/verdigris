@@ -1,6 +1,6 @@
 //! Search-DSL → SQL translator.
 //!
-//! The frontend search bar speaks a Datadog-ish log query language; SQL remains
+//! The frontend search bar speaks a concise, familiar log query language; SQL remains
 //! the first-class interface (this just compiles down to it, so portability is
 //! preserved). Pure and sans-I/O: `now_millis` is passed in by the caller (from
 //! the real clock in the shell, or a fixed value under simulation) so time

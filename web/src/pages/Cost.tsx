@@ -11,7 +11,7 @@ const FALLBACK_COLORS = ["var(--hot)", "var(--warm)", "var(--cold)", "var(--copp
 export default function Cost() {
   const api = useApi();
   const [c] = createResource(() => api(), (a) => a.cost());
-  const savings = () => Math.round((1 - c()!.vsDatadog.ours / c()!.vsDatadog.datadog) * 100);
+  const savings = () => Math.round((1 - c()!.vsHosted.ours / c()!.vsHosted.hosted) * 100);
   // breakdown may omit `color` on real data → fall back to a token per index.
   const breakdown = () => c()!.breakdown.map((b, i) => ({ ...b, color: b.color || FALLBACK_COLORS[i % FALLBACK_COLORS.length] }));
   // "Glacier retrieval" line may be absent → don't `!`-deref a missing find().
@@ -27,7 +27,7 @@ export default function Cost() {
             <Stat label="Month to date" value={usd(c()!.monthToDate)} delta={<span class="delta flat">across all tiers</span>} />
             <Stat label="Projected" value={usd(c()!.projected)} delta={<span class={`delta ${c()!.projected > c()!.lastMonth ? "down" : "up"}`}>{c()!.projected > c()!.lastMonth ? "▲" : "▼"} vs {usd(c()!.lastMonth)} last mo</span>} />
             <Stat label="Glacier retrieval" value={usd(retrievalUsd())} delta={<span class="delta flat">pay only when queried</span>} />
-            <Stat label="vs Datadog (est)" class="" value={<span style={{ color: "var(--copper-bright)" }}>{savings()}%</span>} delta={<span class="delta up">cheaper · same volume</span>} />
+            <Stat label="vs hosted SaaS (est)" class="" value={<span style={{ color: "var(--copper-bright)" }}>{savings()}%</span>} delta={<span class="delta up">cheaper · same volume</span>} />
           </div>
           <div class="grid cols-2" style={{ "margin-bottom": "16px" }}>
             <Card class="pad-lg">

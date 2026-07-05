@@ -89,7 +89,7 @@ export interface Cost {
   monthToDate: number; projected: number; lastMonth: number;
   breakdown: CostBreakdownItem[];
   spendSeries: number[];
-  vsDatadog: { ours: number; datadog: number };
+  vsHosted: { ours: number; hosted: number };
   expensiveQueries: ExpensiveQuery[];
 }
 

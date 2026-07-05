@@ -1282,9 +1282,9 @@ async fn h_cost(State(st): State<AppState>) -> ApiResult {
         breakdown.push(json!({ "label": label, "usd": usd }));
     }
     let total_gib = m.total_bytes() as f64 / cost::GIB;
-    // Illustrative comparison: a SaaS log vendor bills ingest + indexed retention,
-    // roughly ~$2.50/GB-month-equivalent vs our object-storage cost.
-    let datadog = total_gib * 2.50;
+    // Illustrative comparison: a hosted SaaS log service bills ingest + indexed
+    // retention at roughly ~$2.50/GB-month-equivalent, vs our object-storage cost.
+    let hosted = total_gib * 2.50;
 
     Ok(Json(json!({
         "monthToDate": total,
@@ -1292,7 +1292,7 @@ async fn h_cost(State(st): State<AppState>) -> ApiResult {
         "lastMonth": total * 0.92,
         "breakdown": breakdown,
         "spendSeries": [],
-        "vsDatadog": { "ours": total, "datadog": datadog },
+        "vsHosted": { "ours": total, "hosted": hosted },
         // No query-history tracking yet — empty until that subsystem exists.
         "expensiveQueries": [],
     })))

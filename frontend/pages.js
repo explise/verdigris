@@ -408,14 +408,14 @@
     async render() {
       const c = await api.cost();
       const items = c.breakdown.map((b) => ({ ...b, value: b.usd }));
-      const savings = Math.round((1 - c.vsDatadog.ours / c.vsDatadog.datadog) * 100);
+      const savings = Math.round((1 - c.vsHosted.ours / c.vsHosted.hosted) * 100);
       return `${head("Cost", "Billing month to date · us-east-1", `<div class="seg"><button>7d</button><button class="on">30d</button><button>90d</button></div>`)}
         <div class="view-body">
           <div class="grid cols-4" style="margin-bottom:16px">
             <div class="card stat"><div class="label">Month to date</div><div class="value">${usd(c.monthToDate)}</div><div class="delta flat">across all tiers</div></div>
             <div class="card stat"><div class="label">Projected</div><div class="value">${usd(c.projected)}</div><div class="delta ${c.projected > c.lastMonth ? "down" : "up"}">${c.projected > c.lastMonth ? "▲" : "▼"} vs ${usd(c.lastMonth)} last mo</div></div>
             <div class="card stat"><div class="label">Glacier retrieval</div><div class="value">${usd(c.breakdown.find((b) => b.label.includes("retrieval")).usd)}</div><div class="delta flat">pay only when queried</div></div>
-            <div class="card stat" style="border-color:rgba(70,201,171,.3)"><div class="label">vs Datadog (est)</div><div class="value" style="color:var(--copper-bright)">${savings}%</div><div class="delta up">cheaper · same volume</div></div>
+            <div class="card stat" style="border-color:rgba(70,201,171,.3)"><div class="label">vs hosted SaaS (est)</div><div class="value" style="color:var(--copper-bright)">${savings}%</div><div class="delta up">cheaper · same volume</div></div>
           </div>
           <div class="grid cols-2" style="margin-bottom:16px">
             <div class="card pad-lg">

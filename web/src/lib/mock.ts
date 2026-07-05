@@ -129,7 +129,7 @@ export const mock = {
         { label: "Glacier retrieval", usd: 3.66, color: "var(--error)" },
       ],
       spendSeries: ser(30, 2.0, 0.7, 0.5),
-      vsDatadog: { ours: 92, datadog: 4180 },
+      vsHosted: { ours: 92, hosted: 4180 },
       expensiveQueries: [
         { q: "service:* level:ERROR | last 30d", tier: "cold", scanGB: 38, usd: 1.14, user: "ana@acme", when: "1h ago" },
         { q: "trace_id:4ac9* | last 14d", tier: "cold", scanGB: 22, usd: 0.66, user: "deploy-bot", when: "3h ago" },
