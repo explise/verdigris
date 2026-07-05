@@ -10,7 +10,7 @@
 //! Pure and sans-I/O: the shell supplies `now` (for the window) and throughput.
 
 use crate::cost::{self, RetrievalMode};
-use crate::manifest::{DataFile, Manifest};
+use crate::manifest::{DataFile, Manifest, Predicate};
 use crate::model::Tier;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,36 +44,44 @@ fn overlaps(f: &DataFile, window: Option<(i64, i64)>) -> bool {
     }
 }
 
-/// The files a query over `tiers` (optionally bounded to `window`) would touch —
-/// the single source of truth shared by the cost *estimate* and the *executed
-/// scan*. Registering exactly this set at query time means the quoted cost and
-/// the query it gates always read the same files (no "estimated hot, scanned
-/// cold" surprise bills).
+/// The files a query over `tiers` (optionally bounded to `window`, and to the
+/// equality `preds` on stat columns) would touch — the single source of truth
+/// shared by the cost *estimate* and the *executed scan*. Registering exactly this
+/// set at query time means the quoted cost and the query it gates always read the
+/// same files (no "estimated hot, scanned cold" surprise bills).
+///
+/// Pruning is layered and all metadata-only: tier → time window (`min_ts`/`max_ts`)
+/// → per-file value stats (`service`/`level`). A file survives only if it passes
+/// every layer; `preds` can only ever remove a file proven free of the value
+/// (`DataFile::may_match`), so pruning never drops a real match.
 pub fn select_files<'a>(
     manifest: &'a Manifest,
     tiers: &[Tier],
     window: Option<(i64, i64)>,
+    preds: &[Predicate],
 ) -> Vec<&'a DataFile> {
     manifest
         .files
         .iter()
-        .filter(|f| tiers.contains(&f.tier) && overlaps(f, window))
+        .filter(|f| tiers.contains(&f.tier) && overlaps(f, window) && f.may_match(preds))
         .collect()
 }
 
-/// Estimate the scan for a query touching `tiers`, optionally bounded to `window`.
+/// Estimate the scan for a query touching `tiers`, optionally bounded to `window`
+/// and to the equality `preds` on stat columns (`service`/`level`).
 /// `throughput_bytes_per_sec` is the provisioned query throughput (cores × rate).
 pub fn estimate_scan(
     manifest: &Manifest,
     tiers: &[Tier],
     window: Option<(i64, i64)>,
+    preds: &[Predicate],
     throughput_bytes_per_sec: f64,
     retrieval: RetrievalMode,
 ) -> QueryEstimate {
     // Bytes of touched files per tier (index 0/1/2 = hot/warm/cold).
     let mut per = [0u64; 3];
     let mut files_touched = 0;
-    for f in select_files(manifest, tiers, window) {
+    for f in select_files(manifest, tiers, window, preds) {
         per[f.tier.index()] += f.bytes;
         files_touched += 1;
     }
@@ -137,6 +145,8 @@ mod tests {
             min_ts,
             max_ts,
             tier,
+            services: vec![],
+            levels: vec![],
         }
     }
 
@@ -153,7 +163,7 @@ mod tests {
     fn time_window_prunes_files() {
         let m = manifest();
         // Window [800,1000], hot only: only the second hot file overlaps.
-        let e = estimate_scan(&m, &[Tier::Hot], Some((800, 1000)), 1e9, RetrievalMode::Standard);
+        let e = estimate_scan(&m, &[Tier::Hot], Some((800, 1000)), &[], 1e9, RetrievalMode::Standard);
         assert_eq!(e.scan_bytes, 2000);
         assert_eq!(e.files_touched, 1);
         assert_eq!(e.cost_usd, 0.0); // hot retrieval is free
@@ -163,7 +173,7 @@ mod tests {
     #[test]
     fn cold_tier_costs_and_needs_restore() {
         let m = manifest();
-        let e = estimate_scan(&m, &[Tier::Cold], None, 1e9, RetrievalMode::Standard);
+        let e = estimate_scan(&m, &[Tier::Cold], None, &[], 1e9, RetrievalMode::Standard);
         assert_eq!(e.scan_bytes, 5000);
         assert!(e.cost_usd > 0.0); // glacier flexible standard ~ $0.01/GB
         assert!(e.cold_restore);
@@ -177,11 +187,43 @@ mod tests {
             &m,
             &[Tier::Hot, Tier::Cold],
             None,
+            &[],
             1e9,
             RetrievalMode::Standard,
         );
         assert_eq!(e.scan_bytes, 1000 + 2000 + 5000);
         assert_eq!(e.files_touched, 3);
+    }
+
+    #[test]
+    fn value_predicate_prunes_files_it_proves_empty() {
+        use crate::manifest::Predicate;
+        let mut m = Manifest::new("logs");
+        // Two hot files with recorded service stats; one covers auth, one billing.
+        m.add(DataFile {
+            path: "logs/hot/auth".into(), bytes: 1000, rows: 1, min_ts: 0, max_ts: 10,
+            tier: Tier::Hot, services: vec!["auth".into()], levels: vec!["ERROR".into()],
+        });
+        m.add(DataFile {
+            path: "logs/hot/billing".into(), bytes: 3000, rows: 1, min_ts: 0, max_ts: 10,
+            tier: Tier::Hot, services: vec!["billing".into()], levels: vec!["INFO".into()],
+        });
+        // A legacy file with no stats must always be scanned (no false prune).
+        m.add(DataFile {
+            path: "logs/hot/legacy".into(), bytes: 500, rows: 1, min_ts: 0, max_ts: 10,
+            tier: Tier::Hot, services: vec![], levels: vec![],
+        });
+
+        // service:auth → the billing file is proven empty and skipped; auth + legacy stay.
+        let e = estimate_scan(
+            &m, &[Tier::Hot], None, &[Predicate::service("auth")], 1e9, RetrievalMode::Standard,
+        );
+        assert_eq!(e.scan_bytes, 1000 + 500, "billing file pruned, legacy kept");
+        assert_eq!(e.files_touched, 2);
+
+        // No predicate → nothing pruned by value.
+        let all = estimate_scan(&m, &[Tier::Hot], None, &[], 1e9, RetrievalMode::Standard);
+        assert_eq!(all.files_touched, 3);
     }
 
     // The executed scan (which registers `select_files`) and the cost estimate
@@ -197,15 +239,15 @@ mod tests {
             (vec![Tier::Hot, Tier::Cold], None),
             (vec![Tier::Warm], None), // no warm files → empty
         ] {
-            let selected = select_files(&m, &tiers, window);
-            let est = estimate_scan(&m, &tiers, window, 1e9, RetrievalMode::Standard);
+            let selected = select_files(&m, &tiers, window, &[]);
+            let est = estimate_scan(&m, &tiers, window, &[], 1e9, RetrievalMode::Standard);
             // Same count and same bytes the estimate charged for.
             assert_eq!(selected.len(), est.files_touched, "count parity {tiers:?} {window:?}");
             let bytes: u64 = selected.iter().map(|f| f.bytes).sum();
             assert_eq!(bytes, est.scan_bytes, "bytes parity {tiers:?} {window:?}");
         }
         // Hot-only never includes the cold file (the core of the M4.1 bug).
-        let hot = select_files(&m, &[Tier::Hot], None);
+        let hot = select_files(&m, &[Tier::Hot], None, &[]);
         assert!(hot.iter().all(|f| f.tier == Tier::Hot));
         assert_eq!(hot.len(), 2);
     }

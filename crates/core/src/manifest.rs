@@ -13,6 +13,33 @@
 use crate::model::Tier;
 use serde::{Deserialize, Serialize};
 
+/// A stat-carrying string column whose per-file distinct values are recorded in
+/// the manifest so a query can skip files that can't contain the wanted value —
+/// plan-time pruning before any Parquet is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatColumn {
+    Service,
+    Level,
+}
+
+/// An equality predicate on a stat column (`column = value`), used to skip files
+/// at plan time. Deliberately equality-only: ranges/negations can't safely prove
+/// a file is value-free, so they never prune.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Predicate {
+    pub column: StatColumn,
+    pub value: String,
+}
+
+impl Predicate {
+    pub fn service(value: impl Into<String>) -> Self {
+        Self { column: StatColumn::Service, value: value.into() }
+    }
+    pub fn level(value: impl Into<String>) -> Self {
+        Self { column: StatColumn::Level, value: value.into() }
+    }
+}
+
 /// One Parquet data file and the stats needed to plan/skip/price it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DataFile {
@@ -23,6 +50,36 @@ pub struct DataFile {
     pub min_ts: i64,
     pub max_ts: i64,
     pub tier: Tier,
+    /// Distinct `service` values in this file (sorted, deduped). **Empty means
+    /// "not recorded"** (a legacy file predating value stats) — an empty set never
+    /// prunes, so pruning can only ever drop files provably free of a value.
+    #[serde(default)]
+    pub services: Vec<String>,
+    /// Distinct `level` values in this file (sorted, deduped). Empty = not recorded.
+    #[serde(default)]
+    pub levels: Vec<String>,
+}
+
+impl DataFile {
+    fn stat_values(&self, column: StatColumn) -> &[String] {
+        match column {
+            StatColumn::Service => &self.services,
+            StatColumn::Level => &self.levels,
+        }
+    }
+
+    /// Could this file contain a row satisfying every predicate in `preds`?
+    ///
+    /// A file is skippable for a predicate only when it has recorded values for
+    /// that column **and** the wanted value is absent from them. A column with no
+    /// recorded values (legacy/unknown) never prunes. So a `false` here is a proof
+    /// the file holds no matching row — pruning never drops a real match.
+    pub fn may_match(&self, preds: &[Predicate]) -> bool {
+        preds.iter().all(|p| {
+            let vals = self.stat_values(p.column);
+            vals.is_empty() || vals.iter().any(|v| v == &p.value)
+        })
+    }
 }
 
 /// The set of files making up a table. (A single flat snapshot for now; real
@@ -81,6 +138,8 @@ mod tests {
             min_ts: 0,
             max_ts: 100,
             tier: Tier::Hot,
+            services: vec![],
+            levels: vec![],
         });
         m.add(DataFile {
             path: "logs/hot/part-1.parquet".into(),
@@ -89,6 +148,8 @@ mod tests {
             min_ts: 200,
             max_ts: 300,
             tier: Tier::Hot,
+            services: vec![],
+            levels: vec![],
         });
         assert_eq!(m.total_bytes(), 3000);
         assert_eq!(m.total_rows(), 30);
@@ -96,5 +157,32 @@ mod tests {
         let hit: Vec<_> = m.files_in_range(50, 150).collect();
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].path, "logs/hot/part-0.parquet");
+    }
+
+    #[test]
+    fn may_match_skips_only_on_recorded_absence() {
+        let f = DataFile {
+            path: "logs/hot/part.parquet".into(),
+            bytes: 1,
+            rows: 1,
+            min_ts: 0,
+            max_ts: 1,
+            tier: Tier::Hot,
+            services: vec!["auth".into(), "billing".into()],
+            levels: vec!["ERROR".into()],
+        };
+        // Present value → keep.
+        assert!(f.may_match(&[Predicate::service("auth")]));
+        assert!(f.may_match(&[Predicate::level("ERROR")]));
+        // Recorded but absent → provably skippable.
+        assert!(!f.may_match(&[Predicate::service("search")]));
+        assert!(!f.may_match(&[Predicate::level("DEBUG")]));
+        // All predicates must hold (AND): one miss skips the file.
+        assert!(!f.may_match(&[Predicate::service("auth"), Predicate::level("WARN")]));
+        assert!(f.may_match(&[Predicate::service("auth"), Predicate::level("ERROR")]));
+        // Legacy file (no recorded values) is never pruned — correctness over speed.
+        let legacy = DataFile { services: vec![], levels: vec![], ..f.clone() };
+        assert!(legacy.may_match(&[Predicate::service("anything")]));
+        assert!(legacy.may_match(&[Predicate::level("DEBUG")]));
     }
 }

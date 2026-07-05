@@ -65,6 +65,62 @@ pub fn looks_like_sql(input: &str) -> bool {
     t.starts_with("select") || t.starts_with("with")
 }
 
+/// Extract the file-prunable equality predicates (`service:auth`, `level:error`,
+/// `service==x`) from a DSL query's filter terms, for metadata-only file skipping
+/// shared by the estimator and the executor.
+///
+/// Only pure equality on the stat-carrying columns (`service`, `level`) qualifies.
+/// Ranges (`status>=500`), negations (`level!=info`), free text, and attribute
+/// matches are ignored — none can prove a file value-free, so they must not prune.
+/// Raw SQL returns empty (we don't parse arbitrary SQL predicates); its files are
+/// pruned by tier + time window only, which is always safe.
+///
+/// `level` values are upper-cased to match how they're stored (`Level::as_str`)
+/// and how [`to_sql`] emits them, so the predicate compares against the recorded
+/// per-file stats correctly.
+pub fn stat_predicates(input: &str) -> Vec<crate::manifest::Predicate> {
+    use crate::manifest::{Predicate, StatColumn};
+    if looks_like_sql(input) {
+        return Vec::new();
+    }
+    let (filter_part, _commands) = split_pipes(input);
+    let filter_part = normalize_operators(&filter_part);
+    let mut preds = Vec::new();
+    for token in filter_part.split_whitespace() {
+        if let Some((key, value)) = equality_term(token) {
+            match key {
+                "service" => preds.push(Predicate { column: StatColumn::Service, value: value.to_string() }),
+                "level" => preds.push(Predicate { column: StatColumn::Level, value: value.to_uppercase() }),
+                _ => {} // other columns have no per-file value stats
+            }
+        }
+    }
+    preds
+}
+
+/// If `token` is a pure equality term (`key:value`, `key=value`, `key==value`),
+/// return `(key, value)`. Any inequality/range operator (`!= >= <= > <`) yields
+/// `None` — those can't safely skip a file.
+fn equality_term(token: &str) -> Option<(&str, &str)> {
+    // Reject range/negation operators before matching `=` so `>=` isn't read as `=`.
+    for bad in ["!=", ">=", "<=", ">", "<"] {
+        if token.contains(bad) {
+            return None;
+        }
+    }
+    for op in ["==", "=", ":"] {
+        if let Some(idx) = token.find(op) {
+            let key = &token[..idx];
+            let value = &token[idx + op.len()..];
+            if key.is_empty() || value.is_empty() {
+                return None;
+            }
+            return Some((key, value));
+        }
+    }
+    None
+}
+
 /// Extract the `[from, to]` time window implied by a `| last <dur>` command, for
 /// metadata-only scan pruning. Returns `None` if the query has no time bound.
 pub fn time_window(input: &str, now_millis: i64) -> Option<(i64, i64)> {
@@ -231,5 +287,29 @@ mod tests {
     fn bad_inputs_error() {
         assert!(to_sql("status>=abc", "t", 0, 10).is_err());
         assert!(to_sql("foo | last 5x", "t", 0, 10).is_err());
+    }
+
+    #[test]
+    fn stat_predicates_extract_only_prunable_equality() {
+        use crate::manifest::{Predicate, StatColumn};
+        // service/level equality → predicates; level upper-cased to match storage.
+        let p = stat_predicates("service:auth level:error status>=500 timeout | last 1h");
+        assert_eq!(
+            p,
+            vec![
+                Predicate { column: StatColumn::Service, value: "auth".into() },
+                Predicate { column: StatColumn::Level, value: "ERROR".into() },
+            ],
+            "only service/level equality prune; status range, free text, `last` do not"
+        );
+        // `==` is equality too.
+        assert_eq!(stat_predicates("service==billing"), vec![Predicate::service("billing")]);
+        // Negation and ranges never prune.
+        assert!(stat_predicates("level!=info").is_empty());
+        assert!(stat_predicates("status>=500").is_empty());
+        // Raw SQL isn't parsed for predicates.
+        assert!(stat_predicates("SELECT * FROM logs WHERE service='auth'").is_empty());
+        // A column without value stats (trace_id) yields no file-level predicate.
+        assert!(stat_predicates("trace_id:4ac9d21").is_empty());
     }
 }
