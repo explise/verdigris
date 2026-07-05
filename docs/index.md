@@ -36,27 +36,7 @@ never price.
 
 ## Architecture at a glance
 
-```
-  pods on EKS
-      │  (stdout/stderr, OTLP)
-      ▼
-  Vector / Fluent Bit (DaemonSet) · OTel Collector      ← ingestion
-      │
-      ▼
-  Verdigris ingest  ── batches → Parquet, catalog metadata to S3
-      │
-      ▼
-  S3 (your own bucket)                                  ← tiered via S3 lifecycle
-      ├─ hot    : S3 Standard
-      ├─ warm   : Glacier Instant / Standard-IA
-      └─ cold   : Glacier Flexible
-      ▲
-      │  (query in place — no rehydration)
-  Verdigris query engine  (Apache DataFusion on Parquet)
-      │
-      ▼
-  Query API + Web UI + Grafana datasource
-```
+![Verdigris architecture: pods on EKS send logs through Vector, Fluent Bit or an OpenTelemetry Collector into Verdigris ingest, which writes tiered Parquet to your own S3 bucket; the DataFusion query engine reads it in place — no rehydration — and serves the API, web UI and Grafana.](assets/architecture.svg)
 
 Storage tiers: <span class="tier hot">hot</span> <span class="tier warm">warm</span>
 <span class="tier cold">cold</span> — decided at write time by severity, aged across S3

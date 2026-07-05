@@ -96,27 +96,9 @@ replacement-grade demo, from market research).
 
 ## Architecture
 
-```
-  pods on EKS
-      │  (stdout/stderr, OTLP)
-      ▼
-  Vector / Fluent Bit (DaemonSet)  ·  OTel Collector      ← ingestion
-      │
-      ▼
-  Verdigris ingest  ── batches → Parquet, writes catalog metadata to S3
-      │
-      ▼
-  S3 (your own bucket)                                     ← tiered via S3 lifecycle
-      ├─ hot    : S3 Standard          (recent, interactive)
-      ├─ warm   : Glacier Instant / Standard-IA
-      └─ cold   : Glacier Flexible     (cheapest queryable)
-      ▲
-      │  (query in place — no rehydration)
-  Verdigris query engine  (Apache DataFusion on Parquet)
-      │
-      ▼
-  Query API + Web UI + Grafana datasource
-```
+<p align="center">
+  <img src="docs/assets/architecture.svg" width="760" alt="Verdigris architecture: pods on EKS send logs through Vector, Fluent Bit or an OpenTelemetry Collector into Verdigris ingest, which writes tiered Parquet to your own S3 bucket; the DataFusion query engine reads it in place — no rehydration — and serves the API, web UI and Grafana.">
+</p>
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the component breakdown
 and [`docs/adr/`](docs/adr/) for the decisions behind it.
