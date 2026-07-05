@@ -29,7 +29,7 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use futures::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -109,7 +109,30 @@ struct AppState {
     /// Self-observability counters/histogram for the service itself, exposed at
     /// `/metrics` in Prometheus text format.
     metrics: Arc<HttpMetrics>,
+    /// Bounded in-memory ring of recent queries — powers `expensiveQueries` and
+    /// the audit endpoint. (Recent history; durable/exportable persistence is a
+    /// follow-up.)
+    query_history: Arc<tokio::sync::Mutex<VecDeque<QueryRecord>>>,
 }
+
+/// The authenticated caller, stashed in request extensions by `require_auth` and
+/// read by handlers that record who did what. Absent when auth is off.
+#[derive(Clone)]
+struct Identity(String);
+
+/// One recorded query kept in the audit ring.
+#[derive(Clone)]
+struct QueryRecord {
+    ts_millis: i64,
+    user: String,
+    sql: String,
+    scanned_bytes: u64,
+    cost_usd: f64,
+    /// Coldest tier the scan touched ("hot"/"warm"/"cold").
+    tier: &'static str,
+}
+
+const QUERY_HISTORY_CAP: usize = 500;
 
 /// Minimal, dependency-free Prometheus metrics for the service: request counts by
 /// status class and a real request-latency histogram. Recorded by the
@@ -512,6 +535,7 @@ pub async fn serve(
         ingest_sem: Arc::new(tokio::sync::Semaphore::new(max_inflight)),
         tokens: Arc::new(tokio::sync::RwLock::new(tokens_doc)),
         metrics: Arc::new(HttpMetrics::new()),
+        query_history: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
     };
 
     // Alert evaluator. On a writer role (the single manifest writer owns alert
@@ -575,7 +599,8 @@ pub async fn serve(
             .route("/v1/cost", get(h_cost))
             .route("/v1/pipelines", get(h_pipelines))
             .route("/v1/settings", get(h_settings))
-            .route("/v1/tail", get(h_tail));
+            .route("/v1/tail", get(h_tail))
+            .route("/v1/audit/queries", get(h_audit_queries));
     }
     // Token management (issue/list/revoke) — admin-only, enforced by
     // `required_role`. Only mounted when auth is on; otherwise there's no
@@ -688,7 +713,7 @@ struct AuthState {
 /// and `/v1/query/estimate`) need ReadOnly; writes (ingest/OTLP, alert
 /// create/delete) need ReadWrite; token management needs Admin.
 fn required_role(method: &Method, path: &str) -> AuthRole {
-    if path.starts_with("/v1/auth/") {
+    if path.starts_with("/v1/auth/") || path.starts_with("/v1/audit/") {
         return AuthRole::Admin;
     }
     match *method {
@@ -721,21 +746,24 @@ fn presented_secret(req: &Request) -> Option<String> {
 /// Authenticate the token to a [`Role`], then authorize against the route's
 /// [`required_role`]. 401 for missing/invalid/revoked; 403 for a valid token
 /// without sufficient role.
-async fn require_auth(State(auth): State<AuthState>, req: Request, next: Next) -> Response {
+async fn require_auth(State(auth): State<AuthState>, mut req: Request, next: Next) -> Response {
     let Some(secret) = presented_secret(&req) else {
         return AppError::with_status(StatusCode::UNAUTHORIZED, "missing bearer token")
             .into_response();
     };
-    let role = {
+    let (role, user) = {
         let hash = auth::hash_token(&secret);
         if auth
             .bootstrap_admin_hash
             .as_deref()
             .is_some_and(|b| b.as_str() == hash)
         {
-            Some(AuthRole::Admin)
+            (Some(AuthRole::Admin), "bootstrap-admin".to_string())
         } else {
-            auth.tokens.read().await.authenticate(&secret).map(|t| t.role)
+            match auth.tokens.read().await.authenticate(&secret) {
+                Some(t) => (Some(t.role), t.name.clone()),
+                None => (None, String::new()),
+            }
         }
     };
     let Some(role) = role else {
@@ -754,6 +782,8 @@ async fn require_auth(State(auth): State<AuthState>, req: Request, next: Next) -
         )
         .into_response();
     }
+    // Record who's calling so handlers can log it (audit / query history).
+    req.extensions_mut().insert(Identity(user));
     next.run(req).await
 }
 
@@ -866,6 +896,29 @@ async fn h_token_revoke(State(st): State<AppState>, AxPath(id): AxPath<String>) 
     Ok(Json(json!({ "revoked": revoked })))
 }
 
+/// `GET /v1/audit/queries` — recent query history (who/when/sql/scanned/cost),
+/// newest first. Admin-only (enforced by `required_role`).
+async fn h_audit_queries(State(st): State<AppState>) -> ApiResult {
+    let hist = st.query_history.lock().await;
+    let now = crate::now_millis();
+    let out: Vec<Value> = hist
+        .iter()
+        .rev()
+        .map(|r| {
+            json!({
+                "ts": r.ts_millis,
+                "user": r.user,
+                "sql": r.sql,
+                "scannedBytes": r.scanned_bytes,
+                "costUsd": r.cost_usd,
+                "tier": r.tier,
+                "when": format!("{} ago", humanize_ms((now - r.ts_millis).max(0) as u64)),
+            })
+        })
+        .collect();
+    Ok(Json(Value::Array(out)))
+}
+
 /// The static-frontend service: real files from `frontend`, else index.html for
 /// SPA client-side routing. Isolated in its own `Router` so the 404→200 rewrite
 /// (see below) applies ONLY here, never to the `/v1/*` API status codes.
@@ -922,6 +975,7 @@ fn wants_arrow(headers: &HeaderMap) -> bool {
 async fn h_query(
     State(st): State<AppState>,
     headers: HeaderMap,
+    identity: Option<Extension<Identity>>,
     Json(req): Json<QueryReq>,
 ) -> Result<Response, AppError> {
     let arrow = wants_arrow(&headers);
@@ -988,6 +1042,28 @@ async fn h_query(
         "engine": "datafusion",
         "files": files.len(),
     });
+
+    // Audit / expensiveQueries: record who ran what, and what it scanned/cost.
+    let user = identity.map(|Extension(id)| id.0).unwrap_or_else(|| "anonymous".to_string());
+    let (cost_usd, cold_tier) = selected.iter().fold((0.0f64, Tier::Hot), |(c, ct), f| {
+        let usd = f.bytes as f64 / cost::GIB
+            * cost::retrieval_usd_per_gib(f.tier.default_class(), RetrievalMode::Standard);
+        (c + usd, if f.tier.index() > ct.index() { f.tier } else { ct })
+    });
+    {
+        let mut hist = st.query_history.lock().await;
+        if hist.len() >= QUERY_HISTORY_CAP {
+            hist.pop_front();
+        }
+        hist.push_back(QueryRecord {
+            ts_millis: crate::now_millis(),
+            user,
+            sql: req.sql.clone(),
+            scanned_bytes,
+            cost_usd,
+            tier: cold_tier.as_str(),
+        });
+    }
 
     if arrow {
         Ok(query_response(true, arrow_body, &stats, &histogram))
@@ -1414,6 +1490,27 @@ async fn h_cost(State(st): State<AppState>) -> ApiResult {
     // retention at roughly ~$2.50/GB-month-equivalent, vs our object-storage cost.
     let hosted = total_gib * 2.50;
 
+    // Top recent queries by scanned bytes, from the audit ring.
+    let expensive: Vec<Value> = {
+        let hist = st.query_history.lock().await;
+        let now = crate::now_millis();
+        let mut recs: Vec<&QueryRecord> = hist.iter().collect();
+        recs.sort_by(|a, b| b.scanned_bytes.cmp(&a.scanned_bytes));
+        recs.into_iter()
+            .take(5)
+            .map(|r| {
+                json!({
+                    "q": r.sql,
+                    "tier": r.tier,
+                    "scanGB": r.scanned_bytes as f64 / cost::GIB,
+                    "usd": r.cost_usd,
+                    "user": r.user,
+                    "when": format!("{} ago", humanize_ms((now - r.ts_millis).max(0) as u64)),
+                })
+            })
+            .collect()
+    };
+
     Ok(Json(json!({
         "monthToDate": total,
         "projected": total,
@@ -1421,8 +1518,7 @@ async fn h_cost(State(st): State<AppState>) -> ApiResult {
         "breakdown": breakdown,
         "spendSeries": [],
         "vsHosted": { "ours": total, "hosted": hosted },
-        // No query-history tracking yet — empty until that subsystem exists.
-        "expensiveQueries": [],
+        "expensiveQueries": expensive,
     })))
 }
 

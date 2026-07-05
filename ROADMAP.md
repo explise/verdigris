@@ -178,15 +178,16 @@ absent.
 *Effort: L · Priority: P1 (P0 if selling multi-tenant/SaaS-style; single-tenant
 on-prem can ship without it).*
 
-**M2.3 — Audit log / query history.**
-*Problem:* nothing records who queried what. `expensiveQueries` in `/v1/cost` is
-hardcoded `[]` "until query-history tracking exists" (`serve.rs` `h_cost`).
-*Why it matters:* compliance and cost-attribution both need it; it also unblocks the
-expensive-queries UI and per-user cost visibility.
-*Acceptance:*
-- Every query is recorded (who, when, SQL, scanned bytes, cost).
-- `/v1/cost` `expensiveQueries` is populated from real history.
-- History is queryable/exportable for audit.
+**M2.3 — Audit log / query history. ✅ DONE (2026-07-06) — recent history; durable persistence deferred.**
+Shipped: every query is recorded (`serve.rs` `h_query`) with **who** (`Identity` stashed in
+request extensions by `require_auth`; "anonymous" when auth off), **when**, **sql**, **scanned
+bytes**, **cost**, and the coldest tier touched, into a bounded in-memory ring (`QueryRecord`,
+cap 500). `/v1/cost` `expensiveQueries` is now populated from that history (top 5 by scanned
+bytes), and `GET /v1/audit/queries` (admin-only, enforced by `required_role`) returns the log
+newest-first. Verified live: real per-user records, populated expensiveQueries, readonly→403.
+*Deferred:* **durable/exportable** persistence — today it's recent in-memory history (lost on
+restart); flushing to the store (e.g. `_audit/query-history.ndjson`) + load-on-boot is the
+follow-up for true compliance-grade audit.
 *Effort: M · Priority: P1.*
 
 ### M3 — Operations & durability
