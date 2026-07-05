@@ -379,21 +379,64 @@ fn alerts_path(table: &str) -> ObjPath {
 }
 
 async fn load_alerts(s: &Store, table: &str) -> anyhow::Result<AlertsDoc> {
+    Ok(load_alerts_versioned(s, table).await?.0)
+}
+
+/// Load the alerts doc plus its store version, for a CAS write-back.
+async fn load_alerts_versioned(
+    s: &Store,
+    table: &str,
+) -> anyhow::Result<(AlertsDoc, Option<UpdateVersion>)> {
     match s.get(&alerts_path(table)).await {
         Ok(res) => {
+            let version = Some(UpdateVersion {
+                e_tag: res.meta.e_tag.clone(),
+                version: res.meta.version.clone(),
+            });
             let bytes = res.bytes().await?;
-            serde_json::from_slice(&bytes).context("parsing alerts.json")
+            let doc = serde_json::from_slice(&bytes).context("parsing alerts.json")?;
+            Ok((doc, version))
         }
-        Err(object_store::Error::NotFound { .. }) => Ok(AlertsDoc::default()),
+        Err(object_store::Error::NotFound { .. }) => Ok((AlertsDoc::default(), None)),
         Err(e) => Err(e.into()),
     }
 }
 
-async fn save_alerts(s: &Store, table: &str, doc: &AlertsDoc) -> anyhow::Result<()> {
+/// Save the alerts doc under optimistic CAS against the version it was loaded
+/// at — the same commit discipline as the manifest, so a scheduler tick and a
+/// create/delete on another replica can't clobber each other's read-modify-
+/// write. `Ok(false)` = conflict: reload and redo. Backends without conditional
+/// puts fall back to a plain put (correct under the single-writer model).
+async fn save_alerts_cas(
+    s: &Store,
+    table: &str,
+    doc: &AlertsDoc,
+    base: Option<UpdateVersion>,
+) -> anyhow::Result<bool> {
     let bytes = serde_json::to_vec_pretty(doc).context("serializing alerts.json")?;
-    s.put(&alerts_path(table), bytes.into()).await?;
-    Ok(())
+    let mode = match base {
+        Some(v) => PutMode::Update(v),
+        None => PutMode::Create,
+    };
+    match s
+        .put_opts(&alerts_path(table), bytes.clone().into(), PutOptions { mode, ..Default::default() })
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(object_store::Error::Precondition { .. })
+        | Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+        Err(object_store::Error::NotImplemented { .. }) => {
+            s.put(&alerts_path(table), bytes.into())
+                .await
+                .context("writing alerts.json (no-CAS fallback)")?;
+            Ok(true)
+        }
+        Err(e) => Err(e).context("committing alerts.json"),
+    }
 }
+
+/// Retry budget for alert-doc CAS commits under contention.
+const ALERTS_CAS_RETRIES: usize = 4;
 
 /// Run a rule's SQL and pull out its single numeric result — the `v` column if
 /// present, else the first numeric column of the first row.
@@ -413,54 +456,71 @@ async fn measure(s: &Store, table: &str, files: &[String], sql: &str) -> anyhow:
     Ok(0.0)
 }
 
-/// One evaluation pass over every enabled rule: measure, advance state, fire the
-/// webhook on OK↔Firing transitions, and persist. `lock` serializes this against
-/// concurrent create/delete so the read-modify-write of the doc is atomic.
+/// One evaluation pass over every enabled rule: measure, advance state, persist
+/// under CAS, and only then fire webhooks — a notification goes out only for a
+/// transition that was actually committed, so a save conflict can't double-fire.
+/// `lock` serializes this against concurrent create/delete within the process;
+/// the CAS covers other replicas.
 async fn evaluate_all(s: &Store, table: &str, lock: &tokio::sync::Mutex<()>) -> anyhow::Result<()> {
     let _g = lock.lock().await;
-    let mut doc = load_alerts(s, table).await?;
-    if doc.alerts.is_empty() {
-        return Ok(());
-    }
-    let m = verdigris_ingest::Ingestor::new(s.clone(), table)
-        .load_manifest()
-        .await?;
-    let files: Vec<String> = m.files.iter().map(|f| f.path.clone()).collect();
-    let now = crate::now_millis() as u64;
-    for a in doc.alerts.iter_mut() {
-        if !a.rule.enabled {
-            continue;
+    for _ in 0..ALERTS_CAS_RETRIES {
+        let (mut doc, base) = load_alerts_versioned(s, table).await?;
+        if doc.alerts.is_empty() {
+            return Ok(());
         }
-        let value = match measure(s, table, &files, &a.rule.sql).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(rule = %a.rule.name, error = %e, "alert eval failed");
+        let m = verdigris_ingest::Ingestor::new(s.clone(), table)
+            .load_manifest()
+            .await?;
+        let files: Vec<String> = m.files.iter().map(|f| f.path.clone()).collect();
+        let now = crate::now_millis() as u64;
+        // Webhooks for this pass, held until the state they announce is committed.
+        let mut notifications: Vec<(String, Value)> = Vec::new();
+        for a in doc.alerts.iter_mut() {
+            if !a.rule.enabled {
                 continue;
             }
-        };
-        let (next, transition) = alert::evaluate(&a.rule, &a.status, value, now);
-        a.status = next;
-        if matches!(transition, Transition::Fired | Transition::Resolved) {
-            tracing::info!(rule = %a.rule.name, ?transition, value, "alert transition");
-            if let Some(url) = a.rule.webhook.clone() {
-                let firing = matches!(transition, Transition::Fired);
-                let payload = json!({
-                    "alert": a.rule.name,
-                    "severity": a.rule.severity,
-                    "state": if firing { "firing" } else { "resolved" },
-                    "value": value,
-                    "threshold": a.rule.threshold,
-                });
-                tokio::spawn(async move {
-                    if let Err(e) = notify_webhook(&url, payload).await {
-                        tracing::warn!(error = %e, "alert webhook failed");
-                    }
-                });
+            let value = match measure(s, table, &files, &a.rule.sql).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(rule = %a.rule.name, error = %e, "alert eval failed");
+                    continue;
+                }
+            };
+            let (next, transition) = alert::evaluate(&a.rule, &a.status, value, now);
+            a.status = next;
+            if matches!(transition, Transition::Fired | Transition::Resolved) {
+                tracing::info!(rule = %a.rule.name, ?transition, value, "alert transition");
+                if let Some(url) = a.rule.webhook.clone() {
+                    let firing = matches!(transition, Transition::Fired);
+                    notifications.push((
+                        url,
+                        json!({
+                            "alert": a.rule.name,
+                            "severity": a.rule.severity,
+                            "state": if firing { "firing" } else { "resolved" },
+                            "value": value,
+                            "threshold": a.rule.threshold,
+                        }),
+                    ));
+                }
             }
         }
+        if !save_alerts_cas(s, table, &doc, base).await? {
+            // Someone else committed meanwhile (create/delete/another tick):
+            // redo against the fresh doc; the collected notifications describe
+            // a state that never landed, so they are dropped, not sent.
+            continue;
+        }
+        for (url, payload) in notifications {
+            tokio::spawn(async move {
+                if let Err(e) = notify_webhook(&url, payload).await {
+                    tracing::warn!(error = %e, "alert webhook failed");
+                }
+            });
+        }
+        return Ok(());
     }
-    save_alerts(s, table, &doc).await?;
-    Ok(())
+    anyhow::bail!("alert evaluation commit failed after retries under contention")
 }
 
 async fn notify_webhook(url: &str, payload: Value) -> anyhow::Result<()> {
@@ -482,7 +542,8 @@ async fn seed_example_alerts(
     lock: &tokio::sync::Mutex<()>,
 ) -> anyhow::Result<()> {
     let _g = lock.lock().await;
-    if !load_alerts(s, table).await?.alerts.is_empty() {
+    let (existing, base) = load_alerts_versioned(s, table).await?;
+    if !existing.alerts.is_empty() {
         return Ok(());
     }
     let now = crate::now_millis() as u64;
@@ -519,7 +580,10 @@ async fn seed_example_alerts(
             ),
         ],
     };
-    save_alerts(s, table, &doc).await
+    // CAS with the loaded (empty/absent) version: if another replica seeded
+    // first, the conflict is a no-op — their seed stands.
+    save_alerts_cas(s, table, &doc, base).await?;
+    Ok(())
 }
 
 fn humanize_ms(ms: u64) -> String {
@@ -1698,7 +1762,6 @@ async fn h_alert_create(
     }
     let s = store(&st)?;
     let _g = st.alerts_lock.lock().await;
-    let mut doc = load_alerts(&s, st.table.as_str()).await?;
     let now = crate::now_millis() as u64;
     let seq = st.alert_seq.fetch_add(1, Ordering::Relaxed);
     let rule = AlertRule {
@@ -1722,20 +1785,29 @@ async fn h_alert_create(
         .map_err(AppError::bad_request)?;
     let (status, _t) = alert::evaluate(&rule, &AlertStatus::initial(now), value, now);
     let id = rule.id.clone();
-    doc.alerts.push(Alert { rule, status });
-    save_alerts(&s, st.table.as_str(), &doc).await?;
-    Ok((StatusCode::CREATED, Json(json!({ "id": id }))).into_response())
+    for _ in 0..ALERTS_CAS_RETRIES {
+        let (mut doc, base) = load_alerts_versioned(&s, st.table.as_str()).await?;
+        doc.alerts.push(Alert { rule: rule.clone(), status: status.clone() });
+        if save_alerts_cas(&s, st.table.as_str(), &doc, base).await? {
+            return Ok((StatusCode::CREATED, Json(json!({ "id": id }))).into_response());
+        }
+    }
+    Err(anyhow::anyhow!("alert create failed after retries under contention").into())
 }
 
 async fn h_alert_delete(State(st): State<AppState>, AxPath(id): AxPath<String>) -> ApiResult {
     let s = store(&st)?;
     let _g = st.alerts_lock.lock().await;
-    let mut doc = load_alerts(&s, st.table.as_str()).await?;
-    let before = doc.alerts.len();
-    doc.alerts.retain(|a| a.rule.id != id);
-    let removed = doc.alerts.len() != before;
-    save_alerts(&s, st.table.as_str(), &doc).await?;
-    Ok(Json(json!({ "removed": removed })))
+    for _ in 0..ALERTS_CAS_RETRIES {
+        let (mut doc, base) = load_alerts_versioned(&s, st.table.as_str()).await?;
+        let before = doc.alerts.len();
+        doc.alerts.retain(|a| a.rule.id != id);
+        let removed = doc.alerts.len() != before;
+        if save_alerts_cas(&s, st.table.as_str(), &doc, base).await? {
+            return Ok(Json(json!({ "removed": removed })));
+        }
+    }
+    Err(anyhow::anyhow!("alert delete failed after retries under contention").into())
 }
 
 async fn h_pipelines(State(st): State<AppState>) -> ApiResult {
@@ -1929,6 +2001,23 @@ mod tests {
         assert_eq!(doc.queries.len(), QUERY_HISTORY_CAP);
         assert_eq!(doc.queries.first().unwrap().ts_millis, 10);
         assert_eq!(doc.queries.last().unwrap().ts_millis, (n - 1) as i64);
+    }
+
+    #[tokio::test]
+    async fn alerts_cas_rejects_stale_writers() {
+        let s: Store = Arc::new(object_store::memory::InMemory::new());
+        let doc = AlertsDoc::default();
+        // First create wins; a second create (another replica seeding) conflicts.
+        assert!(save_alerts_cas(&s, "t", &doc, None).await.unwrap());
+        assert!(!save_alerts_cas(&s, "t", &doc, None).await.unwrap());
+        // Two writers load the same version; the second commit is stale → rejected.
+        let (_a, va) = load_alerts_versioned(&s, "t").await.unwrap();
+        let (_b, vb) = load_alerts_versioned(&s, "t").await.unwrap();
+        assert!(save_alerts_cas(&s, "t", &doc, va).await.unwrap());
+        assert!(!save_alerts_cas(&s, "t", &doc, vb).await.unwrap());
+        // Reload → fresh version → commit lands.
+        let (_b2, vb2) = load_alerts_versioned(&s, "t").await.unwrap();
+        assert!(save_alerts_cas(&s, "t", &doc, vb2).await.unwrap());
     }
 
     #[tokio::test]
