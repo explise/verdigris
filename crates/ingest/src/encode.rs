@@ -14,12 +14,24 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use std::sync::Arc;
 use verdigris_core::batch::LogRecord;
 
-fn zstd_props() -> Result<WriterProperties> {
+/// Parquet writer settings shared by ingest and compaction: zstd + **bloom
+/// filters** on the string lookup columns. A bloom filter lets the reader skip
+/// whole row groups that can't contain an equality match — the fast path for
+/// "find this `trace_id`", "this `service`'s errors", "`level = 'ERROR'`" — so a
+/// rare-value lookup reads a handful of row groups instead of every row.
+/// (Substring `message ILIKE '%…%'` still scans; an inverted index for arbitrary
+/// grep is future work — M1.2 stretch.)
+fn writer_props() -> Result<WriterProperties> {
     Ok(WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+        .set_column_bloom_filter_enabled(ColumnPath::from("trace_id"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("service"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("level"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("message"), true)
         .build())
 }
 
@@ -40,7 +52,7 @@ pub fn read_parquet_bytes(bytes: Bytes) -> Result<Vec<RecordBatch>> {
 pub fn encode_record_batches(schema: SchemaRef, batches: &[RecordBatch]) -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
     {
-        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(zstd_props()?))
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(writer_props()?))
             .context("creating parquet writer")?;
         for batch in batches {
             writer.write(batch).context("writing record batch")?;
@@ -94,13 +106,9 @@ pub fn encode_parquet(records: &[LogRecord]) -> Result<(Vec<u8>, FileStats)> {
     )
     .context("building record batch")?;
 
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-        .build();
-
     let mut buf: Vec<u8> = Vec::new();
     {
-        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(writer_props()?))
             .context("creating parquet writer")?;
         writer.write(&batch).context("writing record batch")?;
         writer.close().context("closing parquet writer")?;
@@ -151,5 +159,23 @@ mod tests {
     #[test]
     fn empty_batch_is_rejected() {
         assert!(encode_parquet(&[]).is_err());
+    }
+
+    #[test]
+    fn writes_bloom_filters_on_lookup_columns() {
+        let (bytes, _) = encode_parquet(&[rec(10), rec(20)]).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes)).unwrap();
+        let rg = builder.metadata().row_group(0);
+        let bloomed: Vec<String> = (0..rg.num_columns())
+            .filter(|&i| rg.column(i).bloom_filter_offset().is_some())
+            .map(|i| rg.column(i).column_path().string())
+            .collect();
+        // The string lookup columns carry bloom filters (fast equality pruning)…
+        for col in ["trace_id", "service", "level", "message"] {
+            assert!(bloomed.contains(&col.to_string()), "{col} needs a bloom filter; got {bloomed:?}");
+        }
+        // …but the time/int columns (pruned by min/max stats) do not.
+        assert!(!bloomed.contains(&"ts".to_string()));
+        assert!(!bloomed.contains(&"status".to_string()));
     }
 }

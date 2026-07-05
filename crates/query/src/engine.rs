@@ -24,7 +24,7 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::execution::object_store::ObjectStoreUrl;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use object_store::ObjectStore;
 
 /// The result of a SQL query (CLI/pretty path).
@@ -47,7 +47,17 @@ async fn collect_batches(
 ) -> anyhow::Result<Vec<RecordBatch>> {
     anyhow::ensure!(!files.is_empty(), "table '{table}' has no files to query");
 
-    let ctx = SessionContext::new();
+    // Turn on bloom-filter row-group pruning and predicate pushdown so an
+    // equality lookup (`trace_id = '…'`, `service = 'auth'`) reads only the row
+    // groups whose bloom filter admits the value, instead of every row.
+    let mut cfg = SessionConfig::new();
+    {
+        let opts = cfg.options_mut();
+        opts.execution.parquet.bloom_filter_on_read = true;
+        opts.execution.parquet.pushdown_filters = true;
+        opts.execution.parquet.reorder_filters = true;
+    }
+    let ctx = SessionContext::new_with_config(cfg);
 
     // Register our object store under a synthetic scheme/authority.
     let base = ObjectStoreUrl::parse("verdigris://store").context("parsing object store url")?;

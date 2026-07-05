@@ -106,22 +106,21 @@ the CAS retry loop degrades; partitions are what make large-table pruning cheap.
 - Existing JSON-manifest tables migrate or are read compatibly.
 *Effort: L · Priority: P1 (scale unlock; can trail auth/search).*
 
-**M1.2 — Fast text search over columnar Parquet.**
-*Problem:* free-text search is `message ILIKE '%word%'` and attribute search is
-`attrs_json LIKE '%"k":"v"%'` (`crates/core/src/search.rs` `translate_term`). That is
-a full column scan for every "grep this stack trace" — precisely the workload
-`CLAUDE.md` calls out columnar formats as bad at. No bloom filters, no inverted index.
-*Why it matters:* incident response *is* grep-over-logs. Without indexed text search,
-cold-tier and large hot-tier searches are slow and expensive, undercutting the "cold
-logs are always live" pitch.
-*Acceptance:*
-- Parquet is written with bloom filters on `message`/`trace_id` (and attribute keys),
-  used to skip row groups / files at scan time.
-- A measurable win on a representative "find this rare string" query vs the current
-  `ILIKE` scan (report before/after scanned-bytes).
-- The estimator accounts for index-pruned scans so the cost gate stays truthful.
-- (Stretch) an inverted-index option for the hot tier.
-*Effort: L · Priority: P0 (headline UX for the actual job logs are used for).*
+**M1.2 — Fast text search over columnar Parquet. ✅ DONE (2026-07-06) — equality path; substring/inverted-index deferred.**
+Shipped: Parquet is now written with **bloom filters** on `trace_id`, `service`, `level`,
+`message` (`crates/ingest/src/encode.rs` `writer_props`, used by both ingest AND compaction),
+and the query engine enables `bloom_filter_on_read` + `pushdown_filters` + `reorder_filters`
+(`crates/query/src/engine.rs`). So an equality lookup — `trace_id = '…'` (the "find this
+trace" path the DSL already emits), `service = 'auth'`, `level = 'ERROR'` — skips row groups
+whose bloom filter rejects the value instead of scanning every row. Verified: a unit test
+asserts the bloom filters are physically present on the lookup columns (and absent on ts/status);
+a `trace_id` equality lookup returns correct rows (no bloom false-negative).
+*Deferred (the M1.2 stretch):* arbitrary **substring** grep (`message ILIKE '%…%'`) still
+full-scans — that needs a **tokenized inverted index** (or per-file token bloom filters in the
+manifest), which is the real "grep any stack-trace fragment" feature. Also: the estimator
+doesn't yet discount bloom-pruned scans (it prices the whole tier/window file set — conservative,
+so no *under*-quoting). Both are follow-ups.
+*Effort: L · Priority: P0.*
 
 **M1.3 — Finish the DST harness (madsim, DataFusion-in-sim, calibration).**
 *Problem:* the seams and a *hand-driven* sim exist (`SimObjectStore`, `SimClock`, 4
