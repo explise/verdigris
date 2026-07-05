@@ -1499,7 +1499,10 @@ async fn h_config(State(st): State<AppState>) -> ApiResult {
         // Query rows travel as Arrow IPC (columnar); the client transparently
         // falls back to the JSON envelope if a response isn't Arrow.
         "wire": "arrow",
-        "auth": { "kind": "none" },
+        // Tell the SPA whether it must present a bearer token; the actual token
+        // is never in this file — the user supplies it (token gate) and the app
+        // stores it client-side.
+        "auth": { "kind": if st.cfg.auth.enabled { "token" } else { "none" } },
         "orgs": [ { "id": "local", "name": "Verdigris" } ],
         "environments": [ {
             "id": table,

@@ -10,6 +10,7 @@
    ═══════════════════════════════════════════════════════════════════ */
 import { getConfig } from "@/config/runtime";
 import { ARROW_MIME, decodeArrowRows } from "./arrow";
+import { getToken, authRequired } from "./session";
 
 export interface Scope {
   org: string;
@@ -18,10 +19,23 @@ export interface Scope {
 
 function authHeader(): Record<string, string> {
   const { auth } = getConfig();
-  // Real impl: pull token from the auth provider. Stubbed for the scaffold.
-  if (auth.kind === "token") return { Authorization: "Bearer <token>" };
-  if (auth.kind === "oidc") return { Authorization: "Bearer <oidc-access-token>" };
+  if (auth.kind === "token") {
+    // The user's token, collected by the TokenGate and kept in localStorage.
+    const t = getToken();
+    return t ? { Authorization: `Bearer ${t}` } : {};
+  }
+  // OIDC federation is a later milestone (ROADMAP M2.1 deferral).
   return {};
+}
+
+/** A 401 means the token is missing/invalid/revoked: raise the token gate and
+    fail the call. (403 is NOT a gate — the token is valid, the role is just
+    insufficient — so it surfaces as a normal error.) */
+function check401(res: Response, path: string): void {
+  if (res.status === 401) {
+    authRequired();
+    throw new Error(`${path} → 401 (authentication required)`);
+  }
 }
 
 function url(path: string, scope: Scope): string {
@@ -37,12 +51,15 @@ function url(path: string, scope: Scope): string {
 
 /** Absolute URL for an EventSource (SSE) stream. Mirrors url()'s flat-vs-tenant
     routing so streaming endpoints respect apiBaseUrl and the deployment mode.
-    NOTE: EventSource cannot send an Authorization header. If/when this app grows
-    auth, the usual workaround is a short-lived token via query param
-    (e.g. `?access_token=…`) that the backend accepts for the stream — NOT
-    implemented here (auth is currently `none`). */
+    EventSource cannot send an Authorization header, so when the deployment
+    requires a token it rides as `?access_token=…` — the backend's stream
+    endpoints accept exactly that (`require_auth` in serve.rs). */
 export function eventSourceUrl(path: string, scope: Scope): string {
-  return url(path, scope);
+  const base = url(path, scope);
+  if (getConfig().auth.kind !== "token") return base;
+  const t = getToken();
+  if (!t) return base;
+  return `${base}${base.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(t)}`;
 }
 
 /** JSON GET/POST for aggregate endpoints (small payloads). */
@@ -52,6 +69,7 @@ export async function json<T>(path: string, scope: Scope, body?: unknown): Promi
     headers: { "content-type": "application/json", accept: "application/json", ...authHeader() },
     body: body ? JSON.stringify(body) : undefined,
   });
+  check401(res, path);
   if (!res.ok) throw new Error(`${path} → ${res.status}`);
   return res.json() as Promise<T>;
 }
@@ -65,6 +83,7 @@ export async function send<T>(method: string, path: string, scope: Scope, body?:
     headers: { "content-type": "application/json", accept: "application/json", ...authHeader() },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
+  check401(res, path);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error((data && (data as { error?: string }).error) || `${path} → ${res.status}`);
   return data as T;
@@ -85,6 +104,7 @@ export async function queryTable<T>(
     headers: { "content-type": "application/json", accept: wantArrow ? `${ARROW_MIME}, application/json` : "application/json", ...authHeader() },
     body: JSON.stringify(body),
   });
+  check401(res, path);
   if (!res.ok) {
     // The backend returns { error } with a 4xx on a bad query; surface it.
     let msg = `${path} → ${res.status}`;
@@ -113,6 +133,7 @@ export async function table<T>(path: string, scope: Scope, body?: unknown): Prom
     headers: { "content-type": "application/json", accept: wantArrow ? `${ARROW_MIME}, application/json` : "application/json", ...authHeader() },
     body: body ? JSON.stringify(body) : undefined,
   });
+  check401(res, path);
   if (!res.ok) throw new Error(`${path} → ${res.status}`);
   const ct = res.headers.get("content-type") ?? "";
   if (ct.includes("arrow")) {

@@ -5,6 +5,7 @@ import { Router, Route, Navigate, RouteSectionProps } from "@solidjs/router";
 import { ParentProps } from "solid-js";
 import { AppProvider } from "@/store";
 import { Sidebar } from "@/shell/Sidebar";
+import { TokenGate } from "@/shell/TokenGate";
 import { getConfig } from "@/config/runtime";
 
 import Logs from "@/pages/Logs";
@@ -23,6 +24,7 @@ function Layout(props: RouteSectionProps) {
         <Sidebar />
         <main class="main" id="view">{props.children}</main>
       </div>
+      <TokenGate />
     </AppProvider>
   );
 }
