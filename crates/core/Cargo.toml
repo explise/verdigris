@@ -15,6 +15,8 @@ serde.workspace = true
 # toml is parsing-only here (pure, no I/O) — file reading lives in the shell.
 toml.workspace = true
 rand.workspace = true
+# Token secrets are stored as SHA-256 hashes, never in the clear.
+sha2 = "0.10"
 
 # Test-only: the async seam tests use the tokio test harness. Production code in
 # this crate stays free of tokio.

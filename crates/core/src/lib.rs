@@ -8,6 +8,7 @@
 //! See `docs/dst-architecture.md`.
 
 pub mod alert;
+pub mod auth;
 pub mod batch;
 pub mod clock;
 pub mod config;
