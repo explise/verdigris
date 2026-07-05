@@ -151,6 +151,37 @@ async fn engine_reads_only_the_registered_file_set() {
     assert_eq!(rows[0]["s"].as_i64(), Some(1));
 }
 
+// Free-text ("grep") end to end: the DSL term prunes files via the manifest's
+// trigram stats, and the pruned file set returns byte-identical results to
+// scanning everything — pruning is invisible except in bytes scanned.
+#[tokio::test]
+async fn free_text_pruning_never_changes_results() {
+    let (store, manifest) = seeded_table().await;
+    let all = all_paths(&manifest);
+
+    // "auth" only ever appears in the hot (ERROR/auth) file's messages.
+    let dsl = "auth";
+    let sql = verdigris_core::search::to_sql(dsl, "logs", BASE_TS + 3_600_000, 1000).unwrap();
+    assert!(sql.contains("message ILIKE '%auth%'"), "free text compiles to ILIKE: {sql}");
+    let preds = verdigris_core::search::stat_predicates(dsl);
+    assert_eq!(preds, vec![verdigris_core::manifest::Predicate::message_contains("auth")]);
+
+    let pruned: Vec<String> = select_files(&manifest, &[Tier::Hot, Tier::Warm, Tier::Cold], None, &preds)
+        .into_iter()
+        .map(|f| f.path.clone())
+        .collect();
+    assert_eq!(pruned.len(), 1, "trigram stats prune to the auth file only");
+
+    let from_pruned = engine::query_table_json(store.clone(), "logs", &pruned, &sql)
+        .await
+        .expect("pruned query");
+    let from_all = engine::query_table_json(store, "logs", &all, &sql)
+        .await
+        .expect("full query");
+    assert_eq!(from_pruned.len(), 20, "all auth rows found");
+    assert_eq!(from_pruned, from_all, "pruning must not change results");
+}
+
 // The Arrow wire must stay decodable by plain IPC readers: no Utf8View/BinaryView
 // columns (DataFusion's Parquet reader yields them; `deview_batch` casts them
 // down), same rows as the JSON path, and an empty result is an empty buffer.
