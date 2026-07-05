@@ -21,7 +21,7 @@ hosted SaaS log platforms that keeps your log data in **your own** cloud account
 
 ---
 
-## The pitch, in four lines
+## Key ideas
 
 - **Your S3 bucket is the database.** Logs land as compacted Parquet in *your*
   account and are queried **in place** — no vendor cloud in the path, no per-GB
@@ -37,7 +37,7 @@ hosted SaaS log platforms that keeps your log data in **your own** cloud account
   (`service:auth status>=500 | last 1h`) that compiles *to* SQL. Your queries
   stay portable.
 
-## See it in 90 seconds
+## Quick start
 
 ```bash
 # 1. Start the server (first build pulls DataFusion, ~1.5 min).
@@ -73,9 +73,9 @@ severity.** Storage is priced by bytes in S3; query speed is a separately
 provisioned compute dial. Severity decides *placement* (which tier a log lands
 in) — never price.
 
-## What works today
+## Features
 
-The full loop runs end to end — locally and via Helm — and is covered by tests:
+The full pipeline runs end to end — locally and via Helm:
 
 | | |
 |---|---|
@@ -90,9 +90,7 @@ The full loop runs end to end — locally and via Helm — and is covered by tes
 | **Observe** | Prometheus `/metrics` (latency histogram, ingest/query counters), **live tail** over SSE, Grafana datasource |
 | **Deploy** | single binary; Helm chart with split ingest/query roles; production web UI (SolidJS, virtualized, Arrow-decoding) |
 
-What's *not* done yet is tracked honestly in [`ROADMAP.md`](ROADMAP.md)
-(engineering milestones) and [`DEMO_ROADMAP.md`](DEMO_ROADMAP.md) (the gap to a
-replacement-grade demo, from market research).
+Known gaps and planned work are tracked in [`ROADMAP.md`](ROADMAP.md).
 
 ## Architecture
 
@@ -103,10 +101,9 @@ replacement-grade demo, from market research).
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the component breakdown
 and [`docs/adr/`](docs/adr/) for the decisions behind it.
 
-## For the technically curious
+## Design notes
 
-If you're evaluating this codebase (or its author), these are the parts worth
-reading — each solves a problem that separates a demo from a product:
+A few implementation decisions that shape the codebase:
 
 - **Deterministic Simulation Testing as a design constraint** — the control
   plane is sans-I/O (`pure (state, event) → (state, effects)`); *all*
@@ -204,10 +201,8 @@ Verdigris is **alpha**. The full local loop works end to end — ingest → tier
 compact → query → cost-estimate → alert → serve to a browser UI — and deploys
 via Helm. Where it stands and what's next:
 
-- [`ROADMAP.md`](ROADMAP.md) — engineering-readiness milestones (every gap cites
-  the file that proves it)
-- [`DEMO_ROADMAP.md`](DEMO_ROADMAP.md) — the market-research-backed bar for a
-  replacement-grade demo
+- [`ROADMAP.md`](ROADMAP.md) — engineering milestones toward production readiness
+- [`DEMO_ROADMAP.md`](DEMO_ROADMAP.md) — feature gaps vs. established log platforms
 - [`STATUS.md`](STATUS.md) (UI) · [`BACKEND_STATUS.md`](BACKEND_STATUS.md) (backend)
 
 ## Contributing
