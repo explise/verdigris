@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -98,6 +98,9 @@ struct AppState {
     alerts_lock: Arc<tokio::sync::Mutex<()>>,
     /// Monotonic suffix for generated alert ids within this process.
     alert_seq: Arc<AtomicU64>,
+    /// Backpressure: caps concurrent in-flight ingest requests so a flood sheds
+    /// (429) instead of piling parsed bodies up in memory.
+    ingest_sem: Arc<tokio::sync::Semaphore>,
 }
 
 /// An error response: a status code + a JSON `{ "error": ... }` body. Defaults to
@@ -362,12 +365,17 @@ pub async fn serve(
         None
     };
 
+    // Ingest memory bounds (read before `cfg` moves into the shared state).
+    let max_body = cfg.ingest.max_body_bytes;
+    let max_inflight = cfg.ingest.max_inflight.max(1);
+
     let state = AppState {
         cfg: Arc::new(cfg),
         table: Arc::new(table),
         ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
         alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
         alert_seq: Arc::new(AtomicU64::new(0)),
+        ingest_sem: Arc::new(tokio::sync::Semaphore::new(max_inflight)),
     };
 
     // Alert evaluator. On a writer role (the single manifest writer owns alert
@@ -443,7 +451,12 @@ pub async fn serve(
             // it to 200. The hash-routed vanilla frontend is unaffected.
             .fallback_service(static_frontend(&frontend));
     }
-    let app = app.layer(CorsLayer::permissive()).with_state(state);
+    // Cap every request body so an oversized ingest payload can't OOM the
+    // process — it's rejected (413) before being buffered into memory.
+    let app = app
+        .layer(DefaultBodyLimit::max(max_body))
+        .layer(CorsLayer::permissive())
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
@@ -740,7 +753,20 @@ fn parse_ingest_body(body: &str) -> (Vec<LogRecord>, usize, Option<String>) {
 /// `POST /v1/ingest` — accept logs and write them to the store (routing each by
 /// severity to a tier, batching to Parquet, updating the manifest). This is the
 /// real ingestion path the Vector/Fluent-Bit DaemonSet ships to.
+/// Backpressure gate for the write path: grab an in-flight permit or shed with
+/// 429. The permit is held for the request, so at most `ingest.max_inflight`
+/// ingests do the parse+write work at once — a flood is rejected, not buffered.
+fn ingest_permit(st: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, AppError> {
+    st.ingest_sem.clone().try_acquire_owned().map_err(|_| {
+        AppError::with_status(
+            StatusCode::TOO_MANY_REQUESTS,
+            "ingest at capacity — back off and retry",
+        )
+    })
+}
+
 async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
+    let _permit = ingest_permit(&st)?;
     let (records, skipped, first_err) = parse_ingest_body(&body);
     if records.is_empty() {
         return Err(AppError::bad_request(first_err.unwrap_or_else(|| {
@@ -774,6 +800,7 @@ async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
 /// ingest write path (routing + BatchPolicy) and per-process `ingest_lock` as
 /// `/v1/ingest`. OTLP/JSON only (no protobuf/gRPC) to keep deps light.
 async fn h_otlp(State(st): State<AppState>, body: String) -> ApiResult {
+    let _permit = ingest_permit(&st)?;
     let records = verdigris_ingest::otlp::parse_otlp_json(&body).map_err(AppError::bad_request)?;
     if records.is_empty() {
         return Err(AppError::bad_request(

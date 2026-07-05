@@ -17,6 +17,32 @@ pub struct Config {
     pub routing: RoutingConfig,
     pub lifecycle: LifecycleConfig,
     pub auth: AuthConfig,
+    pub ingest: IngestConfig,
+}
+
+/// Ingest backpressure & memory bounds for the `/v1/ingest` + `/v1/otlp/logs`
+/// write path. Acked data is already durable — each POST is synchronously written
+/// to the object store and atomically committed to the manifest, so the store is
+/// the write-ahead log. These settings instead bound *process memory* under load:
+/// oversized bodies and a flood of concurrent ingests piling up in RAM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IngestConfig {
+    /// Max accepted request-body size (bytes); larger payloads get 413 before
+    /// being buffered, bounding per-request memory.
+    pub max_body_bytes: usize,
+    /// Max concurrent in-flight ingest requests; beyond this the server sheds with
+    /// 429 (backpressure) instead of queueing bodies in memory unboundedly.
+    pub max_inflight: usize,
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: 16 * 1024 * 1024, // 16 MiB
+            max_inflight: 32,
+        }
+    }
 }
 
 /// Optional bearer-token auth for the `/v1/*` HTTP API. Off by default so the

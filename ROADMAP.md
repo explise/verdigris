@@ -216,18 +216,23 @@ the ingest/query service's own health, no real p99.
 - Structured tracing (OpenTelemetry) spans across ingest and query paths.
 *Effort: M · Priority: P1.*
 
-**M3.3 — Ingest durability: WAL/queue, backpressure, rate limiting.**
-*Problem:* ingest is best-effort in-memory: records are batched and buffered to
-Parquet in-process, serialized only by a per-process `tokio::sync::Mutex`
-(`serve.rs` `ingest_lock`, `AppState`); a crash before a batch rolls loses buffered
-records, and there's no backpressure or rate limiting on `POST /v1/ingest`.
-*Why it matters:* a log store that silently drops logs under load or on restart isn't
-trustworthy for the incident you're logging *for*.
-*Acceptance:*
-- A durable buffer (WAL or durable queue) so an in-flight batch survives a crash.
-- Backpressure: the endpoint sheds/queues rather than OOMing under a spike.
-- Configurable per-source rate limiting.
-*Effort: L · Priority: P0 (durability is the core promise of a log store).*
+**M3.3 — Ingest durability & backpressure. ✅ DONE (2026-07-06) — bounded memory + backpressure; async-WAL fast-ack deferred.**
+*Durability, on inspection, was already there:* `h_ingest` writes the Parquet files to the
+object store AND commits the manifest (`Ingestor::ingest` → `append_files`, optimistic CAS)
+**synchronously before returning 200** — so the object store *is* the write-ahead log; acked
+data survives a crash, and a crash mid-request just means the client retries (at-least-once).
+The real gap was unbounded *memory*, now fixed:
+- **Bounded request bodies** — `DefaultBodyLimit::max(ingest.max_body_bytes)` (default 16 MiB)
+  rejects oversized payloads with **413** before buffering (verified). Prevents a single huge
+  POST OOMing the process.
+- **Backpressure** — an ingest **semaphore** (`ingest.max_inflight`, default 32) caps concurrent
+  in-flight ingests; a flood sheds **429** ("back off and retry") instead of piling parsed
+  bodies in memory (verified a 30-request burst stays up).
+- New `[ingest]` config section (`crates/core/src/config.rs`).
+*Deferred:* an **async-WAL fast-ack** path (ack after a local fsync'd WAL, flush to Parquet in
+the background) — a *latency* optimization, not a durability fix, since acked data is already
+durable. Per-source (vs global) rate limiting is also a follow-up.
+*Effort: L · Priority: P0.*
 
 **M3.4 — Retention & orphan GC.**
 *Problem:* S3 lifecycle expiry is generated, but the app never garbage-collects
