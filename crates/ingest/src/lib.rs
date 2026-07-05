@@ -191,6 +191,8 @@ impl Ingestor {
             min_ts: stats.min_ts,
             max_ts: stats.max_ts,
             tier,
+            services: stats.services,
+            levels: stats.levels,
         })
     }
 
@@ -308,6 +310,9 @@ impl Ingestor {
                         .await
                         .with_context(|| format!("writing compacted {path}"))?;
 
+                    // Recompute value stats from the merged rows (authoritative even
+                    // if some input files predate value stats) so the compacted file
+                    // still prunes by service/level.
                     new_files.push(DataFile {
                         path,
                         bytes: len,
@@ -315,6 +320,8 @@ impl Ingestor {
                         min_ts: bin.iter().map(|f| f.min_ts).min().unwrap_or(0),
                         max_ts: bin.iter().map(|f| f.max_ts).max().unwrap_or(0),
                         tier,
+                        services: encode::distinct_strings(&batches, "service"),
+                        levels: encode::distinct_strings(&batches, "level"),
                     });
                     for f in &bin {
                         to_delete.push(f.path.clone());
@@ -461,7 +468,86 @@ mod tests {
             min_ts: 0,
             max_ts: 100,
             tier: Tier::Hot,
+            services: vec![],
+            levels: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn ingested_files_carry_value_stats_that_prune_scans() {
+        use verdigris_core::batch::LogRecord;
+        use verdigris_core::estimate::select_files;
+        use verdigris_core::manifest::Predicate;
+        use verdigris_core::model::{Level, Tier};
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ing = Ingestor::new(store, "logs");
+        let routing = RoutingConfig::default();
+        let policy = BatchPolicy { max_rows: 1000, max_bytes: usize::MAX };
+
+        let rec = |svc: &str| LogRecord {
+            ts_millis: 1,
+            level: Level::Error, // all ERROR → same (hot) tier, so only service separates files
+            service: svc.into(),
+            status: Some(500),
+            message: "boom".into(),
+            trace_id: None,
+            attrs: Default::default(),
+        };
+        // Two separate ingests → two separate hot files, one per service.
+        ing.ingest(vec![rec("auth"), rec("auth")], &routing, policy).await.unwrap();
+        ing.ingest(vec![rec("billing")], &routing, policy).await.unwrap();
+
+        let m = ing.load_manifest().await.unwrap();
+        assert_eq!(m.files.len(), 2, "expected one file per ingest");
+        assert!(m.files.iter().all(|f| f.tier == Tier::Hot));
+        // Stats were recorded from the real rows.
+        assert!(m.files.iter().any(|f| f.services == vec!["auth".to_string()]));
+        assert!(m.files.iter().any(|f| f.services == vec!["billing".to_string()]));
+        assert!(m.files.iter().all(|f| f.levels == vec!["ERROR".to_string()]));
+
+        // `service:auth` prunes the billing file at plan time; `service:search`
+        // (present in neither) prunes both.
+        let auth = select_files(&m, &[Tier::Hot], None, &[Predicate::service("auth")]);
+        assert_eq!(auth.len(), 1);
+        assert_eq!(auth[0].services, vec!["auth".to_string()]);
+        let none = select_files(&m, &[Tier::Hot], None, &[Predicate::service("search")]);
+        assert!(none.is_empty(), "a value in no file scans nothing");
+        // No predicate → both files.
+        assert_eq!(select_files(&m, &[Tier::Hot], None, &[]).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn compaction_recomputes_value_stats_from_merged_rows() {
+        use verdigris_core::batch::LogRecord;
+        use verdigris_core::estimate::select_files;
+        use verdigris_core::manifest::Predicate;
+        use verdigris_core::model::{Level, Tier};
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ing = Ingestor::new(store, "logs");
+        let routing = RoutingConfig::default();
+        let policy = BatchPolicy { max_rows: 1, max_bytes: usize::MAX };
+
+        let rec = |svc: &str| LogRecord {
+            ts_millis: 1, level: Level::Error, service: svc.into(),
+            status: Some(500), message: "x".into(), trace_id: None, attrs: Default::default(),
+        };
+        // Many tiny single-row hot files across two services.
+        for svc in ["auth", "auth", "billing", "auth"] {
+            ing.ingest(vec![rec(svc)], &routing, policy).await.unwrap();
+        }
+        ing.compact(10 * 1024 * 1024).await.unwrap();
+
+        let m = ing.load_manifest().await.unwrap();
+        // Merged into one file whose stats are the UNION recomputed from the rows.
+        let hot: Vec<_> = m.files.iter().filter(|f| f.tier == Tier::Hot).collect();
+        assert_eq!(hot.len(), 1, "one compacted hot file");
+        assert_eq!(hot[0].services, vec!["auth".to_string(), "billing".to_string()]);
+        // Both services still prune correctly against the compacted file.
+        assert_eq!(select_files(&m, &[Tier::Hot], None, &[Predicate::service("auth")]).len(), 1);
+        assert_eq!(select_files(&m, &[Tier::Hot], None, &[Predicate::service("billing")]).len(), 1);
+        assert!(select_files(&m, &[Tier::Hot], None, &[Predicate::service("gateway")]).is_empty());
     }
 
     #[tokio::test]

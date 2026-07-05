@@ -6,7 +6,7 @@
 
 use crate::schema::log_schema;
 use anyhow::{Context, Result};
-use arrow::array::{ArrayRef, Int32Array, StringArray, TimestampMillisecondArray};
+use arrow::array::{Array, ArrayRef, Int32Array, StringArray, TimestampMillisecondArray};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -63,11 +63,34 @@ pub fn encode_record_batches(schema: SchemaRef, batches: &[RecordBatch]) -> Resu
 }
 
 /// Per-file statistics recorded in the manifest for planning/pruning/pricing.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileStats {
     pub rows: u64,
     pub min_ts: i64,
     pub max_ts: i64,
+    /// Distinct `service` values in the file (sorted, deduped) — plan-time file skip.
+    pub services: Vec<String>,
+    /// Distinct `level` values in the file (sorted, deduped) — plan-time file skip.
+    pub levels: Vec<String>,
+}
+
+/// Distinct non-null values of a Utf8 column across `batches` (sorted, deduped).
+/// Used to record the per-file `service`/`level` stats the planner prunes on —
+/// authoritative because it reads the actual rows (so compaction recomputes it
+/// from merged data rather than trusting inputs that may predate value stats).
+pub fn distinct_strings(batches: &[RecordBatch], column: &str) -> Vec<String> {
+    let mut set = std::collections::BTreeSet::new();
+    for batch in batches {
+        let Some(col) = batch.column_by_name(column) else { continue };
+        if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+            for i in 0..arr.len() {
+                if arr.is_valid(i) {
+                    set.insert(arr.value(i).to_string());
+                }
+            }
+        }
+    }
+    set.into_iter().collect()
 }
 
 /// Encode `records` to Parquet bytes (zstd-compressed). Errors on an empty batch
@@ -121,10 +144,22 @@ pub fn encode_parquet(records: &[LogRecord]) -> Result<(Vec<u8>, FileStats)> {
         max_ts = max_ts.max(r.ts_millis);
     }
 
+    // Distinct service/level values, so a `service:auth` / `level:error` query can
+    // skip this whole file at plan time when the value is absent (sorted+deduped
+    // via BTreeSet — deterministic, no RNG/HashMap order).
+    let mut svc = std::collections::BTreeSet::new();
+    let mut lvl = std::collections::BTreeSet::new();
+    for r in records {
+        svc.insert(r.service.clone());
+        lvl.insert(r.level.as_str().to_string());
+    }
+
     let stats = FileStats {
         rows: records.len() as u64,
         min_ts,
         max_ts,
+        services: svc.into_iter().collect(),
+        levels: lvl.into_iter().collect(),
     };
     Ok((buf, stats))
 }
@@ -154,6 +189,9 @@ mod tests {
         assert_eq!(stats.rows, 3);
         assert_eq!(stats.min_ts, 10);
         assert_eq!(stats.max_ts, 30);
+        // All three sample rows are service=auth level=ERROR → one distinct each.
+        assert_eq!(stats.services, vec!["auth".to_string()]);
+        assert_eq!(stats.levels, vec!["ERROR".to_string()]);
     }
 
     #[test]
