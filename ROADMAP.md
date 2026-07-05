@@ -73,16 +73,17 @@ placeholder.
 
 ### Test count
 
-- **57 tests pass** on the default offline build — `cargo test --workspace`:
-  core 30, ingest 18, query 1, storage 4, `storage/tests/dst.rs` 4, vdg 0.
+- **66 tests pass** on the default offline build — `cargo test --workspace`:
+  core 38, ingest 19, query 1, storage 4, `storage/tests/dst.rs` 4, vdg 0.
 - **+4** in `vdg` under `cargo test -p vdg --features serve` (the HTTP/auth/OTLP tests
   aren't compiled in the default build).
-- **+4** in `verdigris-query` under `cargo test -p verdigris-query --features datafusion`
+- **+5** in `verdigris-query` under `cargo test -p verdigris-query --features datafusion`
   (`crates/query/tests/engine.rs`): real Parquet written through the production ingest
   path and queried in place — SQL filter/aggregate correctness, the bloom-filtered
   `trace_id` equality lookup, engine-reads-only-registered-files (the M4.1 guarantee at
-  the execution layer), and the view-free Arrow IPC wire vs the JSON path.
-- → **65 across the feature matrix.**
+  the execution layer), free-text pruning result parity, and the view-free Arrow IPC
+  wire vs the JSON path.
+- → **75 across the feature matrix.**
 
 ---
 
@@ -111,7 +112,7 @@ the CAS retry loop degrades; partitions are what make large-table pruning cheap.
 - Existing JSON-manifest tables migrate or are read compatibly.
 *Effort: L · Priority: P1 (scale unlock; can trail auth/search).*
 
-**M1.2 — Fast text search over columnar Parquet. ✅ DONE (2026-07-06) — equality path; substring/inverted-index deferred.**
+**M1.2 — Fast text search over columnar Parquet. ✅ DONE (2026-07-06) — equality path; substring file-pruning added 2026-07-05; within-file inverted index deferred.**
 Shipped: Parquet is now written with **bloom filters** on `trace_id`, `service`, `level`,
 `message` (`crates/ingest/src/encode.rs` `writer_props`, used by both ingest AND compaction),
 and the query engine enables `bloom_filter_on_read` + `pushdown_filters` + `reorder_filters`
@@ -120,11 +121,17 @@ trace" path the DSL already emits), `service = 'auth'`, `level = 'ERROR'` — sk
 whose bloom filter rejects the value instead of scanning every row. Verified: a unit test
 asserts the bloom filters are physically present on the lookup columns (and absent on ts/status);
 a `trace_id` equality lookup returns correct rows (no bloom false-negative).
-*Deferred (the M1.2 stretch):* arbitrary **substring** grep (`message ILIKE '%…%'`) still
-full-scans — that needs a **tokenized inverted index** (or per-file token bloom filters in the
-manifest), which is the real "grep any stack-trace fragment" feature. Also: the estimator
-doesn't yet discount bloom-pruned scans (it prices the whole tier/window file set — conservative,
-so no *under*-quoting). Both are follow-ups.
+*Substring grep (2026-07-05):* free-text terms (`message ILIKE '%…%'`) now prune at the
+**file level** via per-file **character-trigram sets** in the manifest
+(`crates/core/src/text.rs`; `DataFile.message_trigrams`): a file missing any trigram of
+the term provably has no match and is skipped before Parquet is opened — no false
+negatives by construction, and the estimator prices the pruned set (same `select_files`).
+Trigrams (not word tokens) because ILIKE is substring: `auth` must match
+`authentication`. Recorded at ingest, recomputed from merged rows at compaction; legacy
+files without the stat are never pruned.
+*Still deferred:* within a surviving file the ILIKE still scans rows (a row-group-level
+token/trigram structure or full inverted index is the remaining stretch), and
+`attrs_json` matches don't prune.
 *Effort: L · Priority: P0.*
 
 **M1.3 — Finish the DST harness (madsim, DataFusion-in-sim, calibration).**
@@ -289,9 +296,10 @@ tested: unit (`may_match`, `stat_predicates`, `value_predicate_prunes`) + ingest
 (`crates/query/src/engine.rs`) let DataFusion skip row groups within a wide compacted
 file, and Parquet `ts` min/max stats still time-prune inside it. The new file-level
 stats add the coarse pre-DataFusion skip on top.
-*Deferred:* substring (`message ILIKE '%…%'`) and `attrs_json` pruning still full-scan
-(that's the M1.2 inverted-index stretch); the estimator prices the whole surviving
-file set (conservative — never *under*-quotes a bloom-pruned scan).
+*Update (2026-07-05):* substring (`message ILIKE '%…%'`) pruning is now covered at the
+file level by the M1.2 trigram stats (same `select_files` path). Still deferred:
+`attrs_json` matches don't prune, and the estimator prices whole surviving files
+(conservative — never *under*-quotes a row-group-pruned scan).
 *Effort: M · Priority: P1.*
 
 **M4.3 — Saved queries & dashboard/alert persistence.**
@@ -373,7 +381,7 @@ The original P0 wave — M4.1 (tier-filtered scans), M1.2 (equality search), M2.
 
 **M2.2 (tenant isolation) can trail** unless a multi-tenant/SaaS deployment is on the
 table — the current positioning is single-tenant data sovereignty. The deferred
-stretches (substring/inverted-index search from M1.2, OIDC from M2.1, durable audit
+stretches (within-file inverted index from M1.2, OIDC from M2.1, durable audit
 from M2.3) slot in as their parent milestones' follow-ups.
 
 ---

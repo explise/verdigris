@@ -106,7 +106,7 @@ cold-scan gate. **The gaps here are the widest in the product.**
 
 | # | Item | Why | Effort | Grade |
 |---|------|-----|--------|-------|
-| Q-1 | **Fast free-text search** — substring/`ILIKE` still full-scans; bloom filters only accelerate equality (`ROADMAP.md` M1.2 deferral). Ship the tokenized index (per-file token blooms in the manifest as the demoable slice; full inverted index later). | "Grep this stack trace across last month" is *the* log-platform moment. A visible full-scan on stage kills the replacement claim. | L (M for token-bloom slice) | **DP0** (slice) |
+| Q-1 | **Fast free-text search** — ✅ **file-level slice shipped (2026-07-05):** per-file character-trigram sets prune `ILIKE '%…%'` scans before Parquet is opened, shared by estimate + scan (`crates/core/src/text.rs`; trigrams, not word tokens, so in-word substrings stay correct). Remaining: within-file row scans on surviving files (inverted index / row-group trigram structure) and `attrs_json` matches. | "Grep this stack trace across last month" is *the* log-platform moment. A visible full-scan on stage kills the replacement claim. | L (slice: done) | **DP0** (slice ✅) |
 | Q-2 | **Facets from attributes** — auto-surface attr keys/top-values as clickable filters. Today `attrs_json` is an opaque string matched via `LIKE` (`search.rs`); competitors auto-facet every field. | Facet-click exploration is how people *actually* use these tools; typing SQL on stage is a power feature, not a substitute. | M | **DP0** |
 | Q-3 | **Group-by analytics + visualizations** — `GROUP BY` any field/time-bucket rendered as timeseries/top-list *in the product UI* (engine already does SQL; this is a UI/endpoint slice). | "Top 10 services by error count, graphed" is a first-demo request, verbatim. | M | **DP0** |
 | Q-4 | **Saved views** (persisted query+columns+range, shareable per team) — `ROADMAP.md` M4.3. | Teams live in saved views; absence reads as "stateless viewer." | M | DP1 |
@@ -150,7 +150,7 @@ Prometheus `/metrics` (M3.2 ✅); data residency by construction.
 ## Pillar 8 — Run it (reliability & packaging)
 
 **Have:** split-role serve (1 writer / N readers), CAS commits,
-backpressure, Helm chart + Dockerfile, DST harness (4 scenarios), 65 tests
+backpressure, Helm chart + Dockerfile, DST harness (4 scenarios), 75 tests
 green across the feature matrix. Open M-items: Iceberg (M1.1), full DST
 (M1.3), tenant isolation (M2.2), publishing (M5.1), releases (M5.2),
 benchmarks (M5.3).
