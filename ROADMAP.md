@@ -4,6 +4,11 @@
 > customer would trust to hold their production logs. Grounded in the source as of
 > this writing; every gap cites the file that proves it. Where a claim is inference
 > rather than something I ran, it says so.
+>
+> **See also [`DEMO_ROADMAP.md`](DEMO_ROADMAP.md)** — the buyer-facing companion:
+> what's needed before Verdigris can be demoed as a credible *replacement* for the
+> hosted SaaS log platforms, graded by what an evaluating team will see or ask
+> (DP0/DP1/DP2), with market research behind the bar it sets.
 
 ---
 
