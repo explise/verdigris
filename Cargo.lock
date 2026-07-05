@@ -4816,6 +4816,7 @@ dependencies = [
  "tokio",
  "tracing",
  "verdigris-core",
+ "verdigris-ingest",
 ]
 
 [[package]]
