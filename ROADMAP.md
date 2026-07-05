@@ -263,18 +263,30 @@ false.
 - Estimate and executed query provably touch the same file set (a test asserts it).
 *Effort: S · Priority: P0 (correctness of the flagship feature).*
 
-**M4.2 — Predicate/column-stats pruning beyond the time window.**
-*Problem:* only the time window prunes, and only in the *estimate* — the actual query
-registers every file and leans on DataFusion's row-group pruning
-(`crates/query/src/engine.rs` registers all `files`; `estimate.rs` prunes by
-`min_ts`/`max_ts` only). No `service:`/`level:` file-level pruning even though
-level→tier is a freebie from routing (noted in `BACKEND_STATUS.md`). Coarse min/max
-means wide compacted files can't be time-pruned.
-*Why it matters:* less scanned = faster and cheaper; it's the whole compute dial.
-*Acceptance:*
-- Per-file column stats (service, level) used to skip files at plan time.
-- Row-group/column-level pruning surfaced so compacted files still prune by time.
-- Estimator and executor share the pruning logic.
+**M4.2 — Predicate/column-stats pruning beyond the time window. ✅ DONE (2026-07-05) — file-level service/level pruning; substring/attr pruning deferred.**
+Shipped: `DataFile` now records **per-file distinct `service` and `level` values**
+(`crates/core/src/manifest.rs`), populated at ingest from the actual rows
+(`crates/ingest/src/encode.rs` `FileStats`) and **recomputed from merged rows at
+compaction** (`distinct_strings`, so a compacted file still prunes even if inputs
+predate the stat). `DataFile::may_match` skips a file only when it has recorded values
+for a column **and** the wanted value is absent — a legacy file with no stats is never
+pruned, so pruning can't drop a real match. The DSL's `service:`/`level:` equality is
+extracted by `search::stat_predicates` (equality-only — ranges/`!=`/free-text/attrs
+never prune) and fed to `estimate::select_files`, the **single pruning function shared
+by the estimate and the executed scan** — so quote and scan provably read the same
+files. Verified live end-to-end: `service:auth` estimated `filesTouched=1/2416B` and
+the executed query scanned exactly `files=1/2416B` returning only auth rows;
+`service:search` (absent) → 0 files / 0 rows on both; `level:error` → both files. Also
+tested: unit (`may_match`, `stat_predicates`, `value_predicate_prunes`) + ingest e2e
+(real stats prune; compaction recomputes the union).
+*Also (criterion 2, row-group pruning): already met by M1.2* — bloom filters on
+`service`/`level`/`trace_id`/`message` + `pushdown_filters`/`reorder_filters`
+(`crates/query/src/engine.rs`) let DataFusion skip row groups within a wide compacted
+file, and Parquet `ts` min/max stats still time-prune inside it. The new file-level
+stats add the coarse pre-DataFusion skip on top.
+*Deferred:* substring (`message ILIKE '%…%'`) and `attrs_json` pruning still full-scan
+(that's the M1.2 inverted-index stretch); the estimator prices the whole surviving
+file set (conservative — never *under*-quotes a bloom-pruned scan).
 *Effort: M · Priority: P1.*
 
 **M4.3 — Saved queries & dashboard/alert persistence.**
