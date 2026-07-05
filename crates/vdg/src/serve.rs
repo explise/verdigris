@@ -546,6 +546,12 @@ async fn flip_404_to_200(mut res: Response) -> Response {
 #[derive(Deserialize)]
 struct QueryReq {
     sql: String,
+    /// Tiers the scan is scoped to (`hot`/`warm`/`cold`). Empty/omitted = all
+    /// tiers. The executed scan registers exactly the files in these tiers — the
+    /// same set the cost estimate prices — so a hot-only quote can't silently
+    /// scan cold.
+    #[serde(default)]
+    tiers: Vec<String>,
 }
 
 /// True when the client's `Accept` header asks for the Arrow stream wire. The UI
@@ -565,11 +571,22 @@ async fn h_query(
     let arrow = wants_arrow(&headers);
     let (s, m) = manifest(&st).await?;
 
-    if m.files.is_empty() {
+    // Scope the scan to the requested tiers + the query's time window — the SAME
+    // selection `POST /v1/query/estimate` prices (`core::estimate::select_files`),
+    // so the quoted cost and the executed query provably read the same files.
+    // Empty/omitted tiers = all tiers (non-UI callers; the UI always sends them).
+    let mut tiers: Vec<Tier> = req.tiers.iter().filter_map(|t| parse_tier(t)).collect();
+    if tiers.is_empty() {
+        tiers = Tier::ALL.to_vec();
+    }
+    let window = verdigris_core::search::time_window(&req.sql, crate::now_millis());
+    let selected = verdigris_core::estimate::select_files(&m, &tiers, window);
+    if selected.is_empty() {
         let stats = json!({ "events": 0, "scannedBytes": 0, "elapsedMs": 0, "engine": "datafusion", "files": 0 });
         return Ok(query_response(arrow, Vec::new(), &stats, &Vec::new()));
     }
-    let files: Vec<String> = m.files.iter().map(|f| f.path.clone()).collect();
+    let scanned_bytes: u64 = selected.iter().map(|f| f.bytes).sum();
+    let files: Vec<String> = selected.iter().map(|f| f.path.clone()).collect();
 
     // The frontend search bar sends its DSL in `sql`; raw SQL is passed through.
     // A malformed query is a 400, not a 200-with-empty-rows, so the client can
@@ -609,7 +626,7 @@ async fn h_query(
         .sum();
     let stats = json!({
         "events": events,
-        "scannedBytes": m.total_bytes(),
+        "scannedBytes": scanned_bytes,
         "elapsedMs": elapsed,
         "engine": "datafusion",
         "files": files.len(),

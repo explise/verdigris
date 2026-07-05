@@ -44,6 +44,23 @@ fn overlaps(f: &DataFile, window: Option<(i64, i64)>) -> bool {
     }
 }
 
+/// The files a query over `tiers` (optionally bounded to `window`) would touch —
+/// the single source of truth shared by the cost *estimate* and the *executed
+/// scan*. Registering exactly this set at query time means the quoted cost and
+/// the query it gates always read the same files (no "estimated hot, scanned
+/// cold" surprise bills).
+pub fn select_files<'a>(
+    manifest: &'a Manifest,
+    tiers: &[Tier],
+    window: Option<(i64, i64)>,
+) -> Vec<&'a DataFile> {
+    manifest
+        .files
+        .iter()
+        .filter(|f| tiers.contains(&f.tier) && overlaps(f, window))
+        .collect()
+}
+
 /// Estimate the scan for a query touching `tiers`, optionally bounded to `window`.
 /// `throughput_bytes_per_sec` is the provisioned query throughput (cores × rate).
 pub fn estimate_scan(
@@ -56,11 +73,9 @@ pub fn estimate_scan(
     // Bytes of touched files per tier (index 0/1/2 = hot/warm/cold).
     let mut per = [0u64; 3];
     let mut files_touched = 0;
-    for f in &manifest.files {
-        if tiers.contains(&f.tier) && overlaps(f, window) {
-            per[f.tier.index()] += f.bytes;
-            files_touched += 1;
-        }
+    for f in select_files(manifest, tiers, window) {
+        per[f.tier.index()] += f.bytes;
+        files_touched += 1;
     }
 
     let mut per_tier = Vec::new();
@@ -167,5 +182,31 @@ mod tests {
         );
         assert_eq!(e.scan_bytes, 1000 + 2000 + 5000);
         assert_eq!(e.files_touched, 3);
+    }
+
+    // The executed scan (which registers `select_files`) and the cost estimate
+    // MUST touch the same file set — this is the M4.1 "no surprise bills"
+    // guarantee. Exercise both tier and window filtering.
+    #[test]
+    fn select_files_matches_what_the_estimate_prices() {
+        let m = manifest();
+        for (tiers, window) in [
+            (vec![Tier::Hot], None),
+            (vec![Tier::Hot], Some((800, 1000))),
+            (vec![Tier::Cold], None),
+            (vec![Tier::Hot, Tier::Cold], None),
+            (vec![Tier::Warm], None), // no warm files → empty
+        ] {
+            let selected = select_files(&m, &tiers, window);
+            let est = estimate_scan(&m, &tiers, window, 1e9, RetrievalMode::Standard);
+            // Same count and same bytes the estimate charged for.
+            assert_eq!(selected.len(), est.files_touched, "count parity {tiers:?} {window:?}");
+            let bytes: u64 = selected.iter().map(|f| f.bytes).sum();
+            assert_eq!(bytes, est.scan_bytes, "bytes parity {tiers:?} {window:?}");
+        }
+        // Hot-only never includes the cold file (the core of the M4.1 bug).
+        let hot = select_files(&m, &[Tier::Hot], None);
+        assert!(hot.iter().all(|f| f.tier == Tier::Hot));
+        assert_eq!(hot.len(), 2);
     }
 }

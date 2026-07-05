@@ -191,18 +191,16 @@ expensive-queries UI and per-user cost visibility.
 
 ### M3 — Operations & durability
 
-**M3.1 — Real alerting engine.**
-*Problem:* `/v1/alerts` returns a literal empty array (`serve.rs` `h_alerts`:
-"No alerting engine yet"); the `web/` Alerts page renders "No alerts configured yet"
-against it (`web/src/pages/Alerts.tsx`). The "+ New alert" button does nothing.
-*Why it matters:* logs without alerting are a search box, not a monitoring product;
-this is table-stakes for a Datadog replacement.
-*Acceptance:*
-- Define rules (threshold/count over a query window on the hot tier).
-- Continuous evaluation on a schedule; firing/OK state transitions persisted.
-- At least one notification channel (webhook/Slack/PagerDuty).
-- Alerts CRUD wired end to end to the existing UI.
-*Effort: L · Priority: P1.*
+**M3.1 — Real alerting engine. ✅ DONE (2026-07-05).**
+Shipped: `crates/core/src/alert.rs` (pure rule model + firing/OK state machine, unit-tested),
+persisted as `alerts.json` in the object store; `vdg serve` runs a 15s scheduler evaluating
+each rule's SQL via the query engine, fires a webhook on OK↔Firing transitions, and exposes
+`GET/POST/DELETE /v1/alerts` (create validates the SQL + evaluates immediately). Two example
+rules seeded. Wired end to end into BOTH the `frontend/` prototype and the `web/` production
+Alerts pages (create form, delete, real state). Commits `4b0b132`, `d5aae36`.
+*Follow-ups (deferred):* first-class time-window field (today the window is whatever `WHERE ts…`
+you put in the SQL); Slack/PagerDuty channels (thin wrappers on the webhook); CAS persistence
+for the alerts doc (today last-write-wins within the single writer).
 
 **M3.2 — Self-observability (Prometheus `/metrics`, tracing, real latency).**
 *Problem:* `/v1/metrics` returns *business* metrics computed from the log data, and
