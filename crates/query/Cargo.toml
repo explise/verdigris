@@ -31,6 +31,13 @@ version = "54"
 optional = true
 default-features = true
 
-# Test-only: the executor tests use the tokio test harness.
+# Test-only: the executor tests use the tokio test harness; the engine
+# integration tests write real Parquet through the production ingest path.
 [dev-dependencies]
 tokio.workspace = true
+verdigris-ingest.workspace = true
+
+# The engine tests only make sense with the real engine compiled in.
+[[test]]
+name = "engine"
+required-features = ["datafusion"]
