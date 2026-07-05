@@ -22,6 +22,12 @@ const document = {
 };
 const sandbox = { window: {}, document, setTimeout, clearTimeout, console, Math, Date, JSON, location: { hash: "" } };
 sandbox.window.document = document;
+// Force api.js into mock mode so the check runs fully offline (pages fetch the
+// live backend otherwise), and make any fetch that slips through fail loudly.
+sandbox.window.VDG_FORCE_MOCKS = true;
+sandbox.fetch = sandbox.window.fetch = () => {
+  throw new Error("fetch() called during offline verify — a page bypassed USE_MOCKS");
+};
 vm.createContext(sandbox);
 
 for (const f of ["api.js", "charts.js", "pages.js"]) {

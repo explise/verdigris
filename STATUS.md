@@ -67,8 +67,8 @@ The prototype is the reference; `web/` is where the real product goes. Both rend
 8. **Code-split `apache-arrow`** — it dominates the 100 KB gzip bundle; lazy-load it on the Logs route.
 
 ### Frontend — `frontend/` prototype
-9. **Offline fallback.** With `USE_MOCKS=false`, opening `index.html` standalone shows fetch errors on every page but Live tail. Add a "fall back to mocks if no backend responds" path so the prototype still demos offline. (Open decision — see below.)
-10. **`_verify.js` can't run offline anymore** (pages now fetch). Either add a `fetch` stub/mock toggle to the harness, or run it against a live `vdg`.
+9. **Offline fallback.** With `USE_MOCKS=false`, opening `index.html` standalone shows fetch errors on every page but Live tail. *Partial:* setting `window.VDG_FORCE_MOCKS = true` before `api.js` loads now forces mock mode without editing files (manual opt-in). An *automatic* "fall back to mocks if no backend responds" path remains an open decision (see below).
+10. ~~**`_verify.js` can't run offline anymore**~~ **FIXED (2026-07-05).** The harness sets `window.VDG_FORCE_MOCKS` so `api.js` serves mocks, and stubs `fetch` to fail loudly if a page bypasses the flag. `node frontend/_verify.js` passes offline again (all 8 pages).
 
 ### Cross-cutting / product
 11. ~~**Pricing rates swapped in client `TIER_ECON`**~~ — **FIXED.** `warm:0.03` (Glacier Instant per-GET), `cold:0.01` (Glacier Flexible standard) per `CLAUDE.md`, in both `frontend/api.js` and `web/src/lib/types.ts`.

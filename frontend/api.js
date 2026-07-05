@@ -20,7 +20,12 @@
      GET  /v1/settings                            -> config
    ═══════════════════════════════════════════════════════════════════ */
 (function () {
-  const USE_MOCKS = false;
+  // Live backend by default. Set `window.VDG_FORCE_MOCKS = true` BEFORE this
+  // file loads to run fully offline against the mock data without editing it —
+  // that's how the headless check (_verify.js) exercises every page, and it
+  // doubles as an offline-demo switch.
+  const USE_MOCKS =
+    (typeof window !== "undefined" && window.VDG_FORCE_MOCKS === true) || false;
   const BASE = ""; // e.g. "https://verdigris.acme.internal"
 
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
