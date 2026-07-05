@@ -1,14 +1,11 @@
 # Verdigris — Product-Readiness Roadmap
 
-> An honest gap analysis: what stands between the current codebase and something a
-> customer would trust to hold their production logs. Grounded in the source as of
-> this writing; every gap cites the file that proves it. Where a claim is inference
-> rather than something I ran, it says so.
+> What stands between the current codebase and something a customer would trust to
+> hold their production logs. Each item references the relevant source files.
 >
-> **See also [`DEMO_ROADMAP.md`](DEMO_ROADMAP.md)** — the buyer-facing companion:
-> what's needed before Verdigris can be demoed as a credible *replacement* for the
-> hosted SaaS log platforms, graded by what an evaluating team will see or ask
-> (DP0/DP1/DP2), with market research behind the bar it sets.
+> **See also [`DEMO_ROADMAP.md`](DEMO_ROADMAP.md)** — the user-facing companion:
+> feature gaps against established log platforms, graded by demo impact
+> (DP0/DP1/DP2).
 
 ---
 
@@ -30,7 +27,7 @@ would demand before pointing production traffic at it. Nothing is published (eve
 crate is `publish = false`), and the deploy image is a local `repository: verdigris`
 placeholder.
 
-### Done — verified against source
+### Done
 
 - [x] **Ingest → Parquet → store** — `Ingestor::ingest` routes by severity, batches
   per tier, writes content-addressed zstd Parquet (`crates/ingest/src/lib.rs`,
@@ -71,18 +68,17 @@ placeholder.
   (`crates/storage/src/sim.rs`) with modeled latency, per-object storage class, a
   Glacier-restore state machine, seeded fault injection and cost metering; `SimClock`;
   and **4 passing DST scenario tests** (`crates/storage/tests/dst.rs`) including a
-  fabricated 4-trillion-row catalog priced with no bytes behind it. **This is further
-  along than `BACKEND_STATUS.md` claims** ("madsim harness not built yet") — see M1.3
-  for what's genuinely still missing.
+  fabricated 4-trillion-row catalog priced with no bytes behind it. See M1.3 for
+  what's still missing.
 
-### Test count (measured, not guessed)
+### Test count
 
 - **42 tests pass** on the default offline build — `cargo test --workspace`:
   core 18, ingest 15, query 1, storage 4, `storage/tests/dst.rs` 4, vdg 0.
 - **+4** in `vdg` under `cargo test -p vdg --features serve` (the HTTP/auth/OTLP tests
   aren't compiled in the default build) → **46 across the feature matrix.**
-- All green; exit 0. I did not run a `--features datafusion`-only pass separately, so
-  there may be a small number of engine-gated tests not counted above.
+- A `--features datafusion`-only pass isn't counted separately, so a small number of
+  engine-gated tests may not be included above.
 
 ---
 
@@ -354,32 +350,27 @@ cold query safely).
 
 ---
 
-## Recommended sequencing (my honest take)
+## Recommended sequencing
 
-The next three, in order:
+The original P0 wave — M4.1 (tier-filtered scans), M1.2 (equality search), M2.1
+(auth), M3.3 (backpressure) — has shipped. Of what remains:
 
-1. **M4.1 — tier-filtered scans (S, P0).** Small, and it fixes a *correctness* hole in
-   the flagship feature: today the cost estimate and the executed query can scan
-   different files because `h_query` ignores the `tiers` the UI sends. "Make cost
-   legible / no surprise bills" is a stated core principle; this quietly violates it.
-   Cheapest high-value fix on the board — do it first.
+1. **M5.1 — publish artifacts (M, P1).** "One `helm install`, done" isn't real until
+   the image and chart are pullable from a public registry, and it gates anyone else
+   trying the project at all.
 
-2. **M1.2 — fast text search (L, P0)** and **M2.1 — real auth (L, P0)**, in parallel.
-   These are the two biggest *adoption* blockers. Text search is the job people
-   actually use logs for (grep a stack trace); the current `ILIKE`-scan makes that
-   slow and expensive and undercuts the "cold logs are always live" pitch. Real auth
-   (a single shared static token is a non-starter for any security review) gates every
-   serious deployment. Neither is small, but nothing past a demo happens without them.
+2. **M1.1 — real Iceberg (L, P1).** The optimistic-CAS JSON manifest is correct
+   (verified by `concurrent_ingests_preserve_all_rows`) but doesn't scale to millions
+   of files; partitioned metadata is what keeps pruning cheap at volume.
 
-3. **M3.3 — ingest durability (L, P0).** A log store that can drop logs on a crash or
-   under load isn't trustworthy for the incident you're logging for. The in-process
-   mutex + buffered-Parquet path needs a WAL/queue and backpressure before real
-   production traffic.
+3. **M1.3 — finish the DST harness (L, P1).** madsim scheduling, DataFusion behind
+   `ScanExecutor` in sim, and a calibration run to ground the modeled scan times the
+   estimator quotes.
 
-**Iceberg (M1.1) is the scale unlock but can trail** — the optimistic-CAS JSON
-manifest is *correct* (verified by `concurrent_ingests_preserve_all_rows`), just not
-scalable to millions of files. It matters at volume, not for trust on day one, so
-sequence it after the P0 adoption/correctness/durability work.
+**M2.2 (tenant isolation) can trail** unless a multi-tenant/SaaS deployment is on the
+table — the current positioning is single-tenant data sovereignty. The deferred
+stretches (substring/inverted-index search from M1.2, OIDC from M2.1, durable audit
+from M2.3) slot in as their parent milestones' follow-ups.
 
 ---
 

@@ -1,23 +1,20 @@
 # Verdigris — Demo-Parity Roadmap
 
-> Everything between today's codebase and a demo where Verdigris is credibly
-> presented as a **replacement for the hosted SaaS log platforms** — not a toy
-> beside them. Grounded in (a) market research on what those platforms ship and
-> what enterprise buyers screen for, and (b) the actual state of this repo
-> (every "have" below is verified against source; every gap cites the file that
-> proves it).
+> Everything between today's codebase and a demo where Verdigris can stand in for
+> a **hosted SaaS log platform** — not sit beside one as a toy. Based on what
+> those platforms ship and what platform teams look for when picking one; each
+> "have" and each gap references the relevant source files.
 >
-> Companion to `ROADMAP.md` (engineering-readiness milestones, M-numbers). This
-> doc is buyer-facing: it grades work by what an evaluating platform team will
-> *see or ask* in a first demo. Where an item already exists as an M-milestone,
-> it's cross-referenced rather than duplicated.
+> Companion to `ROADMAP.md` (engineering milestones, M-numbers). This doc grades
+> work by what shows up in a first demo. Where an item already exists as an
+> M-milestone, it's cross-referenced rather than duplicated.
 
 ---
 
-## The bar (from market research)
+## The bar
 
 A first "replace your log platform" demo is judged against the incumbents'
-core loop. Buyers walk the same seven stations every time:
+core loop. Evaluations walk the same seven stations:
 
 1. **Collect** — agents/collectors on every node, syslog, HTTP, cloud sources,
    OpenTelemetry; "does it ingest what we already emit, today?"
@@ -62,7 +59,7 @@ Effort: S ≈ days · M ≈ 1–2 weeks · L ≈ weeks-plus.
 
 ## Pillar 1 — Collect
 
-**Have (verified):** Vector DaemonSet shipping node logs (`deploy/helm/**`),
+**Have:** Vector DaemonSet shipping node logs (`deploy/helm/**`),
 HTTP NDJSON/array ingest (`POST /v1/ingest`), OTLP/HTTP **JSON** logs
 (`POST /v1/otlp/logs`), bounded-memory backpressure (413/429), synthetic
 generator for demos.
@@ -76,7 +73,7 @@ generator for demos.
 
 ## Pillar 2 — Pipeline (parse · drop · redact)
 
-**Have (verified):** severity→tier routing at write time (`config.rs`
+**Have:** severity→tier routing at write time (`config.rs`
 `RoutingConfig`). **Nothing else** — no parsing, no drop rules, no redaction
 (the "noise filter" in UI copy is mock-only; no such code path exists).
 
@@ -89,7 +86,7 @@ generator for demos.
 
 ## Pillar 3 — Store & lifecycle
 
-**Have (verified):** hot/warm/cold severity routing; S3 lifecycle policy
+**Have:** hot/warm/cold severity routing; S3 lifecycle policy
 generation + real apply; compaction with CAS commits; cost estimator with
 cold-scan confirm gate; tier+window+value-stat file pruning shared by
 estimate and scan (`ROADMAP.md` M4.1/M4.2 ✅). This pillar is our strength —
@@ -99,11 +96,11 @@ the demo should *lead* with it.
 |---|------|-----|--------|-------|
 | S-1 | **Retention actually enforced & shown** — `expire_days` renders into the lifecycle policy; surface it as a first-class Settings control with per-tier ages, and show the policy that was applied to the bucket. | "What's your retention story?" must be answered from the product UI, not a TOML file. | S | **DP0** |
 | S-2 | **Usage & budget visibility** — per-service ingest volume trend, monthly scan-spend vs a configurable budget, projected bill (extends the existing `/v1/cost`). | Their "budget control" pitch is index quotas; ours is *actual dollars*. Make it visibly better. | M | DP1 |
-| S-3 | **Schema/agility honesty** — document the fixed 7-column core + attrs model and its limits (`crates/ingest/src/schema.rs`); Iceberg swap (`M1.1`) is the scale/evolution answer. | Buyers ask "what happens when my log fields change?" — needs a crisp, honest answer in the room. | S (docs) — L (real, = M1.1) | DP1 answer / DP2 implementation |
+| S-3 | **Schema-evolution story** — document the fixed 7-column core + attrs model and its limits (`crates/ingest/src/schema.rs`); Iceberg swap (`M1.1`) is the scale/evolution answer. | "What happens when my log fields change?" needs a crisp answer in the room. | S (docs) — L (real, = M1.1) | DP1 answer / DP2 implementation |
 
 ## Pillar 4 — Explore (the daily-driver bar)
 
-**Have (verified):** SQL + search DSL, severity histogram, virtualized table,
+**Have:** SQL + search DSL, severity histogram, virtualized table,
 live tail (SSE), Arrow wire, bloom-filter equality speedups (M1.2 ✅),
 cold-scan gate. **The gaps here are the widest in the product.**
 
@@ -117,7 +114,7 @@ cold-scan gate. **The gaps here are the widest in the product.**
 
 ## Pillar 5 — Alert
 
-**Have (verified):** real alert engine — SQL rule + threshold + state machine,
+**Have:** real alert engine — SQL rule + threshold + state machine,
 15s scheduler, webhook on transitions, CRUD API + UI (`ROADMAP.md` M3.1 ✅).
 
 | # | Item | Why | Effort | Grade |
@@ -128,18 +125,18 @@ cold-scan gate. **The gaps here are the widest in the product.**
 
 ## Pillar 6 — Dashboards
 
-**Have (verified):** fixed product pages (metrics/storage/cost/pipelines) and
+**Have:** fixed product pages (metrics/storage/cost/pipelines) and
 a Grafana **datasource** (`deploy/grafana/datasource.yaml`). No user-built
 dashboards.
 
 | # | Item | Why | Effort | Grade |
 |---|------|-----|--------|-------|
-| D-1 | **First-class Grafana path** — ship the datasource + a provisioned starter dashboard in the Helm chart; demo it live. Positioning: "your dashboards live in the tool you already standardize on; we won't clone a dashboard editor." | Honest, credible, and demoable *now*; buyers largely have Grafana already. | S | **DP0** |
+| D-1 | **First-class Grafana path** — ship the datasource + a provisioned starter dashboard in the Helm chart; demo it live. Positioning: "your dashboards live in the tool you already standardize on; we won't clone a dashboard editor." | Credible and demoable *now*; buyers largely have Grafana already. | S | **DP0** |
 | D-2 | **In-product saved dashboards** (grid of saved-view panels) — only after Q-3/Q-4 exist. | Closes the "single pane" objection for teams without Grafana. | L | DP2 |
 
 ## Pillar 7 — Govern
 
-**Have (verified):** per-user revocable tokens + RBAC (3 roles) with hashed
+**Have:** per-user revocable tokens + RBAC (3 roles) with hashed
 storage (M2.1 ✅); query audit history + admin endpoint (M2.3 ✅, in-memory);
 Prometheus `/metrics` (M3.2 ✅); data residency by construction.
 
@@ -152,7 +149,7 @@ Prometheus `/metrics` (M3.2 ✅); data residency by construction.
 
 ## Pillar 8 — Run it (reliability & packaging)
 
-**Have (verified):** split-role serve (1 writer / N readers), CAS commits,
+**Have:** split-role serve (1 writer / N readers), CAS commits,
 backpressure, Helm chart + Dockerfile, DST harness (4 scenarios), 62 tests
 green across the feature matrix. Open M-items: Iceberg (M1.1), full DST
 (M1.3), tenant isolation (M2.2), publishing (M5.1), releases (M5.2),
@@ -164,7 +161,7 @@ benchmarks (M5.3).
 | R-2 | **Validated S3 + Kubernetes run** — end-to-end on kind/k3d + MinIO (S3 API); optionally a real EKS+S3 dry run before the actual meeting (costs real money — owner's call). | Everything so far is verified on local/in-memory stores; the demo claim is S3. | M | **DP0** |
 | R-3 | **Demo corpus + rehearsed script** — multi-service, multi-day, backdated dataset populating all three tiers (non-trivial cost numbers); scripted hot-query → cold-gate → confirm arc; 30-min soak; fallback recording. | The flagship cost-gate moment shows $0.00 on an empty tier; Glacier's real 3–5h restore is unstageable unrehearsed. | S–M | **DP0** |
 | R-4 | **Numbers page** — a one-slide benchmark: ingest rate sustained, p50/p95 query latency hot tier, storage $/GB/mo vs list-price SaaS at the same volume (M5.3 slice). | "Faster/cheaper" needs at least one reproducible number; buyers discount claims without them. | M | DP1 |
-| R-5 | **HA story doc** — reader scale-out is real; single-writer ingest + failover behavior documented honestly (what breaks, what recovers, RPO). | Platform teams ask; honest beats hand-wavy. | S | DP1 |
+| R-5 | **HA story doc** — reader scale-out is real; single-writer ingest + failover behavior documented plainly (what breaks, what recovers, RPO). | Platform teams ask; a plain answer beats a hand-wavy one. | S | DP1 |
 
 ---
 
@@ -205,5 +202,5 @@ list missing breaks one of those six steps.
 
 *Grades reflect a first replacement demo, not GA. Cross-references: `ROADMAP.md`
 (M-milestones), `docs/dst-architecture.md` (testing), `BACKEND_TODO.md`
-(UI-contract punch list). Update this file as items land — same discipline as
-`ROADMAP.md`: cite the file that proves a "have."*
+(UI-contract punch list). Update this file as items land, citing the source for
+each "have."*
