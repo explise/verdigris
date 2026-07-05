@@ -31,7 +31,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use futures::Stream;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use axum::extract::Path as AxPath;
 use axum::routing::delete;
 use object_store::path::Path as ObjPath;
-use object_store::ObjectStoreExt;
+use object_store::{ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 use verdigris_core::alert::{
     self, Alert, AlertRule, AlertStatus, AlertsDoc, Comparator, State as AlertState, Transition,
 };
@@ -109,9 +109,11 @@ struct AppState {
     /// Self-observability counters/histogram for the service itself, exposed at
     /// `/metrics` in Prometheus text format.
     metrics: Arc<HttpMetrics>,
-    /// Bounded in-memory ring of recent queries — powers `expensiveQueries` and
-    /// the audit endpoint. (Recent history; durable/exportable persistence is a
-    /// follow-up.)
+    /// Bounded in-memory ring of recent queries — powers `expensiveQueries`.
+    /// Loaded from the persisted audit doc at boot; every recorded query is also
+    /// written through to `{table}/_audit/query-history.json` under optimistic
+    /// CAS, so the audit trail survives restarts (the audit endpoint reads the
+    /// persisted doc, which collects records from all replicas).
     query_history: Arc<tokio::sync::Mutex<VecDeque<QueryRecord>>>,
 }
 
@@ -120,8 +122,8 @@ struct AppState {
 #[derive(Clone)]
 struct Identity(String);
 
-/// One recorded query kept in the audit ring.
-#[derive(Clone)]
+/// One recorded query kept in the audit ring and the persisted audit doc.
+#[derive(Clone, Serialize, Deserialize)]
 struct QueryRecord {
     ts_millis: i64,
     user: String,
@@ -129,10 +131,78 @@ struct QueryRecord {
     scanned_bytes: u64,
     cost_usd: f64,
     /// Coldest tier the scan touched ("hot"/"warm"/"cold").
-    tier: &'static str,
+    tier: String,
 }
 
 const QUERY_HISTORY_CAP: usize = 500;
+
+/// The persisted audit trail: `{table}/_audit/query-history.json`, oldest first,
+/// trimmed to [`QUERY_HISTORY_CAP`]. Appended under optimistic CAS (same
+/// discipline as the manifest) so concurrent reader replicas don't clobber each
+/// other's records.
+#[derive(Default, Serialize, Deserialize)]
+struct AuditDoc {
+    queries: Vec<QueryRecord>,
+}
+
+fn audit_path(table: &str) -> ObjPath {
+    ObjPath::from(format!("{table}/_audit/query-history.json"))
+}
+
+/// Load the persisted audit doc plus its version (for a CAS write-back).
+/// Missing → empty; a parse error also yields empty (a corrupt audit doc must
+/// not take queries down) but preserves the version so the next append repairs it.
+async fn load_audit(s: &Store, table: &str) -> anyhow::Result<(AuditDoc, Option<UpdateVersion>)> {
+    match s.get(&audit_path(table)).await {
+        Ok(res) => {
+            let version = Some(UpdateVersion {
+                e_tag: res.meta.e_tag.clone(),
+                version: res.meta.version.clone(),
+            });
+            let bytes = res.bytes().await.context("reading audit doc")?;
+            let doc = serde_json::from_slice(&bytes).unwrap_or_default();
+            Ok((doc, version))
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok((AuditDoc::default(), None)),
+        Err(e) => Err(e).context("loading audit doc"),
+    }
+}
+
+/// Append one record to the persisted audit doc under optimistic CAS: reload,
+/// append, trim, conditional put; retry on conflict (another replica appended
+/// first). Backends without conditional puts fall back to a plain put — correct
+/// under the single-writer deployment model.
+async fn append_audit(s: &Store, table: &str, rec: QueryRecord) -> anyhow::Result<()> {
+    for _ in 0..4 {
+        let (mut doc, version) = load_audit(s, table).await?;
+        doc.queries.push(rec.clone());
+        if doc.queries.len() > QUERY_HISTORY_CAP {
+            let excess = doc.queries.len() - QUERY_HISTORY_CAP;
+            doc.queries.drain(..excess);
+        }
+        let bytes = serde_json::to_vec(&doc).context("serializing audit doc")?;
+        let mode = match version {
+            Some(v) => PutMode::Update(v),
+            None => PutMode::Create,
+        };
+        match s
+            .put_opts(&audit_path(table), bytes.clone().into(), PutOptions { mode, ..Default::default() })
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(object_store::Error::Precondition { .. })
+            | Err(object_store::Error::AlreadyExists { .. }) => continue,
+            Err(object_store::Error::NotImplemented { .. }) => {
+                s.put(&audit_path(table), bytes.into())
+                    .await
+                    .context("writing audit doc (no-CAS fallback)")?;
+                return Ok(());
+            }
+            Err(e) => return Err(e).context("committing audit doc"),
+        }
+    }
+    anyhow::bail!("audit append failed after retries under contention")
+}
 
 /// Minimal, dependency-free Prometheus metrics for the service: request counts by
 /// status class and a real request-latency histogram. Recorded by the
@@ -526,6 +596,15 @@ pub async fn serve(
         None => TokensDoc::default(),
     };
 
+    // Load the persisted audit trail so query history survives restarts.
+    let boot_history: VecDeque<QueryRecord> = match &boot_store {
+        Some(s) => load_audit(s, &table)
+            .await
+            .map(|(doc, _)| doc.queries.into())
+            .unwrap_or_default(),
+        None => VecDeque::new(),
+    };
+
     let state = AppState {
         cfg: Arc::new(cfg),
         table: Arc::new(table),
@@ -535,7 +614,7 @@ pub async fn serve(
         ingest_sem: Arc::new(tokio::sync::Semaphore::new(max_inflight)),
         tokens: Arc::new(tokio::sync::RwLock::new(tokens_doc)),
         metrics: Arc::new(HttpMetrics::new()),
-        query_history: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+        query_history: Arc::new(tokio::sync::Mutex::new(boot_history)),
     };
 
     // Alert evaluator. On a writer role (the single manifest writer owns alert
@@ -897,9 +976,18 @@ async fn h_token_revoke(State(st): State<AppState>, AxPath(id): AxPath<String>) 
 }
 
 /// `GET /v1/audit/queries` — recent query history (who/when/sql/scanned/cost),
-/// newest first. Admin-only (enforced by `required_role`).
+/// newest first. Admin-only (enforced by `required_role`). Reads the persisted
+/// audit doc — durable across restarts and complete across replicas; the
+/// in-memory ring is only the fallback if the store is unreachable.
 async fn h_audit_queries(State(st): State<AppState>) -> ApiResult {
-    let hist = st.query_history.lock().await;
+    let persisted: Option<Vec<QueryRecord>> = match store(&st) {
+        Ok(s) => load_audit(&s, st.table.as_str()).await.ok().map(|(d, _)| d.queries),
+        Err(_) => None,
+    };
+    let hist: Vec<QueryRecord> = match persisted {
+        Some(q) => q,
+        None => st.query_history.lock().await.iter().cloned().collect(),
+    };
     let now = crate::now_millis();
     let out: Vec<Value> = hist
         .iter()
@@ -1054,19 +1142,25 @@ async fn h_query(
             * cost::retrieval_usd_per_gib(f.tier.default_class(), RetrievalMode::Standard);
         (c + usd, if f.tier.index() > ct.index() { f.tier } else { ct })
     });
+    let rec = QueryRecord {
+        ts_millis: crate::now_millis(),
+        user,
+        sql: req.sql.clone(),
+        scanned_bytes,
+        cost_usd,
+        tier: cold_tier.as_str().to_string(),
+    };
     {
         let mut hist = st.query_history.lock().await;
         if hist.len() >= QUERY_HISTORY_CAP {
             hist.pop_front();
         }
-        hist.push_back(QueryRecord {
-            ts_millis: crate::now_millis(),
-            user,
-            sql: req.sql.clone(),
-            scanned_bytes,
-            cost_usd,
-            tier: cold_tier.as_str(),
-        });
+        hist.push_back(rec.clone());
+    }
+    // Write through to the persisted audit trail. A store hiccup must not fail
+    // the query the user already got results for — log and move on.
+    if let Err(e) = append_audit(&s, st.table.as_str(), rec).await {
+        tracing::warn!(error = %e, "audit write-through failed");
     }
 
     if arrow {
@@ -1801,5 +1895,52 @@ mod tests {
     fn empty_body_yields_no_records() {
         let (recs, _, _) = parse_ingest_body("   \n  \n");
         assert!(recs.is_empty());
+    }
+
+    fn audit_rec(i: i64) -> QueryRecord {
+        QueryRecord {
+            ts_millis: i,
+            user: "u".into(),
+            sql: "select 1".into(),
+            scanned_bytes: i as u64,
+            cost_usd: 0.0,
+            tier: "hot".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_appends_persist_and_trim_to_cap() {
+        let s: Store = Arc::new(object_store::memory::InMemory::new());
+        // Fresh store → empty history, no version.
+        let (doc, v) = load_audit(&s, "t").await.unwrap();
+        assert!(doc.queries.is_empty() && v.is_none());
+
+        let n = QUERY_HISTORY_CAP + 10;
+        for i in 0..n {
+            append_audit(&s, "t", audit_rec(i as i64)).await.unwrap();
+        }
+        // A "restarted" process (fresh load) sees the newest CAP records, oldest
+        // first — the 10 earliest were trimmed.
+        let (doc, v) = load_audit(&s, "t").await.unwrap();
+        assert!(v.is_some());
+        assert_eq!(doc.queries.len(), QUERY_HISTORY_CAP);
+        assert_eq!(doc.queries.first().unwrap().ts_millis, 10);
+        assert_eq!(doc.queries.last().unwrap().ts_millis, (n - 1) as i64);
+    }
+
+    #[tokio::test]
+    async fn corrupt_audit_doc_reads_empty_and_is_repaired_by_append() {
+        let s: Store = Arc::new(object_store::memory::InMemory::new());
+        s.put(&audit_path("t"), bytes::Bytes::from_static(b"{ not json").into())
+            .await
+            .unwrap();
+        // Corrupt → empty history (queries must not fail), version preserved.
+        let (doc, v) = load_audit(&s, "t").await.unwrap();
+        assert!(doc.queries.is_empty());
+        assert!(v.is_some(), "version kept so the next append repairs the doc");
+        // The next append overwrites the corrupt doc under CAS.
+        append_audit(&s, "t", audit_rec(1)).await.unwrap();
+        let (doc, _) = load_audit(&s, "t").await.unwrap();
+        assert_eq!(doc.queries.len(), 1);
     }
 }
