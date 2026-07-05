@@ -76,10 +76,13 @@ placeholder.
 - **57 tests pass** on the default offline build — `cargo test --workspace`:
   core 30, ingest 18, query 1, storage 4, `storage/tests/dst.rs` 4, vdg 0.
 - **+4** in `vdg` under `cargo test -p vdg --features serve` (the HTTP/auth/OTLP tests
-  aren't compiled in the default build) → **61 across the feature matrix.**
-- A `cargo test -p verdigris-query --features datafusion` pass adds no further tests
-  (it runs the same single query-crate unit test); the engine path is exercised
-  end-to-end by the `serve`-feature tests.
+  aren't compiled in the default build).
+- **+4** in `verdigris-query` under `cargo test -p verdigris-query --features datafusion`
+  (`crates/query/tests/engine.rs`): real Parquet written through the production ingest
+  path and queried in place — SQL filter/aggregate correctness, the bloom-filtered
+  `trace_id` equality lookup, engine-reads-only-registered-files (the M4.1 guarantee at
+  the execution layer), and the view-free Arrow IPC wire vs the JSON path.
+- → **65 across the feature matrix.**
 
 ---
 

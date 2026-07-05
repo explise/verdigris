@@ -150,7 +150,7 @@ Prometheus `/metrics` (M3.2 ✅); data residency by construction.
 ## Pillar 8 — Run it (reliability & packaging)
 
 **Have:** split-role serve (1 writer / N readers), CAS commits,
-backpressure, Helm chart + Dockerfile, DST harness (4 scenarios), 61 tests
+backpressure, Helm chart + Dockerfile, DST harness (4 scenarios), 65 tests
 green across the feature matrix. Open M-items: Iceberg (M1.1), full DST
 (M1.3), tenant isolation (M2.2), publishing (M5.1), releases (M5.2),
 benchmarks (M5.3).

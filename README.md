@@ -9,7 +9,7 @@
 An S3-native log storage & query engine in Rust — a self-hostable alternative to
 hosted SaaS log platforms that keeps your log data in **your own** cloud account.
 
-[![Tests](https://img.shields.io/badge/tests-61%20passing-brightgreen.svg)](#testing--deterministic-simulation)
+[![Tests](https://img.shields.io/badge/tests-65%20passing-brightgreen.svg)](#testing--deterministic-simulation)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![Engine](https://img.shields.io/badge/engine-Apache%20DataFusion-blueviolet.svg)](docs/adr)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
@@ -184,7 +184,7 @@ docs/         architecture, ADRs, HTTP API reference.
 ## Testing — deterministic simulation
 
 Verdigris tests at trillion-row / petabyte scale **without running at scale**:
-61 tests across the feature matrix, all fast, offline, and reproducible.
+65 tests across the feature matrix, all fast, offline, and reproducible.
 
 ```bash
 cargo test --workspace                       # default: fast, offline, deterministic
