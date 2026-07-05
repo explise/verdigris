@@ -98,6 +98,8 @@ async fn estimator_matches_what_the_store_bills() {
             min_ts: 0,
             max_ts: 1_000,
             tier,
+            services: vec![],
+            levels: vec![],
         });
         // Materialize the bytes and tag the object's storage class to match.
         let payload = PutPayload::from(vec![0u8; bytes as usize]);
@@ -111,6 +113,7 @@ async fn estimator_matches_what_the_store_bills() {
         &manifest,
         &[Tier::Hot, Tier::Warm, Tier::Cold],
         None,
+        &[],
         1e9,
         retrieval,
     );
@@ -200,12 +203,14 @@ async fn fabricated_catalog_prices_a_trillion_rows_without_bytes() {
             min_ts: 0,
             max_ts: 1_000_000,
             tier: Tier::Cold,
+            services: vec![],
+            levels: vec![],
         });
     }
     assert_eq!(manifest.files.len() as u64, file_count);
     assert_eq!(manifest.total_rows(), file_count * 4_000_000); // 4 trillion rows
 
-    let estimate = estimate_scan(&manifest, &[Tier::Cold], None, 1e9, RetrievalMode::Standard);
+    let estimate = estimate_scan(&manifest, &[Tier::Cold], None, &[], 1e9, RetrievalMode::Standard);
     assert_eq!(estimate.files_touched as u64, file_count);
     assert!(estimate.cold_restore);
     // Sanity: cost == declared GiB × the cold-standard retrieval rate.

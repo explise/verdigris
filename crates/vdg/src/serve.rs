@@ -991,7 +991,11 @@ async fn h_query(
         tiers = Tier::ALL.to_vec();
     }
     let window = verdigris_core::search::time_window(&req.sql, crate::now_millis());
-    let selected = verdigris_core::estimate::select_files(&m, &tiers, window);
+    // `service:`/`level:` equality in the query skips files proven free of the
+    // value — the SAME predicates the estimate prunes on, so quote and scan stay
+    // in lockstep. (Empty for raw SQL; those files prune by tier+window only.)
+    let preds = verdigris_core::search::stat_predicates(&req.sql);
+    let selected = verdigris_core::estimate::select_files(&m, &tiers, window, &preds);
     if selected.is_empty() {
         let stats = json!({ "events": 0, "scannedBytes": 0, "elapsedMs": 0, "engine": "datafusion", "files": 0 });
         return Ok(query_response(arrow, Vec::new(), &stats, &Vec::new()));
@@ -1268,6 +1272,14 @@ async fn h_estimate(State(st): State<AppState>, Json(req): Json<EstimateReq>) ->
         .as_deref()
         .and_then(|q| verdigris_core::search::time_window(q, crate::now_millis()));
 
+    // …and by `service:`/`level:` equality, the same file-level pruning the
+    // executed query applies — so the quote prices exactly what the scan reads.
+    let preds = req
+        .sql
+        .as_deref()
+        .map(verdigris_core::search::stat_predicates)
+        .unwrap_or_default();
+
     // Provisioned throughput = cores × per-core rate (the storage/compute dial).
     let throughput = st.cfg.query.modeled_mibps_per_core * st.cfg.query.cores as f64 * 1024.0 * 1024.0;
 
@@ -1275,6 +1287,7 @@ async fn h_estimate(State(st): State<AppState>, Json(req): Json<EstimateReq>) ->
         &m,
         &tiers,
         window,
+        &preds,
         throughput,
         RetrievalMode::Standard,
     );
