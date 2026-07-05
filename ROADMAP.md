@@ -73,12 +73,13 @@ placeholder.
 
 ### Test count
 
-- **42 tests pass** on the default offline build — `cargo test --workspace`:
-  core 18, ingest 15, query 1, storage 4, `storage/tests/dst.rs` 4, vdg 0.
+- **57 tests pass** on the default offline build — `cargo test --workspace`:
+  core 30, ingest 18, query 1, storage 4, `storage/tests/dst.rs` 4, vdg 0.
 - **+4** in `vdg` under `cargo test -p vdg --features serve` (the HTTP/auth/OTLP tests
-  aren't compiled in the default build) → **46 across the feature matrix.**
-- A `--features datafusion`-only pass isn't counted separately, so a small number of
-  engine-gated tests may not be included above.
+  aren't compiled in the default build) → **61 across the feature matrix.**
+- A `cargo test -p verdigris-query --features datafusion` pass adds no further tests
+  (it runs the same single query-crate unit test); the engine path is exercised
+  end-to-end by the `serve`-feature tests.
 
 ---
 
