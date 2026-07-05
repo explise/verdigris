@@ -202,19 +202,16 @@ Alerts pages (create form, delete, real state). Commits `4b0b132`, `d5aae36`.
 you put in the SQL); Slack/PagerDuty channels (thin wrappers on the webhook); CAS persistence
 for the alerts doc (today last-write-wins within the single writer).
 
-**M3.2 — Self-observability (Prometheus `/metrics`, tracing, real latency).**
-*Problem:* `/v1/metrics` returns *business* metrics computed from the log data, and
-its `p99` is openly **modeled** (`800.0 + errorRate*18.0`) because "logs have no
-latency field yet" (`serve.rs` `h_metrics`). There is no Prometheus `/metrics`
-endpoint for the *service itself* and no real request-latency histogram. Only a
-`/healthz` liveness probe exists.
-*Why it matters:* operators can't run what they can't see — no SLOs, no dashboards on
-the ingest/query service's own health, no real p99.
-*Acceptance:*
-- A Prometheus `/metrics` endpoint exposing request rate/latency/error counters and
-  ingest/query internals.
-- Real per-request latency replaces the modeled `p99`.
-- Structured tracing (OpenTelemetry) spans across ingest and query paths.
+**M3.2 — Self-observability (Prometheus `/metrics`). ✅ DONE (2026-07-06) — /metrics + real latency; OTel tracing deferred.**
+Shipped: a dependency-free `GET /metrics` in Prometheus text format (`serve.rs` `HttpMetrics` +
+`track_metrics` middleware, open like `/healthz`) exposing `verdigris_http_requests_total{class}`,
+a **real request-latency histogram** `verdigris_http_request_duration_seconds` (sum/count/buckets —
+operators compute real p99 via `histogram_quantile`), and domain counters
+`verdigris_ingest_records_total` / `verdigris_queries_total`. Verified live: real counts + latency.
+This replaces "no service metrics / modeled p99" with real, scrapeable observability.
+*Deferred:* OpenTelemetry **tracing** spans across ingest/query; wiring the real latency into the
+`/v1/metrics` UI-tile p99 (that tile is a business metric of the *logs*, still modeled — separate
+from the service's real request latency now in `/metrics`).
 *Effort: M · Priority: P1.*
 
 **M3.3 — Ingest durability & backpressure. ✅ DONE (2026-07-06) — bounded memory + backpressure; async-WAL fast-ack deferred.**

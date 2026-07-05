@@ -106,6 +106,124 @@ struct AppState {
     /// (not the store) per request; issue/revoke write through + a refresh task
     /// reloads it so revocations propagate across replicas.
     tokens: Arc<tokio::sync::RwLock<TokensDoc>>,
+    /// Self-observability counters/histogram for the service itself, exposed at
+    /// `/metrics` in Prometheus text format.
+    metrics: Arc<HttpMetrics>,
+}
+
+/// Minimal, dependency-free Prometheus metrics for the service: request counts by
+/// status class and a real request-latency histogram. Recorded by the
+/// `track_metrics` middleware, rendered at `GET /metrics`.
+struct HttpMetrics {
+    /// Requests bucketed by status class: [2xx, 4xx, 5xx, other].
+    by_class: [AtomicU64; 4],
+    /// Non-cumulative latency-bucket counts, aligned to `LATENCY_BUCKETS_MS`
+    /// (last slot is the +Inf overflow).
+    latency: [AtomicU64; 12],
+    latency_sum_ms: AtomicU64,
+    latency_count: AtomicU64,
+    /// Domain counters.
+    ingest_records: AtomicU64,
+    queries: AtomicU64,
+}
+
+/// Upper bounds (ms) for the latency histogram; a trailing +Inf bucket is implied.
+const LATENCY_BUCKETS_MS: [f64; 11] =
+    [5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0];
+
+impl HttpMetrics {
+    fn new() -> Self {
+        Self {
+            by_class: Default::default(),
+            latency: Default::default(),
+            latency_sum_ms: AtomicU64::new(0),
+            latency_count: AtomicU64::new(0),
+            ingest_records: AtomicU64::new(0),
+            queries: AtomicU64::new(0),
+        }
+    }
+
+    fn observe(&self, latency_ms: f64, status: u16) {
+        let class = match status {
+            200..=299 => 0,
+            400..=499 => 1,
+            500..=599 => 2,
+            _ => 3,
+        };
+        self.by_class[class].fetch_add(1, Ordering::Relaxed);
+        let idx = LATENCY_BUCKETS_MS
+            .iter()
+            .position(|&b| latency_ms <= b)
+            .unwrap_or(LATENCY_BUCKETS_MS.len()); // +Inf overflow slot
+        self.latency[idx].fetch_add(1, Ordering::Relaxed);
+        self.latency_sum_ms.fetch_add(latency_ms as u64, Ordering::Relaxed);
+        self.latency_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Render Prometheus text exposition format.
+    fn render(&self) -> String {
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let mut out = String::new();
+        out.push_str("# HELP verdigris_http_requests_total HTTP requests by status class.\n");
+        out.push_str("# TYPE verdigris_http_requests_total counter\n");
+        for (i, class) in ["2xx", "4xx", "5xx", "other"].iter().enumerate() {
+            out.push_str(&format!(
+                "verdigris_http_requests_total{{class=\"{class}\"}} {}\n",
+                g(&self.by_class[i])
+            ));
+        }
+        out.push_str("# HELP verdigris_http_request_duration_seconds Request latency.\n");
+        out.push_str("# TYPE verdigris_http_request_duration_seconds histogram\n");
+        let mut cumulative = 0u64;
+        for (i, &bound) in LATENCY_BUCKETS_MS.iter().enumerate() {
+            cumulative += g(&self.latency[i]);
+            out.push_str(&format!(
+                "verdigris_http_request_duration_seconds_bucket{{le=\"{}\"}} {cumulative}\n",
+                bound / 1000.0
+            ));
+        }
+        cumulative += g(&self.latency[LATENCY_BUCKETS_MS.len()]);
+        out.push_str(&format!(
+            "verdigris_http_request_duration_seconds_bucket{{le=\"+Inf\"}} {cumulative}\n"
+        ));
+        out.push_str(&format!(
+            "verdigris_http_request_duration_seconds_sum {}\n",
+            g(&self.latency_sum_ms) as f64 / 1000.0
+        ));
+        out.push_str(&format!(
+            "verdigris_http_request_duration_seconds_count {}\n",
+            g(&self.latency_count)
+        ));
+        out.push_str("# HELP verdigris_ingest_records_total Log records accepted by ingest.\n");
+        out.push_str("# TYPE verdigris_ingest_records_total counter\n");
+        out.push_str(&format!("verdigris_ingest_records_total {}\n", g(&self.ingest_records)));
+        out.push_str("# HELP verdigris_queries_total Queries executed.\n");
+        out.push_str("# TYPE verdigris_queries_total counter\n");
+        out.push_str(&format!("verdigris_queries_total {}\n", g(&self.queries)));
+        out
+    }
+}
+
+/// Middleware: time every request and record its status + latency.
+async fn track_metrics(
+    State(metrics): State<Arc<HttpMetrics>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let start = std::time::Instant::now();
+    let res = next.run(req).await;
+    metrics.observe(start.elapsed().as_secs_f64() * 1000.0, res.status().as_u16());
+    res
+}
+
+/// `GET /metrics` — Prometheus text exposition for the service itself. Open (no
+/// auth), like `/healthz`, so a scraper can always reach it.
+async fn h_prometheus(State(st): State<AppState>) -> Response {
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
+        st.metrics.render(),
+    )
+        .into_response()
 }
 
 /// An error response: a status code + a JSON `{ "error": ... }` body. Defaults to
@@ -393,6 +511,7 @@ pub async fn serve(
         alert_seq: Arc::new(AtomicU64::new(0)),
         ingest_sem: Arc::new(tokio::sync::Semaphore::new(max_inflight)),
         tokens: Arc::new(tokio::sync::RwLock::new(tokens_doc)),
+        metrics: Arc::new(HttpMetrics::new()),
     };
 
     // Alert evaluator. On a writer role (the single manifest writer owns alert
@@ -480,7 +599,10 @@ pub async fn serve(
     // Liveness/readiness probe: 200 in EVERY role and OUTSIDE the auth layer
     // (kubelet carries no token). The ingest role serves no web root, so k8s
     // probes must target this endpoint rather than `/`.
-    app = app.route("/healthz", get(h_healthz));
+    app = app
+        .route("/healthz", get(h_healthz))
+        // Prometheus scrape endpoint for the SERVICE (open, like /healthz).
+        .route("/metrics", get(h_prometheus));
     if role.serves_reads() {
         app = app
             // Runtime deployment config the `web/` SPA reads at boot. Pins it to
@@ -497,10 +619,13 @@ pub async fn serve(
             .fallback_service(static_frontend(&frontend));
     }
     // Cap every request body so an oversized ingest payload can't OOM the
-    // process — it's rejected (413) before being buffered into memory.
+    // process — it's rejected (413) before being buffered into memory. The
+    // metrics layer is outermost so it times the full request.
+    let metrics = state.metrics.clone();
     let app = app
         .layer(DefaultBodyLimit::max(max_body))
         .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn_with_state(metrics, track_metrics))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
@@ -800,6 +925,7 @@ async fn h_query(
     Json(req): Json<QueryReq>,
 ) -> Result<Response, AppError> {
     let arrow = wants_arrow(&headers);
+    st.metrics.queries.fetch_add(1, Ordering::Relaxed);
     let (s, m) = manifest(&st).await?;
 
     // Scope the scan to the requested tiers + the query's time window — the SAME
@@ -1004,6 +1130,7 @@ async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
         .ingest(records, &st.cfg.routing, BatchPolicy::default())
         .await?;
     let bytes: u64 = written.iter().map(|f| f.bytes).sum();
+    st.metrics.ingest_records.fetch_add(ingested as u64, Ordering::Relaxed);
 
     Ok(Json(json!({
         "ingested": ingested,
@@ -1037,6 +1164,7 @@ async fn h_otlp(State(st): State<AppState>, body: String) -> ApiResult {
         .ingest(records, &st.cfg.routing, BatchPolicy::default())
         .await?;
     let bytes: u64 = written.iter().map(|f| f.bytes).sum();
+    st.metrics.ingest_records.fetch_add(ingested as u64, Ordering::Relaxed);
 
     Ok(Json(json!({
         "ingested": ingested,
