@@ -1,47 +1,98 @@
 <div align="center">
 
+<img src="docs/assets/logo.svg" width="90" alt="Verdigris logo">
+
 # Verdigris
 
 **The layer your infrastructure leaves behind.**
 
-S3-native log storage and query engine — a self-hostable Datadog alternative
-that keeps your log data in *your own* cloud account.
+An S3-native log storage & query engine in Rust — a self-hostable alternative to
+hosted SaaS log platforms that keeps your log data in **your own** cloud account.
 
+[![Tests](https://img.shields.io/badge/tests-62%20passing-brightgreen.svg)](#testing--deterministic-simulation)
+[![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
+[![Engine](https://img.shields.io/badge/engine-Apache%20DataFusion-blueviolet.svg)](docs/adr)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Language](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
-[![Status](https://img.shields.io/badge/status-alpha-yellow.svg)](STATUS.md)
+[![Status](https://img.shields.io/badge/status-alpha-yellow.svg)](ROADMAP.md)
+
+*Your bucket is the database. One binary, one `helm install`, no surprise bills.*
 
 </div>
 
 ---
 
-Verdigris is a single, plug-and-play Rust binary that deploys on **EKS + S3** and
-gives you tiered, queryable log storage at object-storage prices. Logs are written
-as compacted Parquet to the customer's **own** S3 bucket and queried **in place** —
-no per-GB ingestion margin, no rehydration toll, no proprietary query language.
+## The pitch, in four lines
 
-> *Verdigris* is the green patina that forms on copper as it sits exposed over time —
-> the layer a metal accumulates simply by existing in the world. That's what logs are:
-> the layer your infrastructure accumulates as it runs. (It's also a quiet Rust pun —
-> verdigris is what oxidation matures into.)
+- **Your S3 bucket is the database.** Logs land as compacted Parquet in *your*
+  account and are queried **in place** — no vendor cloud in the path, no per-GB
+  ingestion margin, and an entire class of compliance questions collapses to
+  *"it's your bucket."*
+- **Cold logs are always live.** Data tiers hot → warm → glacier-cold on S3
+  lifecycle rules and stays queryable at every tier — there is **no
+  "rehydrate the archive back into an index" step, ever.**
+- **No surprise bills.** Before any cold scan runs you see *"this will scan
+  ~40 GB from cold storage and cost ~$0.40 — continue?"* — the estimate and the
+  executed query provably read the same files.
+- **SQL, not a proprietary DSL.** Plus a concise search syntax
+  (`service:auth status>=500 | last 1h`) that compiles *to* SQL. Your queries
+  stay portable.
 
-## Why Verdigris
+## See it in 90 seconds
 
-Two things the commercial incumbents structurally *can't* fix without breaking their
-own business model — and therefore our wedge:
+```bash
+# 1. Start the server (first build pulls DataFusion, ~1.5 min).
+cargo run -p vdg --features serve -- serve --table logs
 
-1. **Data sovereignty.** Data never leaves your AWS account. There is no vendor cloud
-   in the path charging an ingestion margin on every GB that flows through it.
-2. **No rehydration tax.** Queries read Parquet straight out of S3 in place. There is
-   no "pull cold logs back into an expensive index to search them" step. Cold logs are
-   always live; you pay compute only when you actually query, plus the underlying
-   S3/Glacier retrieval cost.
+# 2. In another terminal, keep synthetic logs flowing.
+cargo run -- ingest --table logs --follow
 
-The core design principle, learned from studying Datadog Flex Logs: **never price or
-architect around log severity.** Storage is priced by bytes in S3 (effectively free
-relative to SaaS vendors); **query speed is a separately provisioned dial** (compute),
-decoupled from storage. Severity only decides which S3 prefix / storage class a log
-lands in — it is placement, never price.
+# 3. Open the UI — query, live-tail, tier costs, alerts, the cold-scan gate.
+open http://localhost:8080
+```
+
+Fully offline out of the box (local filesystem storage); switch to S3/MinIO in
+[`config/verdigris.toml`](config/verdigris.toml) with **no recompile**. Deploying
+to Kubernetes + S3 is one `helm install` — see [below](#deploy-on-eks--s3-helm).
+
+## Why this exists
+
+Two things the hosted incumbents structurally *can't* fix without breaking their
+own business model:
+
+1. **Data sovereignty.** With Verdigris, bytes go from your pods to your bucket.
+   There is no vendor cloud metering an ingestion margin on every GB your
+   infrastructure emits, and your data never becomes someone else's asset.
+2. **The rehydration tax.** Hosted platforms park old logs in cheap archives —
+   then make you *re-index* them (slowly, expensively) before you can search.
+   Verdigris reads Parquet straight out of S3 at every tier; you pay compute
+   only when you actually query, plus the underlying S3/Glacier retrieval cost,
+   which is quoted **before** the scan runs.
+
+One design principle underneath it all: **never price or architect around log
+severity.** Storage is priced by bytes in S3; query speed is a separately
+provisioned compute dial. Severity decides *placement* (which tier a log lands
+in) — never price.
+
+## What works today
+
+The full loop runs end to end — locally and via Helm — and is covered by tests:
+
+| | |
+|---|---|
+| **Ingest** | HTTP NDJSON/JSON (`/v1/ingest`) for Vector & Fluent Bit, native OTLP/HTTP logs (`/v1/otlp/logs`), bounded-memory **backpressure** (413/429) |
+| **Store** | zstd Parquet, content-addressed files, **bloom filters** on lookup columns, optimistic **CAS catalog commits** (concurrent writers can't clobber each other) |
+| **Tier** | severity → hot/warm/cold prefixes at write time; S3 lifecycle policies generated *and applied* (`vdg lifecycle --apply`) |
+| **Compact** | background small-file merge per tier — crash-safe, manifest-first |
+| **Query** | Apache DataFusion over Parquet in place; SQL + search DSL; JSON **and Arrow IPC** wire; file-level pruning by tier, time window, and per-file `service`/`level` stats — **shared by the cost estimate and the executed scan** |
+| **Cost gate** | pre-query scan-size + dollar estimate with a confirm gate on cold tiers |
+| **Alert** | SQL rule + threshold engine with a firing/OK state machine, webhook notifications, CRUD API + UI |
+| **Secure** | per-user revocable API tokens (hashed at rest), **role-based access control**, query **audit history** |
+| **Observe** | Prometheus `/metrics` (latency histogram, ingest/query counters), **live tail** over SSE, Grafana datasource |
+| **Deploy** | single binary; Helm chart with split ingest/query roles; production web UI (SolidJS, virtualized, Arrow-decoding) |
+
+What's *not* done yet is tracked honestly in [`ROADMAP.md`](ROADMAP.md)
+(engineering milestones) and [`DEMO_ROADMAP.md`](DEMO_ROADMAP.md) (the gap to a
+replacement-grade demo, from market research).
 
 ## Architecture
 
@@ -67,51 +118,43 @@ lands in — it is placement, never price.
   Query API + Web UI + Grafana datasource
 ```
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full component breakdown and
-[`docs/adr/`](docs/adr/) for the decisions behind it.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the component breakdown
+and [`docs/adr/`](docs/adr/) for the decisions behind it.
 
-## Features
+## For the technically curious
 
-- **Ingest** — native `POST /v1/ingest` (NDJSON / JSON) for Vector & Fluent Bit, plus a
-  native OTLP/HTTP logs receiver (`POST /v1/otlp/logs`) for OpenTelemetry Collectors.
-- **Query in place** — Apache DataFusion reads Parquet directly from object storage.
-  **SQL** is the query language (portable, no proprietary DSL), plus a concise search
-  DSL (`service:auth status>=500 | last 1h`) that compiles to SQL.
-- **Tiering** — severity-based write-time routing (hot/warm/cold prefixes) + S3 lifecycle
-  policies, applied to the bucket automatically on install.
-- **Compaction** — a background job merges the millions of tiny Parquet files streaming
-  logs produce into 100 MB–1 GB files (query speed + the Glacier per-object tax).
-- **Cost estimator** — before a query scans cold storage, Verdigris surfaces
-  "this will scan ~X GB from Glacier and cost ~$Y, continue?" — so Glacier-backed logs
-  are *safe to actually use*.
-- **Live tail** — `GET /v1/tail` streams matching log events over Server-Sent Events.
-- **Deterministic by construction** — nondeterminism lives only behind four seams; the
-  control plane is sans-I/O so trillion-row scale is testable in simulation
-  ([DST](docs/dst-architecture.md)), not just in production.
-- **One `helm install`, done** — a single binary + Helm chart brings up ingest, query,
-  UI, and tiering on EKS. Data lands in your bucket via IRSA — no static keys.
+If you're evaluating this codebase (or its author), these are the parts worth
+reading — each solves a problem that separates a demo from a product:
 
-## Quickstart
+- **Deterministic Simulation Testing as a design constraint** — the control
+  plane is sans-I/O (`pure (state, event) → (state, effects)`); *all*
+  nondeterminism (time, storage, randomness, scan execution) is injected
+  through four seams. Result: a **4-trillion-row catalog is priced in a unit
+  test with zero bytes behind it**, an 8-hour Glacier thaw runs in
+  microseconds of logical time, and a seeded RNG reproduces any fault
+  sequence. [`docs/dst-architecture.md`](docs/dst-architecture.md) ·
+  [`crates/storage/tests/dst.rs`](crates/storage/tests/dst.rs)
+- **The estimator and the scanner cannot disagree.** One function selects the
+  file set; the quote prices it and the engine registers it
+  ([`crates/core/src/estimate.rs`](crates/core/src/estimate.rs)). A DST test
+  asserts the pre-query estimate equals what the simulated store actually
+  bills, to the cent.
+- **Optimistic concurrency on object storage** — content-addressed data files
+  + compare-and-swap catalog commits, so concurrent writers on plain S3 never
+  lose rows ([`crates/ingest/src/lib.rs`](crates/ingest/src/lib.rs), verified
+  by `concurrent_ingests_preserve_all_rows`).
+- **Query pruning in layers** — tier → time-window → per-file value stats →
+  Parquet bloom filters → predicate pushdown, each layer provably unable to
+  drop a real match ([`crates/core/src/manifest.rs`](crates/core/src/manifest.rs)).
+- **Security without a database** — API tokens are SHA-256-hashed into a JSON
+  doc in the object store; RBAC is one `(method, path) → role` map; revocation
+  propagates to all replicas through the store
+  ([`crates/core/src/auth.rs`](crates/core/src/auth.rs)).
+- **A columnar wire to the browser** — query results stream as Arrow IPC and
+  are decoded near-zero-copy in the UI, with a `Utf8View` down-cast so any
+  Arrow decoder can read it ([`crates/query/src/engine.rs`](crates/query/src/engine.rs)).
 
-### Run locally (Cargo)
-
-```bash
-# 1. Start the server (first build pulls DataFusion, ~1.5 min).
-cargo run -p vdg --features serve -- serve --table logs
-
-# 2. In another terminal, keep synthetic logs flowing so `last 1h` stays populated.
-cargo run -- ingest --table logs --follow
-
-# 3. Open the UI.
-open http://localhost:8080
-```
-
-The default build is offline and dependency-light; the heavy bits (DataFusion, the HTTP
-server) are behind the `serve` feature. Storage is config-driven
-([`config/verdigris.toml`](config/verdigris.toml)) — local filesystem (default),
-in-memory, or S3/MinIO, with no recompile to switch.
-
-### Deploy on EKS + S3 (Helm)
+## Deploy on EKS + S3 (Helm)
 
 ```bash
 helm install vdg deploy/helm/verdigris \
@@ -123,10 +166,10 @@ helm install vdg deploy/helm/verdigris \
   --set-string serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<acct>:role/verdigris-s3
 ```
 
-Data lands in **your** bucket; the query tier is stateless and scales freely, while a
-single ingest writer keeps the catalog consistent. Full deployment guide (including the
-zero-config local demo, Vector DaemonSet, and MinIO) is in
-[`deploy/README.md`](deploy/README.md).
+Data lands in **your** bucket via IRSA (no static keys); the query tier is
+stateless and scales freely while a single ingest writer keeps the catalog
+consistent. Full guide — including the zero-config local demo, the Vector
+DaemonSet, and MinIO — in [`deploy/README.md`](deploy/README.md).
 
 ## The `vdg` CLI
 
@@ -141,15 +184,14 @@ zero-config local demo, Vector DaemonSet, and MinIO) is in
 | `vdg serve` | Serve the HTTP API + web UI (`--features serve`) |
 | `vdg config` / `vdg check` | Show / validate configuration |
 
-The HTTP API surface served by `vdg serve` is documented in
-[`docs/API.md`](docs/API.md).
+The HTTP API surface is documented in [`docs/API.md`](docs/API.md).
 
 ## Project layout
 
 ```
 crates/
-  core/       sans-I/O control plane — batch, clock, cost, estimate, lifecycle,
-              manifest, model, rng, search. No I/O, no time, no threads.
+  core/       sans-I/O control plane — auth, batch, clock, cost, estimate,
+              lifecycle, manifest, model, rng, search. No I/O, no time, no threads.
   storage/    the ObjectStore seam — real S3 / local / in-memory + SimObjectStore.
   query/      the ScanExecutor seam — ModeledExecutor + DataFusion engine.
   ingest/     records → Arrow → Parquet → store; manifest, routing, compaction.
@@ -160,35 +202,51 @@ frontend/     original no-build prototype (reference for the UI contract).
 docs/         architecture, ADRs, HTTP API reference.
 ```
 
-## Testing — Deterministic Simulation Testing
+## Testing — deterministic simulation
 
-Verdigris tests at trillion-row / petabyte scale **without running at scale**. The
-control plane is sans-I/O and every source of nondeterminism (`Clock`, `Rng`,
-`ObjectStore`, `ScanExecutor`) is injected through a seam, so a "trillion-row query"
-completes in seconds under a deterministic simulator — no real bytes move. This is a
-core constraint that shapes how every component is written, not a test-time add-on.
-See [`docs/dst-architecture.md`](docs/dst-architecture.md).
+Verdigris tests at trillion-row / petabyte scale **without running at scale**:
+62 tests across the feature matrix, all fast, offline, and reproducible.
 
 ```bash
-cargo test --workspace          # fast, offline, deterministic
-cargo test -p verdigris-storage # includes the SimObjectStore / DST tests
+cargo test --workspace                       # default: fast, offline, deterministic
+cargo test -p vdg --features serve           # HTTP / auth / OTLP surface
+cargo test -p verdigris-query --features datafusion   # real engine path
 ```
+
+This is a core constraint that shapes how every component is written, not a
+test-time add-on — see [`docs/dst-architecture.md`](docs/dst-architecture.md).
 
 ## Status & roadmap
 
-Verdigris is **alpha**. The full local loop works end to end — ingest → tier → compact →
-query → cost-estimate → serve to a browser UI — and deploys via Helm. See
-[`STATUS.md`](STATUS.md) (UI) and [`BACKEND_STATUS.md`](BACKEND_STATUS.md) (backend &
-system) for the current state and what's left.
+Verdigris is **alpha**. The full local loop works end to end — ingest → tier →
+compact → query → cost-estimate → alert → serve to a browser UI — and deploys
+via Helm. Where it stands and what's next:
+
+- [`ROADMAP.md`](ROADMAP.md) — engineering-readiness milestones (every gap cites
+  the file that proves it)
+- [`DEMO_ROADMAP.md`](DEMO_ROADMAP.md) — the market-research-backed bar for a
+  replacement-grade demo
+- [`STATUS.md`](STATUS.md) (UI) · [`BACKEND_STATUS.md`](BACKEND_STATUS.md) (backend)
 
 ## Contributing
 
-Contributions are welcome. Please read [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to
-build, test, and structure changes — in particular the sans-I/O discipline that keeps
-the system deterministically testable. By contributing you agree to license your work
-under Apache-2.0.
+Contributions are welcome. Please read [`CONTRIBUTING.md`](CONTRIBUTING.md) for
+how to build, test, and structure changes — in particular the sans-I/O
+discipline that keeps the system deterministically testable. By contributing you
+agree to license your work under Apache-2.0.
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE). See [`NOTICE`](NOTICE) for
-attribution of embedded third-party components.
+Licensed under the [Apache License, Version 2.0](LICENSE). See
+[`NOTICE`](NOTICE) for attribution of embedded third-party components.
+
+---
+
+<div align="center">
+
+*Verdigris is the green patina that forms on copper as it sits exposed over
+time — the layer a metal accumulates simply by existing in the world. That's
+what logs are: the layer your infrastructure accumulates as it runs. It's also
+a quiet Rust pun — verdigris is what oxidation matures into.*
+
+</div>
