@@ -142,15 +142,15 @@ Prometheus `/metrics` (M3.2 ✅); data residency by construction.
 
 | # | Item | Why | Effort | Grade |
 |---|------|-----|--------|-------|
-| G-1 | **UI login/auth integration** — `web/src/lib/transport.ts` auth header is a stub (`Bearer <token>` literal), so the product UI cannot authenticate against the RBAC we shipped; a demo would run auth-off. | Demoing an enterprise tool with security disabled contradicts the pitch on stage. | S | **DP0** |
-| G-2 | **Durable audit trail** — flush query/audit history to the store (`_audit/…`), load on boot (M2.3 deferral). | "Does the audit log survive a restart?" — currently no. | S | **DP0** |
+| G-1 | **UI login/auth integration** — ✅ **shipped (2026-07-05):** `/config.json` advertises token auth, the transport sends the user's real token (token-gate overlay collects/stores it, 401 re-raises it), SSE rides `?access_token=`. OIDC remains G-3. | Demoing an enterprise tool with security disabled contradicts the pitch on stage. | S | **DP0** ✅ |
+| G-2 | **Durable audit trail** — ✅ **shipped (2026-07-05):** query history persists to `_audit/query-history.json` under CAS, loads on boot; the audit endpoint reads the persisted doc. | "Does the audit log survive a restart?" — yes, verified. | S | **DP0** ✅ |
 | G-3 | **OIDC SSO** (any OIDC IdP → role mapping; SAML/SCIM explicitly later). | SSO is the first governance question in every enterprise screen; tokens+RBAC carry the demo, OIDC carries the POC. | L | DP1 (roadmap answer in-demo; needed for POC) |
 | G-4 | **TLS/encryption posture doc** — ingress-terminated TLS in Helm values; S3 SSE + bucket-policy guidance. | Checklist item; a documented answer suffices. | S | DP1 |
 
 ## Pillar 8 — Run it (reliability & packaging)
 
 **Have:** split-role serve (1 writer / N readers), CAS commits,
-backpressure, Helm chart + Dockerfile, DST harness (4 scenarios), 75 tests
+backpressure, Helm chart + Dockerfile, DST harness (4 scenarios), 78 tests
 green across the feature matrix. Open M-items: Iceberg (M1.1), full DST
 (M1.3), tenant isolation (M2.2), publishing (M5.1), releases (M5.2),
 benchmarks (M5.3).

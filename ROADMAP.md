@@ -75,15 +75,15 @@ placeholder.
 
 - **66 tests pass** on the default offline build — `cargo test --workspace`:
   core 38, ingest 19, query 1, storage 4, `storage/tests/dst.rs` 4, vdg 0.
-- **+4** in `vdg` under `cargo test -p vdg --features serve` (the HTTP/auth/OTLP tests
-  aren't compiled in the default build).
+- **+7** in `vdg` under `cargo test -p vdg --features serve` (the HTTP/auth/OTLP tests
+  plus the audit-persistence and alerts-CAS tests aren't compiled in the default build).
 - **+5** in `verdigris-query` under `cargo test -p verdigris-query --features datafusion`
   (`crates/query/tests/engine.rs`): real Parquet written through the production ingest
   path and queried in place — SQL filter/aggregate correctness, the bloom-filtered
   `trace_id` equality lookup, engine-reads-only-registered-files (the M4.1 guarantee at
   the execution layer), free-text pruning result parity, and the view-free Arrow IPC
   wire vs the JSON path.
-- → **75 across the feature matrix.**
+- → **78 across the feature matrix.**
 
 ---
 
@@ -197,9 +197,10 @@ bytes**, **cost**, and the coldest tier touched, into a bounded in-memory ring (
 cap 500). `/v1/cost` `expensiveQueries` is now populated from that history (top 5 by scanned
 bytes), and `GET /v1/audit/queries` (admin-only, enforced by `required_role`) returns the log
 newest-first. Verified live: real per-user records, populated expensiveQueries, readonly→403.
-*Deferred:* **durable/exportable** persistence — today it's recent in-memory history (lost on
-restart); flushing to the store (e.g. `_audit/query-history.ndjson`) + load-on-boot is the
-follow-up for true compliance-grade audit.
+*Durable persistence (2026-07-05):* every recorded query now writes through to
+`{table}/_audit/query-history.json` under optimistic CAS; the ring loads from it at boot
+and `GET /v1/audit/queries` reads the persisted doc (complete across replicas, survives
+restarts). *Still deferred:* export/retention beyond the 500-record cap.
 *Effort: M · Priority: P1.*
 
 ### M3 — Operations & durability
@@ -211,9 +212,11 @@ each rule's SQL via the query engine, fires a webhook on OK↔Firing transitions
 `GET/POST/DELETE /v1/alerts` (create validates the SQL + evaluates immediately). Two example
 rules seeded. Wired end to end into BOTH the `frontend/` prototype and the `web/` production
 Alerts pages (create form, delete, real state). Commits `4b0b132`, `d5aae36`.
-*Follow-ups (deferred):* first-class time-window field (today the window is whatever `WHERE ts…`
-you put in the SQL); Slack/PagerDuty channels (thin wrappers on the webhook); CAS persistence
-for the alerts doc (today last-write-wins within the single writer).
+*Follow-ups:* CAS persistence for the alerts doc — **done (2026-07-05)**, all four write
+sites commit under optimistic CAS and evaluation webhooks fire only after the transition
+is committed (no double-notify on conflict). Still deferred: first-class time-window field
+(today the window is whatever `WHERE ts…` you put in the SQL); Slack/PagerDuty channels
+(thin wrappers on the webhook).
 
 **M3.2 — Self-observability (Prometheus `/metrics`). ✅ DONE (2026-07-06) — /metrics + real latency; OTel tracing deferred.**
 Shipped: a dependency-free `GET /metrics` in Prometheus text format (`serve.rs` `HttpMetrics` +
