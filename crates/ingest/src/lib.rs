@@ -255,6 +255,21 @@ impl Ingestor {
     /// fixed order, so the operation is deterministic. The manifest is rewritten
     /// to point at the new files *before* old objects are deleted (crash-safer).
     pub async fn compact(&self, target_bytes: u64) -> anyhow::Result<Vec<CompactionReport>> {
+        Ok(self.compact_bounded(target_bytes, usize::MAX).await?.0)
+    }
+
+    /// One bounded compaction pass: merges at most ~`max_merge_files` source files
+    /// (across tiers), commits under CAS, and returns `(reports, more)` where
+    /// `more` is true if mergeable files were left for a later pass because the
+    /// budget was reached. This bounds how long a single pass holds the ingest
+    /// lock; the scheduler runs repeated passes (releasing the lock between them)
+    /// to drain a large backlog. `max_merge_files == usize::MAX` reproduces a full
+    /// single-pass compaction (what the CLI `compact` does).
+    pub async fn compact_bounded(
+        &self,
+        target_bytes: u64,
+        max_merge_files: usize,
+    ) -> anyhow::Result<(Vec<CompactionReport>, bool)> {
         // Whole-operation optimistic retry: snapshot the manifest, rewrite the
         // layout, and commit under compare-and-swap. If a concurrent writer
         // committed in between, our freshly written compacted files become harmless
@@ -267,6 +282,10 @@ impl Ingestor {
             let mut new_files: Vec<DataFile> = Vec::new();
             let mut to_delete: Vec<String> = Vec::new();
             let mut reports: Vec<CompactionReport> = Vec::new();
+            // Per-pass merge budget: once reached, remaining mergeable bins are
+            // deferred (kept as-is) and `more` signals the scheduler to run again.
+            let mut merged_this_pass = 0usize;
+            let mut more = false;
 
             for tier in Tier::ALL {
                 let tier_files: Vec<DataFile> =
@@ -284,6 +303,17 @@ impl Ingestor {
                         // Already big enough on its own — leave it untouched.
                         new_files.push(bin[0].clone());
                         after += 1;
+                        continue;
+                    }
+                    // Budget reached: defer this (and every subsequent) mergeable
+                    // bin to a later pass so one pass can't hold the lock too long.
+                    // Always merge at least one bin so every pass makes progress.
+                    if merged_this_pass > 0 && merged_this_pass + bin.len() > max_merge_files {
+                        more = true;
+                        for f in &bin {
+                            new_files.push(f.clone());
+                        }
+                        after += bin.len();
                         continue;
                     }
                     // Read every file in the bin and re-encode as one Parquet file.
@@ -330,6 +360,7 @@ impl Ingestor {
                     }
                     after += 1;
                     merged += bin.len();
+                    merged_this_pass += bin.len();
                 }
 
                 reports.push(CompactionReport {
@@ -348,7 +379,7 @@ impl Ingestor {
                 for path in to_delete {
                     let _ = self.store.delete(&ObjPath::from(path)).await;
                 }
-                return Ok(reports);
+                return Ok((reports, more));
             }
             // Conflict: reload and redo against the fresh manifest.
         }
@@ -544,6 +575,52 @@ mod tests {
         let reports = ing.compact(target).await.unwrap();
         let merged: usize = reports.iter().map(|r| r.files_merged).sum();
         assert_eq!(predicted, merged, "pending estimate must equal files actually merged");
+    }
+
+    #[tokio::test]
+    async fn bounded_compaction_drains_and_matches_unbounded() {
+        // Invariant: draining a backlog with small bounded passes ends in the same
+        // file layout as one unbounded pass — just spread over multiple commits so
+        // no single pass holds the ingest lock for long.
+        let routing = RoutingConfig::default();
+        let policy = BatchPolicy { max_rows: 100, max_bytes: usize::MAX };
+        let target = 10 * 1024 * 1024;
+
+        let a = Ingestor::new(Arc::new(InMemory::new()) as Arc<dyn ObjectStore>, "logs");
+        let b = Ingestor::new(Arc::new(InMemory::new()) as Arc<dyn ObjectStore>, "logs");
+        // Identical data into both (generator is deterministic).
+        for i in 0u64..20 {
+            a.ingest(generate::generate(100, i, (i as i64) * 1_000_000), &routing, policy)
+                .await
+                .unwrap();
+            b.ingest(generate::generate(100, i, (i as i64) * 1_000_000), &routing, policy)
+                .await
+                .unwrap();
+        }
+        let before = a.load_manifest().await.unwrap().files.len();
+        assert!(before > 6, "expected a backlog, got {before}");
+
+        // A: one unbounded pass leaves nothing pending.
+        let (_ra, more_a) = a.compact_bounded(target, usize::MAX).await.unwrap();
+        assert!(!more_a);
+
+        // B: tiny budget -> many bounded passes until drained.
+        let mut passes = 0usize;
+        loop {
+            let (_rb, more) = b.compact_bounded(target, 4).await.unwrap();
+            passes += 1;
+            assert!(passes < 1000, "must terminate");
+            if !more {
+                break;
+            }
+        }
+        assert!(passes > 1, "small budget should need multiple passes, took {passes}");
+
+        let fa = a.load_manifest().await.unwrap();
+        let fb = b.load_manifest().await.unwrap();
+        assert_eq!(fa.total_rows(), fb.total_rows(), "no rows lost either way");
+        assert_eq!(fa.files.len(), fb.files.len(), "bounded drains to the same layout");
+        assert_eq!(pending_compaction_total(&fb, target), 0, "fully drained");
     }
 
     fn sample_file(path: &str) -> DataFile {

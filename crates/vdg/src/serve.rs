@@ -568,6 +568,7 @@ async fn maybe_compact(
     ingest_lock: &tokio::sync::Mutex<()>,
     target_bytes: u64,
     trigger: usize,
+    max_merge_files: usize,
     metrics: &CompactionMetrics,
 ) -> anyhow::Result<()> {
     let ingestor = verdigris_ingest::Ingestor::new(s.clone(), table);
@@ -581,14 +582,28 @@ async fn maybe_compact(
         return Ok(()); // not enough small files yet to be worth a rewrite
     }
 
-    let _g = ingest_lock.lock().await;
-    let reports = ingestor.compact(target_bytes).await?;
-    let merged: usize = reports.iter().map(|r| r.files_merged).sum();
-    if merged > 0 {
-        metrics.files_merged_total.fetch_add(merged as u64, Ordering::Relaxed);
+    // Drain the backlog with bounded passes. Each pass holds the ingest lock only
+    // for its capped merge, then releases it (yield) so ingest can interleave —
+    // a large backlog no longer stalls ingest in one long pass. The 10k-pass cap
+    // is a runaway backstop; file count strictly drops per pass, so it terminates.
+    let mut total_merged = 0usize;
+    let mut passes = 0usize;
+    loop {
+        let _g = ingest_lock.lock().await;
+        let (reports, more) = ingestor.compact_bounded(target_bytes, max_merge_files).await?;
+        drop(_g);
+        total_merged += reports.iter().map(|r| r.files_merged).sum::<usize>();
+        passes += 1;
+        if !more || passes >= 10_000 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    if total_merged > 0 {
+        metrics.files_merged_total.fetch_add(total_merged as u64, Ordering::Relaxed);
         metrics.runs_total.fetch_add(1, Ordering::Relaxed);
         metrics.last_run_ms.store(crate::now_millis() as u64, Ordering::Relaxed);
-        tracing::info!(files_merged = merged, "auto-compaction ran");
+        tracing::info!(files_merged = total_merged, passes, "auto-compaction ran");
     }
     Ok(())
 }
@@ -782,6 +797,7 @@ pub async fn serve(
                         &lock,
                         target,
                         ccfg.trigger_pending_files,
+                        ccfg.max_merge_files_per_pass,
                         &cm,
                     )
                     .await
@@ -2097,7 +2113,7 @@ mod tests {
         let target = 10 * 1024 * 1024;
 
         // Trigger far above pending -> no-op; files and counters untouched.
-        maybe_compact(&s, "logs", &lock, target, 10_000, &metrics).await.unwrap();
+        maybe_compact(&s, "logs", &lock, target, 10_000, 128, &metrics).await.unwrap();
         assert_eq!(metrics.runs_total.load(Ordering::Relaxed), 0);
         assert_eq!(
             ing.load_manifest().await.unwrap().files.len(),
@@ -2105,13 +2121,23 @@ mod tests {
             "must not compact below the trigger"
         );
 
-        // Low trigger -> compaction runs, files shrink, metrics recorded.
-        maybe_compact(&s, "logs", &lock, target, 2, &metrics).await.unwrap();
+        // Low trigger + tiny per-pass budget -> multiple bounded passes drain the
+        // backlog fully; files shrink and metrics record one run.
+        maybe_compact(&s, "logs", &lock, target, 2, 2, &metrics).await.unwrap();
         let after = ing.load_manifest().await.unwrap().files.len();
         assert!(after < before, "auto-compaction should reduce files ({before} -> {after})");
         assert_eq!(metrics.runs_total.load(Ordering::Relaxed), 1);
         assert!(metrics.files_merged_total.load(Ordering::Relaxed) > 0);
         assert!(metrics.last_run_ms.load(Ordering::Relaxed) > 0);
+        // Fully drained: nothing left pending.
+        assert_eq!(
+            verdigris_ingest::pending_compaction_total(
+                &ing.load_manifest().await.unwrap(),
+                target
+            ),
+            0,
+            "bounded passes should drain the backlog"
+        );
     }
 
     fn audit_rec(i: i64) -> QueryRecord {

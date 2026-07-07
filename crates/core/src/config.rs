@@ -61,6 +61,12 @@ pub struct CompactionConfig {
     /// Compact once any tier has at least this many files pending a merge (files
     /// that would fall into a multi-file bin). Avoids rewriting on every tick.
     pub trigger_pending_files: usize,
+    /// Max source files a single compaction *pass* merges before committing and
+    /// releasing the ingest lock. Bounds how long one pass can stall ingest (a
+    /// full 2k-file backlog in one pass held the lock ~43s in testing); the
+    /// scheduler runs repeated bounded passes to drain a large backlog, yielding
+    /// the lock between them so ingest can interleave.
+    pub max_merge_files_per_pass: usize,
     /// How often the scheduler checks for pending compaction (seconds).
     pub interval_secs: u64,
 }
@@ -71,6 +77,7 @@ impl Default for CompactionConfig {
             enabled: true,
             target_mib: 256,
             trigger_pending_files: 16,
+            max_merge_files_per_pass: 128,
             interval_secs: 300, // 5 min
         }
     }
@@ -299,18 +306,21 @@ mod tests {
         assert_eq!(c.compaction.target_mib, 256);
         assert_eq!(c.compaction.target_bytes(), 256 * 1024 * 1024);
         assert_eq!(c.compaction.trigger_pending_files, 16);
+        assert_eq!(c.compaction.max_merge_files_per_pass, 128);
 
         let toml = r#"
             [compaction]
             enabled = false
             target_mib = 512
             trigger_pending_files = 8
+            max_merge_files_per_pass = 64
             interval_secs = 60
         "#;
         let c: Config = toml::from_str(toml).unwrap();
         assert!(!c.compaction.enabled);
         assert_eq!(c.compaction.target_mib, 512);
         assert_eq!(c.compaction.trigger_pending_files, 8);
+        assert_eq!(c.compaction.max_merge_files_per_pass, 64);
         assert_eq!(c.compaction.interval_secs, 60);
     }
 
