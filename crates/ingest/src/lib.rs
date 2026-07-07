@@ -365,6 +365,50 @@ pub struct CompactionReport {
     pub files_merged: usize,
 }
 
+/// How many files a [`Ingestor::compact`] pass would merge *right now*, per tier,
+/// for `target_bytes` — i.e. files that fall into a multi-file bin (a lone file
+/// already at/over target is left untouched, so it isn't pending). Pure and
+/// manifest-only: no data reads, no `DataFile` clones, so the auto-compaction
+/// scheduler and `/v1/metrics` can call it on every tick cheaply.
+///
+/// This mirrors the binning in [`bin_by_bytes`] exactly (same greedy accumulation,
+/// same trailing-remainder bin); the `pending_matches_compact` test pins the two
+/// together so this count can never drift from what compaction actually merges.
+pub fn pending_compaction(manifest: &Manifest, target_bytes: u64) -> Vec<(Tier, usize)> {
+    let mut out = Vec::new();
+    for tier in Tier::ALL {
+        let mut pending = 0usize;
+        let mut acc = 0u64;
+        let mut bin_len = 0usize;
+        for f in manifest.files.iter().filter(|f| f.tier == tier) {
+            acc += f.bytes;
+            bin_len += 1;
+            if acc >= target_bytes {
+                if bin_len > 1 {
+                    pending += bin_len; // this closed bin is a real merge
+                }
+                acc = 0;
+                bin_len = 0;
+            }
+        }
+        if bin_len > 1 {
+            pending += bin_len; // trailing remainder bin
+        }
+        if pending > 0 {
+            out.push((tier, pending));
+        }
+    }
+    out
+}
+
+/// Total files pending a merge across all tiers.
+pub fn pending_compaction_total(manifest: &Manifest, target_bytes: u64) -> usize {
+    pending_compaction(manifest, target_bytes)
+        .iter()
+        .map(|(_, n)| n)
+        .sum()
+}
+
 /// Greedily group files (in order) into bins whose total size reaches
 /// `target_bytes`. A trailing remainder forms its own bin.
 fn bin_by_bytes(files: &[DataFile], target_bytes: u64) -> Vec<Vec<DataFile>> {
@@ -460,6 +504,46 @@ mod tests {
         assert_eq!(after.compaction_gen, 1);
         // Compacted files use the new naming scheme.
         assert!(after.files.iter().any(|f| f.path.contains("/c0-")));
+    }
+
+    #[test]
+    fn pending_compaction_counts_only_multi_file_bins() {
+        // Hot: three 100-byte files, target 250 -> bin [a,b] closes at 200<250? no,
+        // 100+100=200 < 250, +c=300 >=250 -> one bin of 3 -> all 3 pending.
+        let mut m = Manifest::new("logs");
+        for p in ["logs/hot/a", "logs/hot/b", "logs/hot/c"] {
+            m.add(sample_file(p));
+        }
+        assert_eq!(pending_compaction_total(&m, 250), 3);
+
+        // One file already over target -> its own bin, nothing pending.
+        let mut m2 = Manifest::new("logs");
+        let mut big = sample_file("logs/hot/big");
+        big.bytes = 1000;
+        m2.add(big);
+        assert_eq!(pending_compaction_total(&m2, 250), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_matches_compact() {
+        // The invariant: pending_compaction_total (a manifest-only estimate) must
+        // equal the files compact() actually merges (sum of files_merged). If the
+        // binning ever drifts, this fails.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ing = Ingestor::new(store, "logs");
+        let routing = RoutingConfig::default();
+        let policy = BatchPolicy { max_rows: 100, max_bytes: usize::MAX };
+        for i in 0u64..10 {
+            let recs = generate::generate(100, i, (i as i64) * 1_000_000);
+            ing.ingest(recs, &routing, policy).await.unwrap();
+        }
+        let target = 10 * 1024 * 1024;
+        let m = ing.load_manifest().await.unwrap();
+        let predicted = pending_compaction_total(&m, target);
+
+        let reports = ing.compact(target).await.unwrap();
+        let merged: usize = reports.iter().map(|r| r.files_merged).sum();
+        assert_eq!(predicted, merged, "pending estimate must equal files actually merged");
     }
 
     fn sample_file(path: &str) -> DataFile {

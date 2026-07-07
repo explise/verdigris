@@ -115,6 +115,30 @@ struct AppState {
     /// CAS, so the audit trail survives restarts (the audit endpoint reads the
     /// persisted doc, which collects records from all replicas).
     query_history: Arc<tokio::sync::Mutex<VecDeque<QueryRecord>>>,
+    /// Observability for the background auto-compaction scheduler. Updated by the
+    /// scheduler task; read (with a live pending count) by `/v1/metrics`.
+    compaction: Arc<CompactionMetrics>,
+}
+
+/// Counters for background auto-compaction. The live "pending files" figure is
+/// computed on demand from the manifest (see [`h_metrics`]); these track history.
+struct CompactionMetrics {
+    /// Wall-clock ms of the last run that merged files (0 = never).
+    last_run_ms: AtomicU64,
+    /// Scheduler runs that actually merged files.
+    runs_total: AtomicU64,
+    /// Files merged across all runs.
+    files_merged_total: AtomicU64,
+}
+
+impl CompactionMetrics {
+    fn new() -> Self {
+        Self {
+            last_run_ms: AtomicU64::new(0),
+            runs_total: AtomicU64::new(0),
+            files_merged_total: AtomicU64::new(0),
+        }
+    }
 }
 
 /// The authenticated caller, stashed in request extensions by `require_auth` and
@@ -533,6 +557,42 @@ async fn notify_webhook(url: &str, payload: Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One compaction-scheduler tick. Reads the manifest, and if any single tier has
+/// at least `trigger` files pending a merge, runs a compaction pass and records
+/// what it merged. Cheap when nothing is pending (no data is touched). Holds the
+/// ingest lock across the pass to avoid CAS thrash with local ingests (cross-
+/// replica writers are still resolved by the manifest CAS inside `compact`).
+async fn maybe_compact(
+    s: &Store,
+    table: &str,
+    ingest_lock: &tokio::sync::Mutex<()>,
+    target_bytes: u64,
+    trigger: usize,
+    metrics: &CompactionMetrics,
+) -> anyhow::Result<()> {
+    let ingestor = verdigris_ingest::Ingestor::new(s.clone(), table);
+    let manifest = ingestor.load_manifest().await?;
+    let max_tier_pending = verdigris_ingest::pending_compaction(&manifest, target_bytes)
+        .iter()
+        .map(|(_, n)| *n)
+        .max()
+        .unwrap_or(0);
+    if max_tier_pending < trigger {
+        return Ok(()); // not enough small files yet to be worth a rewrite
+    }
+
+    let _g = ingest_lock.lock().await;
+    let reports = ingestor.compact(target_bytes).await?;
+    let merged: usize = reports.iter().map(|r| r.files_merged).sum();
+    if merged > 0 {
+        metrics.files_merged_total.fetch_add(merged as u64, Ordering::Relaxed);
+        metrics.runs_total.fetch_add(1, Ordering::Relaxed);
+        metrics.last_run_ms.store(crate::now_millis() as u64, Ordering::Relaxed);
+        tracing::info!(files_merged = merged, "auto-compaction ran");
+    }
+    Ok(())
+}
+
 /// Seed two illustrative rules the first time a table is served, so the Alerts
 /// page shows a real firing + OK example instead of an empty screen. No-op once
 /// any rule exists.
@@ -679,6 +739,7 @@ pub async fn serve(
         tokens: Arc::new(tokio::sync::RwLock::new(tokens_doc)),
         metrics: Arc::new(HttpMetrics::new()),
         query_history: Arc::new(tokio::sync::Mutex::new(boot_history)),
+        compaction: Arc::new(CompactionMetrics::new()),
     };
 
     // Alert evaluator. On a writer role (the single manifest writer owns alert
@@ -695,6 +756,37 @@ pub async fn serve(
                     tokio::time::sleep(Duration::from_secs(15)).await;
                     if let Err(e) = evaluate_all(&s, table.as_str(), &lock).await {
                         tracing::warn!(error = %e, "alert scheduler tick failed");
+                    }
+                }
+            });
+        }
+    }
+
+    // Background auto-compaction. Only the writer role compacts (it owns the
+    // manifest). Each tick is cheap when nothing is pending (a manifest read +
+    // arithmetic); it only rewrites files once a tier crosses the trigger.
+    if role.serves_writes() && state.cfg.compaction.enabled {
+        if let Ok(s) = store(&state) {
+            let table = state.table.clone();
+            let cm = state.compaction.clone();
+            let lock = state.ingest_lock.clone();
+            let ccfg = state.cfg.compaction.clone();
+            tokio::spawn(async move {
+                let target = ccfg.target_bytes();
+                let interval = Duration::from_secs(ccfg.interval_secs.max(1));
+                loop {
+                    tokio::time::sleep(interval).await;
+                    if let Err(e) = maybe_compact(
+                        &s,
+                        table.as_str(),
+                        &lock,
+                        target,
+                        ccfg.trigger_pending_files,
+                        &cm,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, "compaction scheduler tick failed");
                     }
                 }
             });
@@ -1631,6 +1723,11 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
         0.0
     };
 
+    // Compaction health: live pending count from the manifest + scheduler history.
+    let target_bytes = st.cfg.compaction.target_bytes();
+    let pending_files = verdigris_ingest::pending_compaction_total(&m, target_bytes);
+    let last_run = st.compaction.last_run_ms.load(Ordering::Relaxed);
+
     Ok(Json(json!({
         "ingestRate": ingest_rate,
         "errorRate": error_rate,
@@ -1641,6 +1738,15 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
             "ingest": { "value": format!("{:.0}", avg(&ingest_rate)), "unit": "ev/s", "delta": 0.0 },
             "errors": { "value": format!("{overall_err:.1}"), "unit": "%", "delta": 0.0 },
             "p99":    { "value": format!("{:.2}", avg(&p99) / 1000.0), "unit": "s", "delta": 0.0 },
+        },
+        "compaction": {
+            "enabled": st.cfg.compaction.enabled,
+            "targetMib": st.cfg.compaction.target_mib,
+            "totalFiles": m.files.len(),
+            "pendingFiles": pending_files,
+            "filesMergedTotal": st.compaction.files_merged_total.load(Ordering::Relaxed),
+            "runsTotal": st.compaction.runs_total.load(Ordering::Relaxed),
+            "lastRunMs": if last_run == 0 { Value::Null } else { json!(last_run) },
         },
     })))
 }
@@ -1970,6 +2076,42 @@ mod tests {
     fn empty_body_yields_no_records() {
         let (recs, _, _) = parse_ingest_body("   \n  \n");
         assert!(recs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_compaction_triggers_below_and_above_threshold() {
+        let s: Store = Arc::new(object_store::memory::InMemory::new());
+        let ing = verdigris_ingest::Ingestor::new(s.clone(), "logs");
+        let routing = verdigris_core::config::RoutingConfig::default();
+        let policy = BatchPolicy { max_rows: 100, max_bytes: usize::MAX };
+        // Many small ingests -> many small files (the streaming reality).
+        for i in 0u64..10 {
+            let recs = verdigris_ingest::generate::generate(100, i, (i as i64) * 1_000_000);
+            ing.ingest(recs, &routing, policy).await.unwrap();
+        }
+        let before = ing.load_manifest().await.unwrap().files.len();
+        assert!(before > 3, "expected many small files, got {before}");
+
+        let lock = tokio::sync::Mutex::new(());
+        let metrics = CompactionMetrics::new();
+        let target = 10 * 1024 * 1024;
+
+        // Trigger far above pending -> no-op; files and counters untouched.
+        maybe_compact(&s, "logs", &lock, target, 10_000, &metrics).await.unwrap();
+        assert_eq!(metrics.runs_total.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            ing.load_manifest().await.unwrap().files.len(),
+            before,
+            "must not compact below the trigger"
+        );
+
+        // Low trigger -> compaction runs, files shrink, metrics recorded.
+        maybe_compact(&s, "logs", &lock, target, 2, &metrics).await.unwrap();
+        let after = ing.load_manifest().await.unwrap().files.len();
+        assert!(after < before, "auto-compaction should reduce files ({before} -> {after})");
+        assert_eq!(metrics.runs_total.load(Ordering::Relaxed), 1);
+        assert!(metrics.files_merged_total.load(Ordering::Relaxed) > 0);
+        assert!(metrics.last_run_ms.load(Ordering::Relaxed) > 0);
     }
 
     fn audit_rec(i: i64) -> QueryRecord {
