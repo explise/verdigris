@@ -316,8 +316,12 @@ impl Ingestor {
                         after += bin.len();
                         continue;
                     }
-                    // Read every file in the bin and re-encode as one Parquet file.
-                    let mut batches = Vec::new();
+                    // Stream the bin through one Parquet writer: fetch → decode →
+                    // encode, a batch at a time, folding the manifest stats as we
+                    // go. Peak memory is one batch plus the encoder's in-progress
+                    // row group, NOT the bin's whole decompressed size — see
+                    // `MergeWriter` (issue #13).
+                    let mut w = encode::MergeWriter::new(schema::log_schema())?;
                     for f in &bin {
                         let bytes = self
                             .store
@@ -326,9 +330,10 @@ impl Ingestor {
                             .with_context(|| format!("reading {} for compaction", f.path))?
                             .bytes()
                             .await?;
-                        batches.extend(encode::read_parquet_bytes(bytes)?);
+                        encode::stream_parquet_into(bytes, &mut w)?;
                     }
-                    let data = encode::encode_record_batches(schema::log_schema(), &batches)?;
+                    let in_progress = w.in_progress_size();
+                    let (data, stats) = w.finish()?;
                     let path = format!(
                         "{}/{}/c{generation}-{seq:05}.parquet",
                         self.table,
@@ -341,19 +346,28 @@ impl Ingestor {
                         .await
                         .with_context(|| format!("writing compacted {path}"))?;
 
-                    // Recompute value stats from the merged rows (authoritative even
-                    // if some input files predate value stats) so the compacted file
-                    // still prunes by service/level.
+                    tracing::debug!(
+                        tier = tier.as_str(),
+                        files = bin.len(),
+                        out_bytes = len,
+                        rows = stats.rows,
+                        writer_in_progress_bytes = in_progress,
+                        "compacted bin"
+                    );
+
+                    // Stats are recomputed from the merged rows by `MergeWriter`
+                    // (authoritative even if some input files predate value stats),
+                    // so the compacted file still prunes by service/level/trigram.
                     new_files.push(DataFile {
                         path,
                         bytes: len,
-                        rows: bin.iter().map(|f| f.rows).sum(),
-                        min_ts: bin.iter().map(|f| f.min_ts).min().unwrap_or(0),
-                        max_ts: bin.iter().map(|f| f.max_ts).max().unwrap_or(0),
+                        rows: stats.rows,
+                        min_ts: stats.min_ts,
+                        max_ts: stats.max_ts,
                         tier,
-                        services: encode::distinct_strings(&batches, "service"),
-                        levels: encode::distinct_strings(&batches, "level"),
-                        message_trigrams: Some(encode::message_trigrams(&batches)),
+                        services: stats.services,
+                        levels: stats.levels,
+                        message_trigrams: Some(stats.message_trigrams),
                     });
                     for f in &bin {
                         to_delete.push(f.path.clone());
@@ -519,6 +533,13 @@ mod tests {
         let before = ing.load_manifest().await.unwrap();
         let rows_before = before.total_rows();
         assert!(before.files.len() > 3, "expected many small files");
+        let span = |m: &Manifest| {
+            (
+                m.files.iter().map(|f| f.min_ts).min().unwrap(),
+                m.files.iter().map(|f| f.max_ts).max().unwrap(),
+            )
+        };
+        let span_before = span(&before);
 
         // Large target -> each tier collapses toward a single file.
         let reports = ing.compact(10 * 1024 * 1024).await.unwrap();
@@ -533,6 +554,11 @@ mod tests {
         );
         assert_eq!(after.total_rows(), rows_before, "no rows lost");
         assert_eq!(after.compaction_gen, 1);
+        // The streaming merge recomputes min/max ts from the rows it writes rather
+        // than inheriting them from the inputs' manifest entries; the time span it
+        // reports must still cover exactly what went in, or the planner would prune
+        // away real data.
+        assert_eq!(span(&after), span_before, "time span changed across compaction");
         // Compacted files use the new naming scheme.
         assert!(after.files.iter().any(|f| f.path.contains("/c0-")));
     }
