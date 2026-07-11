@@ -11,7 +11,7 @@
 //!
 //! Field mapping (OTLP → LogRecord):
 //!   - `timeUnixNano` (ns, string or number) → `ts_millis` (ns / 1e6);
-//!      falls back to `observedTimeUnixNano`.
+//!     falls back to `observedTimeUnixNano`.
 //!   - `severityText` (if recognized) else `severityNumber` → `level`.
 //!   - `body.stringValue` → `message`.
 //!   - resource attribute `service.name` → `service`.

@@ -98,20 +98,11 @@ impl CompactionConfig {
 /// The token may be set here or, preferably in production, via the
 /// `VERDIGRIS_API_TOKEN` environment variable (which overrides this field so the
 /// secret never has to live in a config file). See `Config::resolved_auth_token`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthConfig {
     pub enabled: bool,
     pub token: Option<String>,
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            token: None,
-        }
-    }
 }
 
 impl Config {

@@ -827,10 +827,10 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let ing = Ingestor::new(store, "logs");
         let f = sample_file("logs/hot/part-x.parquet");
-        ing.append_files(&[f.clone()]).await.unwrap();
+        ing.append_files(std::slice::from_ref(&f)).await.unwrap();
         // Re-appending the same path (retry / content-hash duplicate) must not
         // double-count.
-        ing.append_files(&[f.clone()]).await.unwrap();
+        ing.append_files(std::slice::from_ref(&f)).await.unwrap();
         let m = ing.load_manifest().await.unwrap();
         assert_eq!(m.files.iter().filter(|x| x.path == f.path).count(), 1);
     }
