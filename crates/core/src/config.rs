@@ -18,6 +18,7 @@ pub struct Config {
     pub lifecycle: LifecycleConfig,
     pub auth: AuthConfig,
     pub ingest: IngestConfig,
+    pub compaction: CompactionConfig,
 }
 
 /// Ingest backpressure & memory bounds for the `/v1/ingest` + `/v1/otlp/logs`
@@ -42,6 +43,50 @@ impl Default for IngestConfig {
             max_body_bytes: 16 * 1024 * 1024, // 16 MiB
             max_inflight: 32,
         }
+    }
+}
+
+/// Background auto-compaction: merge small Parquet files into larger ones without
+/// operator intervention. Streaming ingest produces many small files — worse at
+/// low, steady volume — which slow scans and bloat the manifest; the scheduler
+/// keeps file count bounded so the system stays a product, not a toy. Files only
+/// ever merge within their own tier, so severity/tiering is unaffected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompactionConfig {
+    /// Run the background compaction scheduler (writer role only).
+    pub enabled: bool,
+    /// Target size for a compacted file (MiB); bins fill to ~this size.
+    pub target_mib: u64,
+    /// Compact once any tier has at least this many files pending a merge (files
+    /// that would fall into a multi-file bin). Avoids rewriting on every tick.
+    pub trigger_pending_files: usize,
+    /// Max source files a single compaction *pass* merges before committing and
+    /// releasing the ingest lock. Bounds how long one pass can stall ingest (a
+    /// full 2k-file backlog in one pass held the lock ~43s in testing); the
+    /// scheduler runs repeated bounded passes to drain a large backlog, yielding
+    /// the lock between them so ingest can interleave.
+    pub max_merge_files_per_pass: usize,
+    /// How often the scheduler checks for pending compaction (seconds).
+    pub interval_secs: u64,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            target_mib: 256,
+            trigger_pending_files: 16,
+            max_merge_files_per_pass: 128,
+            interval_secs: 300, // 5 min
+        }
+    }
+}
+
+impl CompactionConfig {
+    /// Target compacted-file size in bytes.
+    pub fn target_bytes(&self) -> u64 {
+        self.target_mib * 1024 * 1024
     }
 }
 
@@ -251,6 +296,32 @@ mod tests {
             _ => panic!("expected s3"),
         }
         assert_eq!(c.query.cores, 8);
+    }
+
+    #[test]
+    fn compaction_defaults_on_and_parses() {
+        // Absent [compaction] section -> sensible defaults (auto-compaction on).
+        let c = Config::default();
+        assert!(c.compaction.enabled);
+        assert_eq!(c.compaction.target_mib, 256);
+        assert_eq!(c.compaction.target_bytes(), 256 * 1024 * 1024);
+        assert_eq!(c.compaction.trigger_pending_files, 16);
+        assert_eq!(c.compaction.max_merge_files_per_pass, 128);
+
+        let toml = r#"
+            [compaction]
+            enabled = false
+            target_mib = 512
+            trigger_pending_files = 8
+            max_merge_files_per_pass = 64
+            interval_secs = 60
+        "#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert!(!c.compaction.enabled);
+        assert_eq!(c.compaction.target_mib, 512);
+        assert_eq!(c.compaction.trigger_pending_files, 8);
+        assert_eq!(c.compaction.max_merge_files_per_pass, 64);
+        assert_eq!(c.compaction.interval_secs, 60);
     }
 
     #[test]
