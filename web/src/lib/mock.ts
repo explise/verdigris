@@ -117,10 +117,11 @@ export const mock = {
       totalGB: 11372, totalPerMonth: 49.64,
     };
   },
-  async cost(): Promise<Cost> {
+  async cost(days = 30): Promise<Cost> {
     await wait(90);
+    const monthly = 61.7;
     return {
-      monthToDate: 61.7, projected: 92.4, lastMonth: 88.1,
+      monthToDate: monthly, projected: +(monthly * days / 30).toFixed(1), lastMonth: 88.1,
       breakdown: [
         { label: "Hot storage (S3 Standard)", usd: 9.48, color: "var(--hot)" },
         { label: "Warm storage (Glacier IR)", usd: 7.36, color: "var(--warm)" },
@@ -128,7 +129,7 @@ export const mock = {
         { label: "Query compute (EKS)", usd: 8.4, color: "var(--copper)" },
         { label: "Glacier retrieval", usd: 3.66, color: "var(--error)" },
       ],
-      spendSeries: ser(30, 2.0, 0.7, 0.5),
+      spendSeries: ser(days, 2.0, 0.7, 0.5),
       vsHosted: { ours: 92, hosted: 4180 },
       expensiveQueries: [
         { q: "service:* level:ERROR | last 30d", tier: "cold", scanGB: 38, usd: 1.14, user: "ana@acme", when: "1h ago" },

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
@@ -1767,7 +1767,16 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
     })))
 }
 
-async fn h_cost(State(st): State<AppState>) -> ApiResult {
+/// Query params for `/v1/cost`. `days` selects the projection horizon (the
+/// 7d/30d/90d toggle in the UI): storage is billed as a monthly rate, so the
+/// projected spend over a window is `monthly_rate * days / 30`.
+#[derive(Deserialize)]
+struct CostQuery {
+    days: Option<u32>,
+}
+
+async fn h_cost(State(st): State<AppState>, Query(q): Query<CostQuery>) -> ApiResult {
+    let days = q.days.unwrap_or(30).clamp(1, 3650);
     let (_s, m) = manifest(&st).await?;
     let mut breakdown = Vec::new();
     let mut total = 0.0;
@@ -1807,9 +1816,12 @@ async fn h_cost(State(st): State<AppState>) -> ApiResult {
             .collect()
     };
 
+    // Storage is a monthly rate; project it over the selected window.
+    let projected = total * days as f64 / 30.0;
     Ok(Json(json!({
+        "rangeDays": days,
         "monthToDate": total,
-        "projected": total,
+        "projected": projected,
         "lastMonth": total * 0.92,
         "breakdown": breakdown,
         "spendSeries": [],
