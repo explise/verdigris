@@ -44,7 +44,7 @@ export interface Api {
   createAlert(body: NewAlert): Promise<{ id: string }>;
   deleteAlert(id: string): Promise<{ removed: boolean }>;
   storage(): Promise<Storage>;
-  cost(): Promise<Cost>;
+  cost(days?: number): Promise<Cost>;
   pipelines(): Promise<Pipelines>;
   settings(): Promise<Settings>;
 }
@@ -99,7 +99,7 @@ export function createApi(scope: Scope): Api {
     createAlert(body) { return live ? send<{ id: string }>("POST", "/alerts", scope, body) : mock.createAlert(body); },
     deleteAlert(id) { return live ? send<{ removed: boolean }>("DELETE", `/alerts/${encodeURIComponent(id)}`, scope) : mock.deleteAlert(id); },
     storage() { return live ? json<Storage>("/storage/tiers", scope) : mock.storage(); },
-    cost() { return live ? json<Cost>("/cost", scope) : mock.cost(); },
+    cost(days = 30) { return live ? json<Cost>(`/cost?days=${days}`, scope) : mock.cost(days); },
     pipelines() { return live ? json<Pipelines>("/pipelines", scope) : mock.pipelines(); },
     settings() { return live ? json<Settings>("/settings", scope) : mock.settings(); },
   };

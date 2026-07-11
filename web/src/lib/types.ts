@@ -86,6 +86,8 @@ export interface Storage {
 export interface CostBreakdownItem { label: string; usd: number; color: string; }
 export interface ExpensiveQuery { q: string; tier: TierId; scanGB: number; usd: number; user: string; when: string; }
 export interface Cost {
+  /** Projection horizon the server used, echoed back (7 | 30 | 90). */
+  rangeDays?: number;
   monthToDate: number; projected: number; lastMonth: number;
   breakdown: CostBreakdownItem[];
   spendSeries: number[];

@@ -1,4 +1,4 @@
-import { createResource, For, Show } from "solid-js";
+import { createResource, createSignal, For, Show } from "solid-js";
 import { useApi } from "@/store";
 import { ViewHead, Card, CardHead, Stat } from "@/ui/primitives";
 import { Donut, HBars, AreaSVG } from "@/charts";
@@ -10,22 +10,32 @@ const FALLBACK_COLORS = ["var(--hot)", "var(--warm)", "var(--cold)", "var(--copp
 
 export default function Cost() {
   const api = useApi();
-  const [c] = createResource(() => api(), (a) => a.cost());
+  // 7d/30d/90d projection horizon — re-fetches cost when changed.
+  const [days, setDays] = createSignal(30);
+  const [c] = createResource(() => ({ a: api(), d: days() }), ({ a, d }) => a.cost(d));
   const savings = () => Math.round((1 - c()!.vsHosted.ours / c()!.vsHosted.hosted) * 100);
   // breakdown may omit `color` on real data → fall back to a token per index.
   const breakdown = () => c()!.breakdown.map((b, i) => ({ ...b, color: b.color || FALLBACK_COLORS[i % FALLBACK_COLORS.length] }));
   // "Glacier retrieval" line may be absent → don't `!`-deref a missing find().
   const retrievalUsd = () => c()!.breakdown.find((b) => b.label.toLowerCase().includes("retrieval"))?.usd ?? 0;
+  // `lastMonth` is a full-month figure; scale it to the selected window so the
+  // delta compares like for like (a 7d projection vs a 30d bill is meaningless).
+  const lastMonthWindow = () => c()!.lastMonth * days() / 30;
+  const over = () => c()!.projected > lastMonthWindow();
 
   return (
     <>
       <ViewHead title="Cost" sub="Live spend across storage + compute"
-        actions={<div class="seg"><button>7d</button><button class="on">30d</button><button>90d</button></div>} />
+        actions={<div class="seg">
+          <For each={[7, 30, 90]}>{(d) => (
+            <button class={days() === d ? "on" : ""} onClick={() => setDays(d)}>{d}d</button>
+          )}</For>
+        </div>} />
       <Show when={c()} fallback={<div class="empty">loading…</div>}>
         <div class="view-body">
           <div class="grid cols-4" style={{ "margin-bottom": "16px" }}>
             <Stat label="Month to date" value={usd(c()!.monthToDate)} delta={<span class="delta flat">across all tiers</span>} />
-            <Stat label="Projected" value={usd(c()!.projected)} delta={<span class={`delta ${c()!.projected > c()!.lastMonth ? "down" : "up"}`}>{c()!.projected > c()!.lastMonth ? "▲" : "▼"} vs {usd(c()!.lastMonth)} last mo</span>} />
+            <Stat label={`Projected (${days()}d)`} value={usd(c()!.projected)} delta={<span class={`delta ${over() ? "down" : "up"}`}>{over() ? "▲" : "▼"} vs {usd(lastMonthWindow())} same window last mo</span>} />
             <Stat label="Glacier retrieval" value={usd(retrievalUsd())} delta={<span class="delta flat">pay only when queried</span>} />
             <Stat label="vs hosted SaaS (est)" class="" value={<span style={{ color: "var(--copper-bright)" }}>{savings()}%</span>} delta={<span class="delta up">cheaper · same volume</span>} />
           </div>
@@ -38,7 +48,7 @@ export default function Cost() {
               </div>
             </Card>
             <Card class="pad-lg">
-              <CardHead title="Daily spend" hint="last 30 days · $/day" />
+              <CardHead title="Daily spend" hint={`last ${days()} days · $/day`} />
               <Show when={(c()!.spendSeries ?? []).length > 1} fallback={<div class="empty" style={{ padding: "44px 0" }}>no spend history yet</div>}>
                 <AreaSVG data={c()!.spendSeries} max={Math.max(4, ...c()!.spendSeries)} />
               </Show>
