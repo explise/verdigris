@@ -51,6 +51,7 @@ use verdigris_core::cost::{self, RetrievalMode};
 use verdigris_core::manifest::Manifest;
 use verdigris_core::model::Tier;
 use verdigris_ingest::wire::JsonLog;
+use verdigris_query::engine::{QueryLimits, ResultTooLarge};
 use verdigris_storage::Store;
 
 /// Which HTTP surface this node exposes (from `vdg serve --role`).
@@ -365,6 +366,19 @@ impl AppError {
             message: e.to_string(),
         }
     }
+
+    /// Map a query-engine failure to a status the client can act on.
+    ///
+    /// An oversized result is 413, not 400 or 500: the query was valid and the
+    /// server is healthy — the client simply asked for more than it is allowed to
+    /// receive, and the message says how to ask for less. Everything else (parse
+    /// errors, unknown columns) stays 400, as query failures always have.
+    fn from_query(e: anyhow::Error) -> Self {
+        match e.downcast_ref::<ResultTooLarge>() {
+            Some(too_large) => Self::with_status(StatusCode::PAYLOAD_TOO_LARGE, too_large),
+            None => Self::bad_request(e),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -383,6 +397,12 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
 }
 
 type ApiResult = Result<Json<Value>, AppError>;
+
+/// The query memory ceilings for this deployment (issue #2). Cheap to build, so
+/// it's derived per call rather than cached on `AppState`.
+fn limits(st: &AppState) -> QueryLimits {
+    QueryLimits::from_config(&st.cfg.query)
+}
 
 fn store(st: &AppState) -> anyhow::Result<Store> {
     verdigris_storage::build(&st.cfg.storage)
@@ -464,8 +484,15 @@ const ALERTS_CAS_RETRIES: usize = 4;
 
 /// Run a rule's SQL and pull out its single numeric result — the `v` column if
 /// present, else the first numeric column of the first row.
-async fn measure(s: &Store, table: &str, files: &[String], sql: &str) -> anyhow::Result<f64> {
-    let rows = verdigris_query::engine::query_table_json(s.clone(), table, files, sql).await?;
+async fn measure(
+    s: &Store,
+    table: &str,
+    files: &[String],
+    sql: &str,
+    limits: &QueryLimits,
+) -> anyhow::Result<f64> {
+    let rows =
+        verdigris_query::engine::query_table_json(s.clone(), table, files, sql, limits).await?;
     let Some(Value::Object(row)) = rows.into_iter().next() else {
         return Ok(0.0);
     };
@@ -485,7 +512,12 @@ async fn measure(s: &Store, table: &str, files: &[String], sql: &str) -> anyhow:
 /// transition that was actually committed, so a save conflict can't double-fire.
 /// `lock` serializes this against concurrent create/delete within the process;
 /// the CAS covers other replicas.
-async fn evaluate_all(s: &Store, table: &str, lock: &tokio::sync::Mutex<()>) -> anyhow::Result<()> {
+async fn evaluate_all(
+    s: &Store,
+    table: &str,
+    lock: &tokio::sync::Mutex<()>,
+    limits: &QueryLimits,
+) -> anyhow::Result<()> {
     let _g = lock.lock().await;
     for _ in 0..ALERTS_CAS_RETRIES {
         let (mut doc, base) = load_alerts_versioned(s, table).await?;
@@ -503,7 +535,7 @@ async fn evaluate_all(s: &Store, table: &str, lock: &tokio::sync::Mutex<()>) -> 
             if !a.rule.enabled {
                 continue;
             }
-            let value = match measure(s, table, &files, &a.rule.sql).await {
+            let value = match measure(s, table, &files, &a.rule.sql, limits).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(rule = %a.rule.name, error = %e, "alert eval failed");
@@ -764,12 +796,13 @@ pub async fn serve(
         if let Ok(s) = store(&state) {
             let table = state.table.clone();
             let lock = state.alerts_lock.clone();
+            let lim = limits(&state);
             let _ = seed_example_alerts(&s, table.as_str(), &lock).await;
-            let _ = evaluate_all(&s, table.as_str(), &lock).await;
+            let _ = evaluate_all(&s, table.as_str(), &lock, &lim).await;
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(15)).await;
-                    if let Err(e) = evaluate_all(&s, table.as_str(), &lock).await {
+                    if let Err(e) = evaluate_all(&s, table.as_str(), &lock, &lim).await {
                         tracing::warn!(error = %e, "alert scheduler tick failed");
                     }
                 }
@@ -948,8 +981,6 @@ async fn write_disabled() -> AppError {
     )
 }
 
-/// Bearer-token auth middleware for the `/v1/*` surface. Applied only when
-/// `[auth].enabled` is set. Missing/wrong token → 401 `{"error":...}`.
 // ───────────────────────── authn / authz ─────────────────────────
 
 /// Middleware state for [`require_auth`].
@@ -1277,21 +1308,33 @@ async fn h_query(
     let t0 = std::time::Instant::now();
     let (arrow_body, json_rows) = if arrow {
         let bytes =
-            verdigris_query::engine::query_table_arrow(s.clone(), st.table.as_str(), &files, &sql)
-                .await
-                .map_err(AppError::bad_request)?;
+            verdigris_query::engine::query_table_arrow(
+                s.clone(),
+                st.table.as_str(),
+                &files,
+                &sql,
+                &limits(&st),
+            )
+            .await
+            .map_err(AppError::from_query)?;
         (bytes, Value::Null)
     } else {
         let rows =
-            verdigris_query::engine::query_table_json(s.clone(), st.table.as_str(), &files, &sql)
-                .await
-                .map_err(AppError::bad_request)?;
+            verdigris_query::engine::query_table_json(
+                s.clone(),
+                st.table.as_str(),
+                &files,
+                &sql,
+                &limits(&st),
+            )
+            .await
+            .map_err(AppError::from_query)?;
         (Vec::new(), Value::Array(rows))
     };
     let elapsed = t0.elapsed().as_millis() as u64;
 
     let (min_ts, max_ts) = time_range(&m);
-    let histogram = histogram(&s, st.table.as_str(), &files, min_ts, max_ts)
+    let histogram = histogram(&s, st.table.as_str(), &files, min_ts, max_ts, &limits(&st))
         .await
         .unwrap_or_default();
     // `events` is the total matched count (histogram sum), not the page of rows.
@@ -1374,6 +1417,7 @@ async fn histogram(
     files: &[String],
     min_ts: i64,
     max_ts: i64,
+    limits: &QueryLimits,
 ) -> anyhow::Result<Vec<Value>> {
     let range_ms = (max_ts - min_ts).max(1);
     let interval_secs = (range_ms / 60 / 1000).max(1);
@@ -1384,7 +1428,8 @@ async fn histogram(
                 count(*) FILTER (WHERE level = 'ERROR') AS errors \
          FROM {table} GROUP BY {bin} ORDER BY {bin}"
     );
-    let rows = verdigris_query::engine::query_table_json(s.clone(), table, files, &sql).await?;
+    let rows =
+        verdigris_query::engine::query_table_json(s.clone(), table, files, &sql, limits).await?;
     Ok(rows
         .into_iter()
         .map(|r| {
@@ -1705,7 +1750,8 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
     if !files.is_empty() {
         let sql = format!("SELECT service, count(*) AS n FROM {table} GROUP BY service ORDER BY n DESC");
         if let Ok(rows) =
-            verdigris_query::engine::query_table_json(s.clone(), table, &files, &sql).await
+            verdigris_query::engine::query_table_json(s.clone(), table, &files, &sql, &limits(&st))
+                .await
         {
             let total_rows = m.total_rows().max(1) as f64;
             for r in rows {
@@ -1719,7 +1765,10 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
 
         let (min_ts, max_ts) = time_range(&m);
         let interval_secs = ((max_ts - min_ts).max(1) / 60 / 1000).max(1) as f64;
-        for b in histogram(&s, table, &files, min_ts, max_ts).await.unwrap_or_default() {
+        for b in histogram(&s, table, &files, min_ts, max_ts, &limits(&st))
+            .await
+            .unwrap_or_default()
+        {
             let total = b.get("total").and_then(Value::as_i64).unwrap_or(0);
             let errors = b.get("errors").and_then(Value::as_i64).unwrap_or(0);
             total_events += total;
@@ -1914,14 +1963,14 @@ async fn h_alert_create(
         .load_manifest()
         .await?;
     let files: Vec<String> = m.files.iter().map(|f| f.path.clone()).collect();
-    let value = measure(&s, st.table.as_str(), &files, &rule.sql)
+    let value = measure(&s, st.table.as_str(), &files, &rule.sql, &limits(&st))
         .await
         .map_err(AppError::bad_request)?;
     let (status, _t) = alert::evaluate(&rule, &AlertStatus::initial(now), value, now);
     let id = rule.id.clone();
     for _ in 0..ALERTS_CAS_RETRIES {
         let (mut doc, base) = load_alerts_versioned(&s, st.table.as_str()).await?;
-        doc.alerts.push(Alert { rule: rule.clone(), status: status.clone() });
+        doc.alerts.push(Alert { rule: rule.clone(), status });
         if save_alerts_cas(&s, st.table.as_str(), &doc, base).await? {
             return Ok((StatusCode::CREATED, Json(json!({ "id": id }))).into_response());
         }
@@ -2048,7 +2097,8 @@ async fn tail_poll(st: &AppState, since_ts: i64) -> anyhow::Result<(Vec<Value>, 
          FROM {table} WHERE ts > to_timestamp_millis({since_ts}) \
          ORDER BY ts ASC LIMIT {TAIL_MAX_ROWS}"
     );
-    let mut rows = verdigris_query::engine::query_table_json(s, table, &files, &sql).await?;
+    let mut rows =
+        verdigris_query::engine::query_table_json(s, table, &files, &sql, &limits(st)).await?;
 
     let mut max_ts = since_ts;
     for r in &mut rows {
