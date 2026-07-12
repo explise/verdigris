@@ -229,8 +229,26 @@ pub struct QueryConfig {
     /// Modeled per-core scan throughput (MiB/s) used by the ModeledExecutor and
     /// as the calibration target for the real executor.
     pub modeled_mibps_per_core: f64,
-    /// Provisioned query cores.
+    /// Provisioned query cores. Also caps the real engine's target partitions —
+    /// each partition carries its own buffers, so this bounds concurrency and
+    /// therefore peak execution memory.
     pub cores: u32,
+
+    // ── Memory bounds (issue #2: run comfortably on a 1–2 GB box) ──────────
+    //
+    // Two independent ceilings, because a query can blow up in two different
+    // places. `memory_pool_mib` bounds *execution* (the sorts, joins and
+    // aggregates DataFusion runs); past it, operators spill to disk, and if even
+    // that can't be satisfied the query fails with a message naming the biggest
+    // consumers. `max_result_*` bound the *result set* being accumulated for the
+    // client, which the pool does not cover: a `SELECT *` with no aggregation is
+    // pure streaming output, so nothing would stop it from filling RAM.
+    /// Ceiling on the DataFusion execution memory pool, in MiB.
+    pub memory_pool_mib: u64,
+    /// Reject a result larger than this many rows...
+    pub max_result_rows: u64,
+    /// ...or this much Arrow data, whichever trips first. In MiB.
+    pub max_result_mib: u64,
 }
 
 impl Default for QueryConfig {
@@ -238,6 +256,11 @@ impl Default for QueryConfig {
         Self {
             modeled_mibps_per_core: 250.0,
             cores: 4,
+            // Sized so the engine, the accumulated result and the rest of the
+            // process all fit inside a 2 GB box with headroom.
+            memory_pool_mib: 512,
+            max_result_rows: 1_000_000,
+            max_result_mib: 256,
         }
     }
 }
