@@ -4810,6 +4810,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "datafusion",
+ "futures",
  "object_store",
  "serde_json",
  "thiserror",
