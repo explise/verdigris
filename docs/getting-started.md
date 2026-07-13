@@ -1,8 +1,8 @@
 # Quickstart
 
-Verdigris runs **inside your own EKS cluster** and writes to **your own S3 bucket** — a
-drop-in replacement for your logging backend that never moves data out of your AWS account.
-This page takes you from nothing to logs landing in S3 and queried in place, in three steps:
+Verdigris runs **inside your own EKS cluster** and writes to **your own S3 bucket**; no
+data leaves your AWS account. This page takes you from nothing to logs landing in S3 and
+queried in place, in three steps:
 
 1. **Install** the chart into your cluster (pointed at your bucket).
 2. **Point your log pipeline** at it (Vector / Fluent Bit / OTLP — no app changes).

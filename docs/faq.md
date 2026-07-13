@@ -25,15 +25,19 @@ bytes the scan touches.
 
 ## How is this different from a hosted log service?
 
-Two things a vendor that owns your storage structurally can't offer without breaking its own
-business model — which is exactly the wedge:
+Architecturally, two things follow from the data never leaving the operator's account:
 
-1. **Data sovereignty** — data never leaves your account; no per-GB ingestion margin.
-2. **No rehydration tax** — no cold-to-index rehydration step to pay for.
+1. **No ingestion middleman.** There is no vendor cloud between the emitter and the bucket,
+   so there is nothing to meter per-GB in transit. Cost is the underlying S3 bill plus the
+   compute you provision.
+2. **No rehydration step.** Hosted platforms typically archive cold logs out of their index
+   and re-index them on demand before they're searchable. Here the Parquet in the bucket *is*
+   the queryable form, at every tier — a cold query pays Glacier retrieval, not a re-indexing
+   pipeline.
 
-Verdigris keeps the good idea the category converged on — decoupling storage (priced by bytes)
-from query speed (a separately provisioned compute dial), and refusing to price around log
-severity — and removes the two things that only exist because a vendor owns the storage.
+The design keeps the storage/compute decoupling the category converged on (storage priced by
+bytes, query speed a separately provisioned dial, severity never priced) and removes the
+steps that only exist when someone else owns the storage.
 
 ## How is this different from other self-hosted, object-storage log tools?
 
@@ -83,30 +87,62 @@ optimistic compare-and-swap with retry-on-conflict — so even concurrent writer
 can't silently lose or corrupt data. Full Apache Iceberg (partitions, snapshots, a catalog
 service) is future work for scale and features, not correctness.
 
-## What's production-ready vs. early?
+## What's working vs. early?
 
-Honest state of the build:
+Honest state of the build. The rule: claims must match code — where something is modeled or
+partial, it says so here and is tracked as an issue whose acceptance criteria are tests.
 
-**Working end to end (local and S3):** ingest (`/v1/ingest` NDJSON/JSON + native OTLP/JSON),
-severity routing, tiering + lifecycle policy, small-file compaction, query in place (SQL +
-search DSL), Arrow/JSON responses, live tail, the pre-query cost estimator with the cold-scan
-confirm gate, concurrency-safe manifest commits, the Helm chart (local demo + EKS/S3 with
-IRSA), and optional bearer auth.
+**Working end to end (local and S3):**
 
-**Early / partial / placeholder — don't rely on these as finished:**
+- Ingest: `/v1/ingest` (NDJSON/JSON) and native OTLP/HTTP **JSON**; severity → tier routing;
+  backpressure (bounded in-flight, 429 shed).
+- Storage: zstd Parquet with **bloom filters** on `trace_id`/`service`/`level`/`message`;
+  content-addressed files; **compare-and-swap manifest commits** with retry-on-conflict.
+- Compaction: bounded incremental passes, a background auto-trigger, and a **streaming merge**
+  that never materializes a bin in memory.
+- Query in place: SQL + the search DSL; file pruning by tier, time window, per-file
+  service/level stats, and **trigram sets** (free-text, provably no false negatives);
+  Arrow IPC or JSON on the wire; live tail over SSE.
+- **Bounded query memory**: a spill-to-disk execution pool plus a streaming result-size
+  ceiling — an oversized result is a typed 413, not an OOM.
+- The **pre-query cost estimator** with the cold-scan confirm gate; the estimate and the
+  executed scan read the same file set by construction.
+- Real **alerting** (rules, scheduler, state transitions, webhook notify, CRUD), per-user
+  **tokens + RBAC**, a query-history **audit** doc (`expensiveQueries` is real data),
+  Prometheus `/metrics`, and the Helm chart (local demo and EKS/S3 with IRSA).
 
-- **Alerting** — no alert engine yet; `/v1/alerts` returns `[]`.
-- **`p99` latency** in `/v1/metrics` is **modeled** (logs carry no latency field yet), not
-  measured.
-- **`expensiveQueries`** in `/v1/cost` is empty until query-history tracking exists.
-- **Fast full-text search** (bloom filters / inverted index) over Parquet — future work;
-  substring search is `ILIKE` today.
-- **Query-time tier filtering** isn't wired yet — a query scans all tiers; only the *estimate*
-  is tier-aware.
-- **Real Apache Iceberg** (partitions/snapshots/catalog) — the manifest is a JSON stand-in;
-  correctness is handled, scale features are future.
+**Early / partial / modeled — tracked, not hidden:**
+
+- The **DST harness is unfinished**: of the four seams, `ObjectStore` is fully real and `Rng`
+  mostly; the shell still reads the wall clock directly and the production query path routes
+  around the `ScanExecutor` trait. The sim is hand-driven, not madsim, and the modeled scan
+  throughput is **uncalibrated**.
+  ([#31](https://github.com/explise/verdigris/issues/31),
+  [#11](https://github.com/explise/verdigris/issues/11))
+- **Tier prefix ≠ storage class** yet: lifecycle transitions by age over the whole table, so a
+  fresh cold-routed log sits in S3 Standard for its first days while the estimator prices it
+  as Glacier. ([#20](https://github.com/explise/verdigris/issues/20))
+- The JSON manifest is an explicit **Iceberg stand-in**: correct under CAS, but a single
+  object rewritten per commit — it will not scale to very high commit rates or millions of
+  files. ([#18](https://github.com/explise/verdigris/issues/18))
+- **Single-writer ingest** (one `--role ingest` pod owns the manifest write); multi-writer HA
+  is designed but not built. ([#19](https://github.com/explise/verdigris/issues/19))
+- `p99` in `/v1/metrics` is **modeled**, not measured — logs carry no latency field yet; the
+  service's own real latencies are on the Prometheus endpoint.
+  ([#27](https://github.com/explise/verdigris/issues/27))
+- `/v1/pipelines` is a shape-correct placeholder; `spendSeries` in `/v1/cost` is empty (no
+  spend history store yet, [#33](https://github.com/explise/verdigris/issues/33)).
+- Free-text pruning is **file-level only** — inside a surviving file, `ILIKE` scans rows.
+  ([#23](https://github.com/explise/verdigris/issues/23))
+- OTLP is **JSON-only**; default OTel exporters speak protobuf and need their encoding set
+  to `http/json`.
+
+The full capability-by-capability map, each defined by the tests that would prove it, is the
+[parity scorecard](https://github.com/explise/verdigris/issues/34).
 
 ## Is it published? What's the binary called?
 
-Not yet published publicly. The CLI binary is **`vdg`** (e.g. `vdg query`, `vdg ingest`,
-`vdg serve`); the brand/product name everywhere users see it is **Verdigris**.
+The source lives at [github.com/explise/verdigris](https://github.com/explise/verdigris).
+Nothing is on crates.io and no container image is published yet — you build from source. The
+CLI binary is **`vdg`** (e.g. `vdg query`, `vdg ingest`, `vdg serve`); the project name is
+**Verdigris**.
