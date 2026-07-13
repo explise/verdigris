@@ -11,8 +11,10 @@ philosophy that shapes all of it, see [`dst-architecture.md`](dst-architecture.m
    booth on its own users; data stays in the customer's account and is queried in place.
 2. **Storage cheap, compute provisioned.** Bytes in S3 are the storage cost; query speed
    is a separately provisioned dial. Severity decides *placement*, never *price*.
-3. **Make cost legible.** No surprise bills — estimate a scan before you run it.
-4. **One binary, `helm install`, done.** Plug-and-play is the whole promise.
+3. **Make cost legible.** A scan's size and dollar cost are estimated before it runs, and
+   the estimate provably covers the same files the scan reads.
+4. **One binary, one chart.** A single `vdg` binary behind one Helm chart runs ingest,
+   query, UI, and tiering.
 5. **Deterministic by construction.** Nondeterminism lives only behind seams; the control
    plane is sans-I/O so scale is testable in simulation, not just in production.
 
@@ -27,7 +29,7 @@ dependency-light; DataFusion and the HTTP server are behind feature flags.
 | `crates/storage` | The `ObjectStore` seam. `build(&StorageConfig)` → local fs / in-memory / S3-or-MinIO, plus `SimObjectStore` for tests. |
 | `crates/query` | The `ScanExecutor` seam. `ModeledExecutor` (default) + a DataFusion `engine` (feature `datafusion`). |
 | `crates/ingest` | The write path: records → Arrow → Parquet → store; manifest writes; severity routing; compaction; the OTLP mapping; a synthetic generator. |
-| `crates/vdg` | The CLI + HTTP shell. Real `Clock`, config loading, all commands, and `serve` (feature `serve`). |
+| `crates/vdg` | The CLI + HTTP shell: config loading, all commands, and `serve` (feature `serve`). All real I/O lives here — including, today, direct wall-clock reads: the shell is not yet wired through the `Clock` seam ([#31](https://github.com/explise/verdigris/issues/31)). |
 
 ## The four seams
 

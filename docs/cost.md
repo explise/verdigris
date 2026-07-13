@@ -1,6 +1,6 @@
 # Cost & tiering
 
-The cost model *is* the product. Two ideas carried through the whole system:
+The cost model shapes the whole system. Two ideas are carried through every component:
 
 1. **Storage is priced by bytes in S3** — effectively free relative to hosted log services.
    Severity only decides which prefix / storage class a log lands in. Placement, never price.
