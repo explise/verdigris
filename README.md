@@ -202,12 +202,13 @@ compact → query → cost-estimate → alert → serve to a browser UI — and 
 via Helm. Where it stands and what's next:
 
 - [`ROADMAP.md`](ROADMAP.md) — engineering milestones toward production readiness
-- [`DEMO_ROADMAP.md`](DEMO_ROADMAP.md) — feature gaps vs. established log platforms
-- [`STATUS.md`](STATUS.md) (UI) · [`BACKEND_STATUS.md`](BACKEND_STATUS.md) (backend)
+- [Parity scorecard (#34)](https://github.com/explise/verdigris/issues/34) — capability
+  gaps vs. established log platforms, each defined by the tests that would prove it
+- [`web/STATUS.md`](web/STATUS.md) — frontend status
 
 ## Contributing
 
-Contributions are welcome. Please read [`CONTRIBUTING.md`](CONTRIBUTING.md) for
+Contributions are welcome. Please read [`docs/contributing.md`](docs/contributing.md) for
 how to build, test, and structure changes — in particular the sans-I/O
 discipline that keeps the system deterministically testable. By contributing you
 agree to license your work under Apache-2.0.

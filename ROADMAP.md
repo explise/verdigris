@@ -3,9 +3,9 @@
 > What stands between the current codebase and something a customer would trust to
 > hold their production logs. Each item references the relevant source files.
 >
-> **See also [`DEMO_ROADMAP.md`](DEMO_ROADMAP.md)** — the user-facing companion:
-> feature gaps against established log platforms, graded by demo impact
-> (DP0/DP1/DP2).
+> **See also the [parity scorecard (#34)](https://github.com/explise/verdigris/issues/34)**
+> — the living companion: capability gaps against established log platforms, each
+> defined by the tests that would prove it. (It supersedes the old `DEMO_ROADMAP.md`.)
 
 ---
 
@@ -153,7 +153,6 @@ comment admits it's "only as good as its calibration").
   seam swaps in `ModeledExecutor` and the boundary is documented + tested.
 - A calibration run emits absolute GB/s numbers that feed `ModeledExecutor`/`scan_ms`;
   the estimator's modeled scan time is validated against a real run.
-- `BACKEND_STATUS.md`'s "not built yet" line is corrected to reflect reality.
 *Effort: L · Priority: P1.*
 
 ### M2 — Multi-tenancy, auth & security
@@ -177,7 +176,7 @@ path); per-token scoping to tables/tenants (pairs with M2.2); a `web/` login UI.
 *Problem:* the backend is single-tenant and flat — `/config.json` pins `mode:"onprem"`
 with one org/env derived from the served table (`serve.rs` `h_config`), while the
 `web/` app routes `/:org/:env/:page` and its transport carries tenancy segments
-(`web/src/lib/transport.ts`, `STATUS.md`). The two don't meet; there's no enforced
+(`web/src/lib/transport.ts`, `web/STATUS.md`). The two don't meet; there's no enforced
 per-tenant data boundary.
 *Why it matters:* multi-team/multi-customer deployments need guaranteed isolation
 (one tenant can't read another's bucket/prefix/table). Today that's structurally
@@ -317,7 +316,7 @@ the UI is a stateless viewer.
 
 **M4.4 — Feed charts directly from Arrow columns.**
 *Problem:* the Arrow round-trip is wired, but uPlot is fed materialized JS arrays
-rather than Arrow columns directly (`STATUS.md` items 5/65; `web/src/lib/arrow.ts`).
+rather than Arrow columns directly (`web/STATUS.md` items 5/65; `web/src/lib/arrow.ts`).
 *Why it matters:* the direct-column path is the real scale win for large result sets.
 *Acceptance:*
 - uPlot consumes `x[]`/`y[]` straight from Arrow columns, no full materialization.
@@ -329,7 +328,7 @@ rather than Arrow columns directly (`STATUS.md` items 5/65; `web/src/lib/arrow.t
 **M5.1 — Publish artifacts (image, chart, crate).**
 *Problem:* every crate is `publish = false` (`crates/*/Cargo.toml`); the Helm image is
 a bare local `repository: verdigris` with an empty tag (`deploy/helm/verdigris/values.yaml`);
-the `vdg` crate name is unverified on crates.io (`CLAUDE.md`, `BACKEND_STATUS.md`).
+the `vdg` crate name is unverified on crates.io (`CLAUDE.md`).
 Nothing is pushed anywhere.
 *Why it matters:* "one `helm install`, done" isn't real until the image and chart are
 pullable from a registry a customer can reach.
@@ -342,7 +341,7 @@ pullable from a registry a customer can reach.
 **M5.2 — Versioned releases + changelog.**
 *Problem:* workspace is pinned at `0.0.1` (`Cargo.toml`); history is a handful of
 commits with no tags, no `CHANGELOG.md`, no release process
-(`git log`; `BACKEND_STATUS.md` "nothing is committed/published").
+(`git log`).
 *Why it matters:* customers pin versions and read changelogs before upgrading.
 *Acceptance:*
 - Semver tags + GitHub releases with artifacts.

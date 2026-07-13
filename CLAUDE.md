@@ -193,7 +193,7 @@ model and the **cost estimator** are the same model and share code.
 
 ## Frontend
 
-**For current frontend status & roadmap, read [`STATUS.md`](STATUS.md) first** — it
+**For current frontend status & roadmap, read [`web/STATUS.md`](web/STATUS.md) first** — it
 covers both frontends, what's done, and what's left.
 
 There are two: `frontend/` (the original vanilla no-build prototype, now wired to the
@@ -204,7 +204,7 @@ The prototype is a dependency-free SPA (vanilla JS + CSS + inline SVG; open
 `index.html`). **Its entire backend integration is one file: `frontend/api.js`** —
 the return shapes there are the API contract the UI renders. `web/` has the same
 single swap point in `web/src/lib/api.ts`, with the typed contract in
-`web/src/lib/types.ts`. Backend punch list: `BACKEND_TODO.md`.
+`web/src/lib/types.ts`. Backend gaps are tracked as GitHub issues (see epic #34).
 
 If you are doing any frontend work, read **`frontend/AGENTS.md` first** — it is the
 contract for that directory (architecture, file map, page-module contract, the
