@@ -77,9 +77,9 @@ pub fn restore_latency_ms(class: StorageClass, mode: RetrievalMode) -> u64 {
     match class {
         StorageClass::Standard | StorageClass::GlacierInstant => 0,
         StorageClass::GlacierFlexible | StorageClass::GlacierDeepArchive => match mode {
-            RetrievalMode::Expedited => 5 * 60 * 1000,      // ~5 min
-            RetrievalMode::Standard => 4 * 60 * 60 * 1000,  // ~4 h
-            RetrievalMode::Bulk => 8 * 60 * 60 * 1000,      // ~8 h
+            RetrievalMode::Expedited => 5 * 60 * 1000,     // ~5 min
+            RetrievalMode::Standard => 4 * 60 * 60 * 1000, // ~4 h
+            RetrievalMode::Bulk => 8 * 60 * 60 * 1000,     // ~8 h
         },
     }
 }

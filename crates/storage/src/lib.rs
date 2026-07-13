@@ -94,7 +94,10 @@ pub async fn health_probe(store: &Store) -> anyhow::Result<ObjPath> {
         .context("probe put")?;
     let got = store.get(&path).await.context("probe get")?;
     let bytes = got.bytes().await.context("probe read")?;
-    anyhow::ensure!(bytes.as_ref() == payload.as_slice(), "probe payload mismatch");
+    anyhow::ensure!(
+        bytes.as_ref() == payload.as_slice(),
+        "probe payload mismatch"
+    );
     store.delete(&path).await.context("probe delete")?;
     Ok(path)
 }

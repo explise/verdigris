@@ -21,12 +21,7 @@
 pub const RESULT_COLUMNS: &str = "ts, level, service, status, message, trace_id, attrs_json";
 
 /// Translate a search-DSL `input` into a SQL query over `table`.
-pub fn to_sql(
-    input: &str,
-    table: &str,
-    now_millis: i64,
-    limit: usize,
-) -> Result<String, String> {
+pub fn to_sql(input: &str, table: &str, now_millis: i64, limit: usize) -> Result<String, String> {
     let (filter_part, commands) = split_pipes(input);
 
     // Glue spaces around operators so `status == 200` tokenizes as one term.
@@ -39,7 +34,10 @@ pub fn to_sql(
 
     for cmd in commands {
         let cmd = cmd.trim();
-        if let Some(rest) = cmd.strip_prefix("last ").or_else(|| cmd.strip_prefix("last")) {
+        if let Some(rest) = cmd
+            .strip_prefix("last ")
+            .or_else(|| cmd.strip_prefix("last"))
+        {
             let dur_ms = parse_duration(rest.trim())?;
             let from = now_millis.saturating_sub(dur_ms);
             conditions.push(format!("ts >= to_timestamp_millis({from})"));
@@ -213,7 +211,10 @@ fn translate_compare(key: &str, op: &str, value: &str) -> Result<String, String>
                 .map_err(|_| format!("status must be numeric, got '{value}'"))?;
             Ok(format!("status {op} {n}"))
         }
-        "level" => Ok(format!("level {op} '{}'", sql_escape(&value.to_uppercase()))),
+        "level" => Ok(format!(
+            "level {op} '{}'",
+            sql_escape(&value.to_uppercase())
+        )),
         k if STRING_COLUMNS.contains(&k) => Ok(format!("{k} {op} '{}'", sql_escape(value))),
         // Unknown key -> match inside the attrs_json blob (equality only).
         other => {
@@ -317,7 +318,10 @@ mod tests {
             "service/level equality and free text prune; status range and `last` do not"
         );
         // `==` is equality too.
-        assert_eq!(stat_predicates("service==billing"), vec![Predicate::service("billing")]);
+        assert_eq!(
+            stat_predicates("service==billing"),
+            vec![Predicate::service("billing")]
+        );
         // Negation and ranges never prune.
         assert!(stat_predicates("level!=info").is_empty());
         assert!(stat_predicates("status>=500").is_empty());

@@ -1,0 +1,93 @@
+# The Rust code gate (issue #8): tests across the feature matrix, clippy with
+# warnings denied, and rustfmt.
+#
+# Why a matrix: the default build has no query engine (deterministic, offline),
+# so code behind `datafusion`/`serve` is INVISIBLE to a default-features run —
+# a broken example and three clippy warnings once hid exactly there. Every lane
+# below has caught (or would have caught) a real regression.
+name: rust
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: default            # offline, no query engine — the DST build
+            args: ""
+          - lane: datafusion         # real query engine + its integration tests
+            args: "--features vdg/datafusion"
+          - lane: serve              # HTTP shell (implies datafusion) + serve tests
+            args: "--features vdg/serve"
+    name: test (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.lane }}
+      - run: cargo test --workspace ${{ matrix.args }}
+
+  clippy:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: default
+            args: ""
+          - lane: serve              # serve implies datafusion → lints the full surface
+            args: "--features vdg/serve"
+    name: clippy (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-${{ matrix.lane }}
+      - run: cargo clippy --workspace --all-targets ${{ matrix.args }} -- -D warnings
+
+  # `apply` pulls the AWS SDK (vdg lifecycle --apply). Type-check only: its
+  # runtime needs real AWS, but it must never rot to the point of not compiling.
+  check-apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: apply
+      - run: cargo check -p vdg --features apply

@@ -153,8 +153,7 @@ impl Ingestor {
     async fn append_files(&self, files: &[DataFile]) -> anyhow::Result<()> {
         for _ in 0..MAX_COMMIT_RETRIES {
             let (mut manifest, base) = self.load_manifest_versioned().await?;
-            let existing: HashSet<String> =
-                manifest.files.iter().map(|f| f.path.clone()).collect();
+            let existing: HashSet<String> = manifest.files.iter().map(|f| f.path.clone()).collect();
             let mut added = false;
             for f in files {
                 if !existing.contains(&f.path) {
@@ -288,8 +287,12 @@ impl Ingestor {
             let mut more = false;
 
             for tier in Tier::ALL {
-                let tier_files: Vec<DataFile> =
-                    manifest.files.iter().filter(|f| f.tier == tier).cloned().collect();
+                let tier_files: Vec<DataFile> = manifest
+                    .files
+                    .iter()
+                    .filter(|f| f.tier == tier)
+                    .cloned()
+                    .collect();
                 if tier_files.is_empty() {
                     continue;
                 }
@@ -397,7 +400,9 @@ impl Ingestor {
             }
             // Conflict: reload and redo against the fresh manifest.
         }
-        anyhow::bail!("compaction commit failed after {MAX_COMMIT_RETRIES} retries under contention")
+        anyhow::bail!(
+            "compaction commit failed after {MAX_COMMIT_RETRIES} retries under contention"
+        )
     }
 }
 
@@ -558,7 +563,11 @@ mod tests {
         // than inheriting them from the inputs' manifest entries; the time span it
         // reports must still cover exactly what went in, or the planner would prune
         // away real data.
-        assert_eq!(span(&after), span_before, "time span changed across compaction");
+        assert_eq!(
+            span(&after),
+            span_before,
+            "time span changed across compaction"
+        );
         // Compacted files use the new naming scheme.
         assert!(after.files.iter().any(|f| f.path.contains("/c0-")));
     }
@@ -589,7 +598,10 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let ing = Ingestor::new(store, "logs");
         let routing = RoutingConfig::default();
-        let policy = BatchPolicy { max_rows: 100, max_bytes: usize::MAX };
+        let policy = BatchPolicy {
+            max_rows: 100,
+            max_bytes: usize::MAX,
+        };
         for i in 0u64..10 {
             let recs = generate::generate(100, i, (i as i64) * 1_000_000);
             ing.ingest(recs, &routing, policy).await.unwrap();
@@ -600,7 +612,10 @@ mod tests {
 
         let reports = ing.compact(target).await.unwrap();
         let merged: usize = reports.iter().map(|r| r.files_merged).sum();
-        assert_eq!(predicted, merged, "pending estimate must equal files actually merged");
+        assert_eq!(
+            predicted, merged,
+            "pending estimate must equal files actually merged"
+        );
     }
 
     #[tokio::test]
@@ -609,19 +624,30 @@ mod tests {
         // file layout as one unbounded pass — just spread over multiple commits so
         // no single pass holds the ingest lock for long.
         let routing = RoutingConfig::default();
-        let policy = BatchPolicy { max_rows: 100, max_bytes: usize::MAX };
+        let policy = BatchPolicy {
+            max_rows: 100,
+            max_bytes: usize::MAX,
+        };
         let target = 10 * 1024 * 1024;
 
         let a = Ingestor::new(Arc::new(InMemory::new()) as Arc<dyn ObjectStore>, "logs");
         let b = Ingestor::new(Arc::new(InMemory::new()) as Arc<dyn ObjectStore>, "logs");
         // Identical data into both (generator is deterministic).
         for i in 0u64..20 {
-            a.ingest(generate::generate(100, i, (i as i64) * 1_000_000), &routing, policy)
-                .await
-                .unwrap();
-            b.ingest(generate::generate(100, i, (i as i64) * 1_000_000), &routing, policy)
-                .await
-                .unwrap();
+            a.ingest(
+                generate::generate(100, i, (i as i64) * 1_000_000),
+                &routing,
+                policy,
+            )
+            .await
+            .unwrap();
+            b.ingest(
+                generate::generate(100, i, (i as i64) * 1_000_000),
+                &routing,
+                policy,
+            )
+            .await
+            .unwrap();
         }
         let before = a.load_manifest().await.unwrap().files.len();
         assert!(before > 6, "expected a backlog, got {before}");
@@ -640,12 +666,19 @@ mod tests {
                 break;
             }
         }
-        assert!(passes > 1, "small budget should need multiple passes, took {passes}");
+        assert!(
+            passes > 1,
+            "small budget should need multiple passes, took {passes}"
+        );
 
         let fa = a.load_manifest().await.unwrap();
         let fb = b.load_manifest().await.unwrap();
         assert_eq!(fa.total_rows(), fb.total_rows(), "no rows lost either way");
-        assert_eq!(fa.files.len(), fb.files.len(), "bounded drains to the same layout");
+        assert_eq!(
+            fa.files.len(),
+            fb.files.len(),
+            "bounded drains to the same layout"
+        );
         assert_eq!(pending_compaction_total(&fb, target), 0, "fully drained");
     }
 
@@ -673,7 +706,10 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let ing = Ingestor::new(store, "logs");
         let routing = RoutingConfig::default();
-        let policy = BatchPolicy { max_rows: 1000, max_bytes: usize::MAX };
+        let policy = BatchPolicy {
+            max_rows: 1000,
+            max_bytes: usize::MAX,
+        };
 
         let rec = |svc: &str| LogRecord {
             ts_millis: 1,
@@ -685,16 +721,29 @@ mod tests {
             attrs: Default::default(),
         };
         // Two separate ingests → two separate hot files, one per service.
-        ing.ingest(vec![rec("auth"), rec("auth")], &routing, policy).await.unwrap();
-        ing.ingest(vec![rec("billing")], &routing, policy).await.unwrap();
+        ing.ingest(vec![rec("auth"), rec("auth")], &routing, policy)
+            .await
+            .unwrap();
+        ing.ingest(vec![rec("billing")], &routing, policy)
+            .await
+            .unwrap();
 
         let m = ing.load_manifest().await.unwrap();
         assert_eq!(m.files.len(), 2, "expected one file per ingest");
         assert!(m.files.iter().all(|f| f.tier == Tier::Hot));
         // Stats were recorded from the real rows.
-        assert!(m.files.iter().any(|f| f.services == vec!["auth".to_string()]));
-        assert!(m.files.iter().any(|f| f.services == vec!["billing".to_string()]));
-        assert!(m.files.iter().all(|f| f.levels == vec!["ERROR".to_string()]));
+        assert!(m
+            .files
+            .iter()
+            .any(|f| f.services == vec!["auth".to_string()]));
+        assert!(m
+            .files
+            .iter()
+            .any(|f| f.services == vec!["billing".to_string()]));
+        assert!(m
+            .files
+            .iter()
+            .all(|f| f.levels == vec!["ERROR".to_string()]));
 
         // `service:auth` prunes the billing file at plan time; `service:search`
         // (present in neither) prunes both.
@@ -717,11 +766,19 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let ing = Ingestor::new(store, "logs");
         let routing = RoutingConfig::default();
-        let policy = BatchPolicy { max_rows: 1, max_bytes: usize::MAX };
+        let policy = BatchPolicy {
+            max_rows: 1,
+            max_bytes: usize::MAX,
+        };
 
         let rec = |svc: &str| LogRecord {
-            ts_millis: 1, level: Level::Error, service: svc.into(),
-            status: Some(500), message: "x".into(), trace_id: None, attrs: Default::default(),
+            ts_millis: 1,
+            level: Level::Error,
+            service: svc.into(),
+            status: Some(500),
+            message: "x".into(),
+            trace_id: None,
+            attrs: Default::default(),
         };
         // Many tiny single-row hot files across two services.
         for svc in ["auth", "auth", "billing", "auth"] {
@@ -733,10 +790,19 @@ mod tests {
         // Merged into one file whose stats are the UNION recomputed from the rows.
         let hot: Vec<_> = m.files.iter().filter(|f| f.tier == Tier::Hot).collect();
         assert_eq!(hot.len(), 1, "one compacted hot file");
-        assert_eq!(hot[0].services, vec!["auth".to_string(), "billing".to_string()]);
+        assert_eq!(
+            hot[0].services,
+            vec!["auth".to_string(), "billing".to_string()]
+        );
         // Both services still prune correctly against the compacted file.
-        assert_eq!(select_files(&m, &[Tier::Hot], None, &[Predicate::service("auth")]).len(), 1);
-        assert_eq!(select_files(&m, &[Tier::Hot], None, &[Predicate::service("billing")]).len(), 1);
+        assert_eq!(
+            select_files(&m, &[Tier::Hot], None, &[Predicate::service("auth")]).len(),
+            1
+        );
+        assert_eq!(
+            select_files(&m, &[Tier::Hot], None, &[Predicate::service("billing")]).len(),
+            1
+        );
         assert!(select_files(&m, &[Tier::Hot], None, &[Predicate::service("gateway")]).is_empty());
     }
 
@@ -750,19 +816,35 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let ing = Ingestor::new(store, "logs");
         let routing = RoutingConfig::default();
-        let policy = BatchPolicy { max_rows: 1000, max_bytes: usize::MAX };
+        let policy = BatchPolicy {
+            max_rows: 1000,
+            max_bytes: usize::MAX,
+        };
 
         let rec = |msg: &str| LogRecord {
-            ts_millis: 1, level: Level::Error, service: "auth".into(),
-            status: Some(500), message: msg.into(), trace_id: None, attrs: Default::default(),
+            ts_millis: 1,
+            level: Level::Error,
+            service: "auth".into(),
+            status: Some(500),
+            message: msg.into(),
+            trace_id: None,
+            attrs: Default::default(),
         };
         // Two separate hot files with distinct message vocabularies.
-        ing.ingest(vec![rec("connection timeout to db-primary")], &routing, policy)
-            .await
-            .unwrap();
-        ing.ingest(vec![rec("NullPointerException at AuthFilter.java:42")], &routing, policy)
-            .await
-            .unwrap();
+        ing.ingest(
+            vec![rec("connection timeout to db-primary")],
+            &routing,
+            policy,
+        )
+        .await
+        .unwrap();
+        ing.ingest(
+            vec![rec("NullPointerException at AuthFilter.java:42")],
+            &routing,
+            policy,
+        )
+        .await
+        .unwrap();
 
         let m = ing.load_manifest().await.unwrap();
         assert_eq!(m.files.len(), 2);
@@ -771,18 +853,33 @@ mod tests {
         // A term unique to one file scans only that file — including an in-word
         // substring, matching `ILIKE '%…%'` semantics ("ointer" ⊂ "NullPointer").
         assert_eq!(
-            select_files(&m, &[Tier::Hot], None, &[Predicate::message_contains("timeout")]).len(),
+            select_files(
+                &m,
+                &[Tier::Hot],
+                None,
+                &[Predicate::message_contains("timeout")]
+            )
+            .len(),
             1
         );
         assert_eq!(
-            select_files(&m, &[Tier::Hot], None, &[Predicate::message_contains("ointer")]).len(),
+            select_files(
+                &m,
+                &[Tier::Hot],
+                None,
+                &[Predicate::message_contains("ointer")]
+            )
+            .len(),
             1
         );
         // A term in no file scans nothing; a short term can't prune anything.
-        assert!(
-            select_files(&m, &[Tier::Hot], None, &[Predicate::message_contains("kubelet")])
-                .is_empty()
-        );
+        assert!(select_files(
+            &m,
+            &[Tier::Hot],
+            None,
+            &[Predicate::message_contains("kubelet")]
+        )
+        .is_empty());
         assert_eq!(
             select_files(&m, &[Tier::Hot], None, &[Predicate::message_contains("db")]).len(),
             2
@@ -800,10 +897,13 @@ mod tests {
                 "term {term:?} must survive compaction"
             );
         }
-        assert!(
-            select_files(&m, &[Tier::Hot], None, &[Predicate::message_contains("kubelet")])
-                .is_empty()
-        );
+        assert!(select_files(
+            &m,
+            &[Tier::Hot],
+            None,
+            &[Predicate::message_contains("kubelet")]
+        )
+        .is_empty());
         // The recorded stat also round-trips the manifest JSON (base64 bitmap).
         let t = m.files[0].message_trigrams.as_ref().unwrap();
         assert_eq!(t.contains_term("db-primary"), Some(true));

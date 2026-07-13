@@ -79,7 +79,10 @@ pub fn generate(n: usize, seed: u64, start_ts_millis: i64) -> Vec<LogRecord> {
 
         let status = if level == Level::Error { 503 } else { 200 };
         let mut attrs = BTreeMap::new();
-        attrs.insert("pod".to_string(), format!("{service}-{}", rng.next_u64() % 900));
+        attrs.insert(
+            "pod".to_string(),
+            format!("{service}-{}", rng.next_u64() % 900),
+        );
         attrs.insert("region".to_string(), "us-east-1".to_string());
 
         out.push(LogRecord {

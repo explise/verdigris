@@ -196,7 +196,11 @@ fn map_record(
             "http.status_code" | "http.response.status_code" | "status_code" | "status"
         );
         if is_status && status.is_none() {
-            status = kv.value.as_ref().and_then(AnyValue::as_i64).map(|i| i as i32);
+            status = kv
+                .value
+                .as_ref()
+                .and_then(AnyValue::as_i64)
+                .map(|i| i as i32);
         }
         if let Some(v) = kv.value.as_ref().and_then(AnyValue::to_display_string) {
             attrs.insert(kv.key.clone(), v);
@@ -227,9 +231,9 @@ fn level_from(text: Option<&str>, number: Option<i64>) -> Level {
     }
     if let Some(n) = number {
         return match n {
-            1..=8 => Level::Debug,   // TRACE + DEBUG
-            9..=12 => Level::Info,   // INFO
-            13..=16 => Level::Warn,  // WARN
+            1..=8 => Level::Debug,        // TRACE + DEBUG
+            9..=12 => Level::Info,        // INFO
+            13..=16 => Level::Warn,       // WARN
             n if n >= 17 => Level::Error, // ERROR + FATAL
             _ => Level::Info,
         };
@@ -338,13 +342,14 @@ mod tests {
 
     #[test]
     fn observed_time_fallback_and_empty() {
-        let body =
-            r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"observedTimeUnixNano":"5000000"}]}]}]}"#;
+        let body = r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"observedTimeUnixNano":"5000000"}]}]}]}"#;
         let recs = parse_otlp_json(body).unwrap();
         assert_eq!(recs[0].ts_millis, 5);
 
         // Well-formed but no records.
-        assert!(parse_otlp_json(r#"{"resourceLogs":[]}"#).unwrap().is_empty());
+        assert!(parse_otlp_json(r#"{"resourceLogs":[]}"#)
+            .unwrap()
+            .is_empty());
 
         // Malformed JSON -> error.
         assert!(parse_otlp_json("not json").is_err());

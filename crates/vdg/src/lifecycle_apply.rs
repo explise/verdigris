@@ -49,7 +49,10 @@ pub async fn apply(storage: &StorageConfig, policy: &LifecyclePolicy) -> anyhow:
         .await
         .with_context(|| format!("PutBucketLifecycleConfiguration on bucket {bucket}"))?;
 
-    println!("applied lifecycle policy to s3://{bucket} ({} rule(s))", policy.rules.len());
+    println!(
+        "applied lifecycle policy to s3://{bucket} ({} rule(s))",
+        policy.rules.len()
+    );
     Ok(())
 }
 

@@ -158,7 +158,12 @@ pub fn step(prev: &AlertStatus, firing: bool, value: f64, now: u64) -> (AlertSta
 }
 
 /// Convenience: evaluate a rule against a measured value and advance its status.
-pub fn evaluate(rule: &AlertRule, prev: &AlertStatus, value: f64, now: u64) -> (AlertStatus, Transition) {
+pub fn evaluate(
+    rule: &AlertRule,
+    prev: &AlertStatus,
+    value: f64,
+    now: u64,
+) -> (AlertStatus, Transition) {
     let firing = rule.comparator.holds(value, rule.threshold);
     step(prev, firing, value, now)
 }

@@ -164,7 +164,14 @@ mod tests {
     fn time_window_prunes_files() {
         let m = manifest();
         // Window [800,1000], hot only: only the second hot file overlaps.
-        let e = estimate_scan(&m, &[Tier::Hot], Some((800, 1000)), &[], 1e9, RetrievalMode::Standard);
+        let e = estimate_scan(
+            &m,
+            &[Tier::Hot],
+            Some((800, 1000)),
+            &[],
+            1e9,
+            RetrievalMode::Standard,
+        );
         assert_eq!(e.scan_bytes, 2000);
         assert_eq!(e.files_touched, 1);
         assert_eq!(e.cost_usd, 0.0); // hot retrieval is free
@@ -208,25 +215,48 @@ mod tests {
         let mut m = Manifest::new("logs");
         // Two hot files with recorded service stats; one covers auth, one billing.
         m.add(DataFile {
-            path: "logs/hot/auth".into(), bytes: 1000, rows: 1, min_ts: 0, max_ts: 10,
-            tier: Tier::Hot, services: vec!["auth".into()], levels: vec!["ERROR".into()],
+            path: "logs/hot/auth".into(),
+            bytes: 1000,
+            rows: 1,
+            min_ts: 0,
+            max_ts: 10,
+            tier: Tier::Hot,
+            services: vec!["auth".into()],
+            levels: vec!["ERROR".into()],
             message_trigrams: trigrams_of("connection timeout to db-primary"),
         });
         m.add(DataFile {
-            path: "logs/hot/billing".into(), bytes: 3000, rows: 1, min_ts: 0, max_ts: 10,
-            tier: Tier::Hot, services: vec!["billing".into()], levels: vec!["INFO".into()],
+            path: "logs/hot/billing".into(),
+            bytes: 3000,
+            rows: 1,
+            min_ts: 0,
+            max_ts: 10,
+            tier: Tier::Hot,
+            services: vec!["billing".into()],
+            levels: vec!["INFO".into()],
             message_trigrams: trigrams_of("invoice generated"),
         });
         // A legacy file with no stats must always be scanned (no false prune).
         m.add(DataFile {
-            path: "logs/hot/legacy".into(), bytes: 500, rows: 1, min_ts: 0, max_ts: 10,
-            tier: Tier::Hot, services: vec![], levels: vec![],
+            path: "logs/hot/legacy".into(),
+            bytes: 500,
+            rows: 1,
+            min_ts: 0,
+            max_ts: 10,
+            tier: Tier::Hot,
+            services: vec![],
+            levels: vec![],
             message_trigrams: None,
         });
 
         // service:auth → the billing file is proven empty and skipped; auth + legacy stay.
         let e = estimate_scan(
-            &m, &[Tier::Hot], None, &[Predicate::service("auth")], 1e9, RetrievalMode::Standard,
+            &m,
+            &[Tier::Hot],
+            None,
+            &[Predicate::service("auth")],
+            1e9,
+            RetrievalMode::Standard,
         );
         assert_eq!(e.scan_bytes, 1000 + 500, "billing file pruned, legacy kept");
         assert_eq!(e.files_touched, 2);
@@ -234,20 +264,40 @@ mod tests {
         // Free text `timeout` → only the auth file's trigrams admit it; the
         // billing file is proven match-free, the stat-less legacy file stays.
         let e = estimate_scan(
-            &m, &[Tier::Hot], None, &[Predicate::message_contains("timeout")],
-            1e9, RetrievalMode::Standard,
+            &m,
+            &[Tier::Hot],
+            None,
+            &[Predicate::message_contains("timeout")],
+            1e9,
+            RetrievalMode::Standard,
         );
-        assert_eq!(e.scan_bytes, 1000 + 500, "free text pruned billing, kept legacy");
+        assert_eq!(
+            e.scan_bytes,
+            1000 + 500,
+            "free text pruned billing, kept legacy"
+        );
         // A substring *inside* a word must not prune the file containing it.
         let e = estimate_scan(
-            &m, &[Tier::Hot], None, &[Predicate::message_contains("imeou")],
-            1e9, RetrievalMode::Standard,
+            &m,
+            &[Tier::Hot],
+            None,
+            &[Predicate::message_contains("imeou")],
+            1e9,
+            RetrievalMode::Standard,
         );
-        assert_eq!(e.scan_bytes, 1000 + 500, "in-word substring still matches auth file");
+        assert_eq!(
+            e.scan_bytes,
+            1000 + 500,
+            "in-word substring still matches auth file"
+        );
         // A term too short to judge (< 3 chars) never prunes anything.
         let e = estimate_scan(
-            &m, &[Tier::Hot], None, &[Predicate::message_contains("db")],
-            1e9, RetrievalMode::Standard,
+            &m,
+            &[Tier::Hot],
+            None,
+            &[Predicate::message_contains("db")],
+            1e9,
+            RetrievalMode::Standard,
         );
         assert_eq!(e.files_touched, 3, "short terms cannot prove absence");
 
@@ -272,7 +322,11 @@ mod tests {
             let selected = select_files(&m, &tiers, window, &[]);
             let est = estimate_scan(&m, &tiers, window, &[], 1e9, RetrievalMode::Standard);
             // Same count and same bytes the estimate charged for.
-            assert_eq!(selected.len(), est.files_touched, "count parity {tiers:?} {window:?}");
+            assert_eq!(
+                selected.len(),
+                est.files_touched,
+                "count parity {tiers:?} {window:?}"
+            );
             let bytes: u64 = selected.iter().map(|f| f.bytes).sum();
             assert_eq!(bytes, est.scan_bytes, "bytes parity {tiers:?} {window:?}");
         }
