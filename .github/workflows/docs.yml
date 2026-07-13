@@ -1,0 +1,53 @@
+# Build and deploy the documentation site (MkDocs Material) to GitHub Pages.
+#
+# Triggers only when the site can actually change: docs content, the mkdocs
+# config, or this workflow itself. Deploys via the Pages artifact flow (not a
+# gh-pages branch), so every deploy is visible under Actions → docs and in the
+# github-pages environment; the Pages source must be set to "GitHub Actions".
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - ".github/workflows/docs.yml"
+  # Manual redeploys (e.g. after a Pages config change) without an empty commit.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One Pages deploy at a time; never cancel a deploy already in flight.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pinned to the versions the site was authored against; bump deliberately.
+      - run: pip install mkdocs==1.6.1 mkdocs-material==9.7.6
+      # Not --strict yet: contributing.md/ARCHITECTURE.md carry 5 known links to
+      # repo files outside docs/ that strict mode rejects. Fix those, then
+      # tighten this to `mkdocs build --strict`.
+      - run: mkdocs build --site-dir _site
+      - uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

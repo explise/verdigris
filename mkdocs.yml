@@ -1,9 +1,9 @@
 # MkDocs Material config for the Verdigris documentation site.
 #
-# The docs source lives in docs/ with the code so it never drifts, and the
-# site publishes from THIS repo's gh-pages branch (https://explise.github.io/verdigris/).
-# Build:   mkdocs build      Preview:  mkdocs serve
-# Publish: mkdocs gh-deploy  (builds and pushes HTML to gh-pages)
+# The docs source lives in docs/ with the code so it never drifts. CI deploys
+# the site to https://explise.github.io/verdigris/ on every push to main that
+# touches docs/ or this file (.github/workflows/docs.yml) — no manual publish.
+# Local preview: mkdocs serve
 site_name: Verdigris
 site_description: >-
   S3-native log storage and query engine in Rust: compacted Parquet in the
