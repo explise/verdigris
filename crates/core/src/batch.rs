@@ -27,11 +27,7 @@ pub struct LogRecord {
 impl LogRecord {
     /// Rough in-memory footprint, used only to decide when to roll a file.
     pub fn approx_bytes(&self) -> usize {
-        let attrs: usize = self
-            .attrs
-            .iter()
-            .map(|(k, v)| k.len() + v.len() + 2)
-            .sum();
+        let attrs: usize = self.attrs.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
         8 + 8 + 4 // ts + level + status
             + self.service.len()
             + self.message.len()

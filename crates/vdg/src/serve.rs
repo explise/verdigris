@@ -33,9 +33,9 @@ use axum::{Extension, Json, Router};
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::Path as AxPath;
 use axum::routing::delete;
@@ -211,7 +211,14 @@ async fn append_audit(s: &Store, table: &str, rec: QueryRecord) -> anyhow::Resul
             None => PutMode::Create,
         };
         match s
-            .put_opts(&audit_path(table), bytes.clone().into(), PutOptions { mode, ..Default::default() })
+            .put_opts(
+                &audit_path(table),
+                bytes.clone().into(),
+                PutOptions {
+                    mode,
+                    ..Default::default()
+                },
+            )
             .await
         {
             Ok(_) => return Ok(()),
@@ -246,8 +253,9 @@ struct HttpMetrics {
 }
 
 /// Upper bounds (ms) for the latency histogram; a trailing +Inf bucket is implied.
-const LATENCY_BUCKETS_MS: [f64; 11] =
-    [5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0];
+const LATENCY_BUCKETS_MS: [f64; 11] = [
+    5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
+];
 
 impl HttpMetrics {
     fn new() -> Self {
@@ -274,7 +282,8 @@ impl HttpMetrics {
             .position(|&b| latency_ms <= b)
             .unwrap_or(LATENCY_BUCKETS_MS.len()); // +Inf overflow slot
         self.latency[idx].fetch_add(1, Ordering::Relaxed);
-        self.latency_sum_ms.fetch_add(latency_ms as u64, Ordering::Relaxed);
+        self.latency_sum_ms
+            .fetch_add(latency_ms as u64, Ordering::Relaxed);
         self.latency_count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -314,7 +323,10 @@ impl HttpMetrics {
         ));
         out.push_str("# HELP verdigris_ingest_records_total Log records accepted by ingest.\n");
         out.push_str("# TYPE verdigris_ingest_records_total counter\n");
-        out.push_str(&format!("verdigris_ingest_records_total {}\n", g(&self.ingest_records)));
+        out.push_str(&format!(
+            "verdigris_ingest_records_total {}\n",
+            g(&self.ingest_records)
+        ));
         out.push_str("# HELP verdigris_queries_total Queries executed.\n");
         out.push_str("# TYPE verdigris_queries_total counter\n");
         out.push_str(&format!("verdigris_queries_total {}\n", g(&self.queries)));
@@ -330,7 +342,10 @@ async fn track_metrics(
 ) -> Response {
     let start = std::time::Instant::now();
     let res = next.run(req).await;
-    metrics.observe(start.elapsed().as_secs_f64() * 1000.0, res.status().as_u16());
+    metrics.observe(
+        start.elapsed().as_secs_f64() * 1000.0,
+        res.status().as_u16(),
+    );
     res
 }
 
@@ -463,7 +478,14 @@ async fn save_alerts_cas(
         None => PutMode::Create,
     };
     match s
-        .put_opts(&alerts_path(table), bytes.clone().into(), PutOptions { mode, ..Default::default() })
+        .put_opts(
+            &alerts_path(table),
+            bytes.clone().into(),
+            PutOptions {
+                mode,
+                ..Default::default()
+            },
+        )
         .await
     {
         Ok(_) => Ok(true),
@@ -622,7 +644,9 @@ async fn maybe_compact(
     let mut passes = 0usize;
     loop {
         let _g = ingest_lock.lock().await;
-        let (reports, more) = ingestor.compact_bounded(target_bytes, max_merge_files).await?;
+        let (reports, more) = ingestor
+            .compact_bounded(target_bytes, max_merge_files)
+            .await?;
         drop(_g);
         total_merged += reports.iter().map(|r| r.files_merged).sum::<usize>();
         passes += 1;
@@ -632,9 +656,13 @@ async fn maybe_compact(
         tokio::task::yield_now().await;
     }
     if total_merged > 0 {
-        metrics.files_merged_total.fetch_add(total_merged as u64, Ordering::Relaxed);
+        metrics
+            .files_merged_total
+            .fetch_add(total_merged as u64, Ordering::Relaxed);
         metrics.runs_total.fetch_add(1, Ordering::Relaxed);
-        metrics.last_run_ms.store(crate::now_millis() as u64, Ordering::Relaxed);
+        metrics
+            .last_run_ms
+            .store(crate::now_millis() as u64, Ordering::Relaxed);
         tracing::info!(files_merged = total_merged, passes, "auto-compaction ran");
     }
     Ok(())
@@ -654,19 +682,20 @@ async fn seed_example_alerts(
         return Ok(());
     }
     let now = crate::now_millis() as u64;
-    let mk = |id: &str, name: &str, sql: String, cmp: Comparator, threshold: f64, sev: &str| Alert {
-        rule: AlertRule {
-            id: id.to_string(),
-            name: name.to_string(),
-            sql,
-            comparator: cmp,
-            threshold,
-            severity: sev.to_string(),
-            webhook: None,
-            enabled: true,
-        },
-        status: AlertStatus::initial(now),
-    };
+    let mk =
+        |id: &str, name: &str, sql: String, cmp: Comparator, threshold: f64, sev: &str| Alert {
+            rule: AlertRule {
+                id: id.to_string(),
+                name: name.to_string(),
+                sql,
+                comparator: cmp,
+                threshold,
+                severity: sev.to_string(),
+                webhook: None,
+                enabled: true,
+            },
+            status: AlertStatus::initial(now),
+        };
     let doc = AlertsDoc {
         alerts: vec![
             mk(
@@ -680,7 +709,9 @@ async fn seed_example_alerts(
             mk(
                 "seed-auth-5xx",
                 "Auth 5xx surge",
-                format!("SELECT count(*) AS v FROM {table} WHERE service = 'auth' AND status >= 500"),
+                format!(
+                    "SELECT count(*) AS v FROM {table} WHERE service = 'auth' AND status >= 500"
+                ),
                 Comparator::Gt,
                 100_000.0,
                 "warning",
@@ -940,7 +971,10 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .with_context(|| format!("binding port {port}"))?;
-    println!("verdigris serving on http://localhost:{port} (role: {})", role_name(role));
+    println!(
+        "verdigris serving on http://localhost:{port} (role: {})",
+        role_name(role)
+    );
     if role.serves_reads() {
         println!("  frontend: {}", frontend.display());
         println!("  api:      http://localhost:{port}/v1/query");
@@ -1184,7 +1218,10 @@ async fn h_token_revoke(State(st): State<AppState>, AxPath(id): AxPath<String>) 
 /// in-memory ring is only the fallback if the store is unreachable.
 async fn h_audit_queries(State(st): State<AppState>) -> ApiResult {
     let persisted: Option<Vec<QueryRecord>> = match store(&st) {
-        Ok(s) => load_audit(&s, st.table.as_str()).await.ok().map(|(d, _)| d.queries),
+        Ok(s) => load_audit(&s, st.table.as_str())
+            .await
+            .ok()
+            .map(|(d, _)| d.queries),
         Err(_) => None,
     };
     let hist: Vec<QueryRecord> = match persisted {
@@ -1307,28 +1344,26 @@ async fn h_query(
     // Run the query once, in the negotiated wire (never both).
     let t0 = std::time::Instant::now();
     let (arrow_body, json_rows) = if arrow {
-        let bytes =
-            verdigris_query::engine::query_table_arrow(
-                s.clone(),
-                st.table.as_str(),
-                &files,
-                &sql,
-                &limits(&st),
-            )
-            .await
-            .map_err(AppError::from_query)?;
+        let bytes = verdigris_query::engine::query_table_arrow(
+            s.clone(),
+            st.table.as_str(),
+            &files,
+            &sql,
+            &limits(&st),
+        )
+        .await
+        .map_err(AppError::from_query)?;
         (bytes, Value::Null)
     } else {
-        let rows =
-            verdigris_query::engine::query_table_json(
-                s.clone(),
-                st.table.as_str(),
-                &files,
-                &sql,
-                &limits(&st),
-            )
-            .await
-            .map_err(AppError::from_query)?;
+        let rows = verdigris_query::engine::query_table_json(
+            s.clone(),
+            st.table.as_str(),
+            &files,
+            &sql,
+            &limits(&st),
+        )
+        .await
+        .map_err(AppError::from_query)?;
         (Vec::new(), Value::Array(rows))
     };
     let elapsed = t0.elapsed().as_millis() as u64;
@@ -1351,11 +1386,20 @@ async fn h_query(
     });
 
     // Audit / expensiveQueries: record who ran what, and what it scanned/cost.
-    let user = identity.map(|Extension(id)| id.0).unwrap_or_else(|| "anonymous".to_string());
+    let user = identity
+        .map(|Extension(id)| id.0)
+        .unwrap_or_else(|| "anonymous".to_string());
     let (cost_usd, cold_tier) = selected.iter().fold((0.0f64, Tier::Hot), |(c, ct), f| {
         let usd = f.bytes as f64 / cost::GIB
             * cost::retrieval_usd_per_gib(f.tier.default_class(), RetrievalMode::Standard);
-        (c + usd, if f.tier.index() > ct.index() { f.tier } else { ct })
+        (
+            c + usd,
+            if f.tier.index() > ct.index() {
+                f.tier
+            } else {
+                ct
+            },
+        )
     });
     let rec = QueryRecord {
         ts_millis: crate::now_millis(),
@@ -1381,7 +1425,10 @@ async fn h_query(
     if arrow {
         Ok(query_response(true, arrow_body, &stats, &histogram))
     } else {
-        Ok(Json(json!({ "rows": json_rows, "stats": stats, "histogram": histogram })).into_response())
+        Ok(
+            Json(json!({ "rows": json_rows, "stats": stats, "histogram": histogram }))
+                .into_response(),
+        )
     }
 }
 
@@ -1390,7 +1437,12 @@ async fn h_query(
 /// so the whole envelope is still one round-trip. JSON: the usual body envelope.
 /// Same-origin (UI + API on one binary) means the client can read the custom
 /// headers without CORS `Access-Control-Expose-Headers`.
-fn query_response(arrow: bool, arrow_body: Vec<u8>, stats: &Value, histogram: &[Value]) -> Response {
+fn query_response(
+    arrow: bool,
+    arrow_body: Vec<u8>,
+    stats: &Value,
+    histogram: &[Value],
+) -> Response {
     if !arrow {
         return Json(json!({ "rows": [], "stats": stats, "histogram": histogram })).into_response();
     }
@@ -1421,8 +1473,9 @@ async fn histogram(
 ) -> anyhow::Result<Vec<Value>> {
     let range_ms = (max_ts - min_ts).max(1);
     let interval_secs = (range_ms / 60 / 1000).max(1);
-    let bin =
-        format!("date_bin(INTERVAL '{interval_secs} seconds', ts, TIMESTAMP '1970-01-01T00:00:00')");
+    let bin = format!(
+        "date_bin(INTERVAL '{interval_secs} seconds', ts, TIMESTAMP '1970-01-01T00:00:00')"
+    );
     let sql = format!(
         "SELECT count(*) AS total, \
                 count(*) FILTER (WHERE level = 'ERROR') AS errors \
@@ -1521,7 +1574,9 @@ async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
         .ingest(records, &st.cfg.routing, BatchPolicy::default())
         .await?;
     let bytes: u64 = written.iter().map(|f| f.bytes).sum();
-    st.metrics.ingest_records.fetch_add(ingested as u64, Ordering::Relaxed);
+    st.metrics
+        .ingest_records
+        .fetch_add(ingested as u64, Ordering::Relaxed);
 
     Ok(Json(json!({
         "ingested": ingested,
@@ -1555,7 +1610,9 @@ async fn h_otlp(State(st): State<AppState>, body: String) -> ApiResult {
         .ingest(records, &st.cfg.routing, BatchPolicy::default())
         .await?;
     let bytes: u64 = written.iter().map(|f| f.bytes).sum();
-    st.metrics.ingest_records.fetch_add(ingested as u64, Ordering::Relaxed);
+    st.metrics
+        .ingest_records
+        .fetch_add(ingested as u64, Ordering::Relaxed);
 
     Ok(Json(json!({
         "ingested": ingested,
@@ -1592,7 +1649,8 @@ async fn h_estimate(State(st): State<AppState>, Json(req): Json<EstimateReq>) ->
         .unwrap_or_default();
 
     // Provisioned throughput = cores × per-core rate (the storage/compute dial).
-    let throughput = st.cfg.query.modeled_mibps_per_core * st.cfg.query.cores as f64 * 1024.0 * 1024.0;
+    let throughput =
+        st.cfg.query.modeled_mibps_per_core * st.cfg.query.cores as f64 * 1024.0 * 1024.0;
 
     let est = verdigris_core::estimate::estimate_scan(
         &m,
@@ -1633,7 +1691,12 @@ async fn h_storage(State(st): State<AppState>) -> ApiResult {
         (Tier::Warm, "Warm", "Glacier Instant"),
         (Tier::Cold, "Cold", "Glacier Flexible"),
     ] {
-        let bytes: u64 = m.files.iter().filter(|f| f.tier == tier).map(|f| f.bytes).sum();
+        let bytes: u64 = m
+            .files
+            .iter()
+            .filter(|f| f.tier == tier)
+            .map(|f| f.bytes)
+            .sum();
         let objects = m.files.iter().filter(|f| f.tier == tier).count();
         let gib = bytes as f64 / cost::GIB;
         let per_month = gib * cost::storage_usd_per_gib_month(tier.default_class());
@@ -1704,7 +1767,9 @@ async fn h_config(State(st): State<AppState>) -> ApiResult {
         StorageConfig::S3 { bucket, region, .. } => {
             (format!("s3://{bucket}"), region.clone().unwrap_or_default())
         }
-        StorageConfig::Local { path } => (format!("local://{}", path.display()), "local".to_string()),
+        StorageConfig::Local { path } => {
+            (format!("local://{}", path.display()), "local".to_string())
+        }
         StorageConfig::Memory => ("memory://".to_string(), "local".to_string()),
     };
     let table = st.table.as_str();
@@ -1748,7 +1813,8 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
     let mut total_errors = 0i64;
 
     if !files.is_empty() {
-        let sql = format!("SELECT service, count(*) AS n FROM {table} GROUP BY service ORDER BY n DESC");
+        let sql =
+            format!("SELECT service, count(*) AS n FROM {table} GROUP BY service ORDER BY n DESC");
         if let Ok(rows) =
             verdigris_query::engine::query_table_json(s.clone(), table, &files, &sql, &limits(&st))
                 .await
@@ -1774,14 +1840,24 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
             total_events += total;
             total_errors += errors;
             ingest_rate.push(total as f64 / interval_secs);
-            let er = if total > 0 { errors as f64 / total as f64 * 100.0 } else { 0.0 };
+            let er = if total > 0 {
+                errors as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            };
             error_rate.push(er);
             // No latency field in logs yet, so p99 is MODELED from error rate.
             p99.push(800.0 + er * 18.0);
         }
     }
 
-    let avg = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
+    let avg = |v: &[f64]| {
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
+    };
     let overall_err = if total_events > 0 {
         total_errors as f64 / total_events as f64 * 100.0
     } else {
@@ -1834,8 +1910,14 @@ async fn h_cost(State(st): State<AppState>, Query(q): Query<CostQuery>) -> ApiRe
         (Tier::Warm, "Warm storage (Glacier IR)"),
         (Tier::Cold, "Cold storage (Glacier Flex)"),
     ] {
-        let bytes: u64 = m.files.iter().filter(|f| f.tier == tier).map(|f| f.bytes).sum();
-        let usd = (bytes as f64 / cost::GIB) * cost::storage_usd_per_gib_month(tier.default_class());
+        let bytes: u64 = m
+            .files
+            .iter()
+            .filter(|f| f.tier == tier)
+            .map(|f| f.bytes)
+            .sum();
+        let usd =
+            (bytes as f64 / cost::GIB) * cost::storage_usd_per_gib_month(tier.default_class());
         total += usd;
         breakdown.push(json!({ "label": label, "usd": usd }));
     }
@@ -1970,7 +2052,10 @@ async fn h_alert_create(
     let id = rule.id.clone();
     for _ in 0..ALERTS_CAS_RETRIES {
         let (mut doc, base) = load_alerts_versioned(&s, st.table.as_str()).await?;
-        doc.alerts.push(Alert { rule: rule.clone(), status });
+        doc.alerts.push(Alert {
+            rule: rule.clone(),
+            status,
+        });
         if save_alerts_cas(&s, st.table.as_str(), &doc, base).await? {
             return Ok((StatusCode::CREATED, Json(json!({ "id": id }))).into_response());
         }
@@ -2161,7 +2246,10 @@ mod tests {
         let s: Store = Arc::new(object_store::memory::InMemory::new());
         let ing = verdigris_ingest::Ingestor::new(s.clone(), "logs");
         let routing = verdigris_core::config::RoutingConfig::default();
-        let policy = BatchPolicy { max_rows: 100, max_bytes: usize::MAX };
+        let policy = BatchPolicy {
+            max_rows: 100,
+            max_bytes: usize::MAX,
+        };
         // Many small ingests -> many small files (the streaming reality).
         for i in 0u64..10 {
             let recs = verdigris_ingest::generate::generate(100, i, (i as i64) * 1_000_000);
@@ -2175,7 +2263,9 @@ mod tests {
         let target = 10 * 1024 * 1024;
 
         // Trigger far above pending -> no-op; files and counters untouched.
-        maybe_compact(&s, "logs", &lock, target, 10_000, 128, &metrics).await.unwrap();
+        maybe_compact(&s, "logs", &lock, target, 10_000, 128, &metrics)
+            .await
+            .unwrap();
         assert_eq!(metrics.runs_total.load(Ordering::Relaxed), 0);
         assert_eq!(
             ing.load_manifest().await.unwrap().files.len(),
@@ -2185,18 +2275,20 @@ mod tests {
 
         // Low trigger + tiny per-pass budget -> multiple bounded passes drain the
         // backlog fully; files shrink and metrics record one run.
-        maybe_compact(&s, "logs", &lock, target, 2, 2, &metrics).await.unwrap();
+        maybe_compact(&s, "logs", &lock, target, 2, 2, &metrics)
+            .await
+            .unwrap();
         let after = ing.load_manifest().await.unwrap().files.len();
-        assert!(after < before, "auto-compaction should reduce files ({before} -> {after})");
+        assert!(
+            after < before,
+            "auto-compaction should reduce files ({before} -> {after})"
+        );
         assert_eq!(metrics.runs_total.load(Ordering::Relaxed), 1);
         assert!(metrics.files_merged_total.load(Ordering::Relaxed) > 0);
         assert!(metrics.last_run_ms.load(Ordering::Relaxed) > 0);
         // Fully drained: nothing left pending.
         assert_eq!(
-            verdigris_ingest::pending_compaction_total(
-                &ing.load_manifest().await.unwrap(),
-                target
-            ),
+            verdigris_ingest::pending_compaction_total(&ing.load_manifest().await.unwrap(), target),
             0,
             "bounded passes should drain the backlog"
         );
@@ -2253,13 +2345,19 @@ mod tests {
     #[tokio::test]
     async fn corrupt_audit_doc_reads_empty_and_is_repaired_by_append() {
         let s: Store = Arc::new(object_store::memory::InMemory::new());
-        s.put(&audit_path("t"), bytes::Bytes::from_static(b"{ not json").into())
-            .await
-            .unwrap();
+        s.put(
+            &audit_path("t"),
+            bytes::Bytes::from_static(b"{ not json").into(),
+        )
+        .await
+        .unwrap();
         // Corrupt → empty history (queries must not fail), version preserved.
         let (doc, v) = load_audit(&s, "t").await.unwrap();
         assert!(doc.queries.is_empty());
-        assert!(v.is_some(), "version kept so the next append repairs the doc");
+        assert!(
+            v.is_some(),
+            "version kept so the next append repairs the doc"
+        );
         // The next append overwrites the corrupt doc under CAS.
         append_audit(&s, "t", audit_rec(1)).await.unwrap();
         let (doc, _) = load_audit(&s, "t").await.unwrap();

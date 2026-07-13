@@ -172,14 +172,27 @@ async fn free_text_pruning_never_changes_results() {
     // "auth" only ever appears in the hot (ERROR/auth) file's messages.
     let dsl = "auth";
     let sql = verdigris_core::search::to_sql(dsl, "logs", BASE_TS + 3_600_000, 1000).unwrap();
-    assert!(sql.contains("message ILIKE '%auth%'"), "free text compiles to ILIKE: {sql}");
+    assert!(
+        sql.contains("message ILIKE '%auth%'"),
+        "free text compiles to ILIKE: {sql}"
+    );
     let preds = verdigris_core::search::stat_predicates(dsl);
-    assert_eq!(preds, vec![verdigris_core::manifest::Predicate::message_contains("auth")]);
+    assert_eq!(
+        preds,
+        vec![verdigris_core::manifest::Predicate::message_contains(
+            "auth"
+        )]
+    );
 
-    let pruned: Vec<String> = select_files(&manifest, &[Tier::Hot, Tier::Warm, Tier::Cold], None, &preds)
-        .into_iter()
-        .map(|f| f.path.clone())
-        .collect();
+    let pruned: Vec<String> = select_files(
+        &manifest,
+        &[Tier::Hot, Tier::Warm, Tier::Cold],
+        None,
+        &preds,
+    )
+    .into_iter()
+    .map(|f| f.path.clone())
+    .collect();
     assert_eq!(pruned.len(), 1, "trigram stats prune to the auth file only");
 
     let from_pruned = engine::query_table_json(store.clone(), "logs", &pruned, &sql, &limits())
@@ -207,10 +220,7 @@ async fn arrow_wire_is_view_free_and_matches_the_json_path() {
     let reader = StreamReader::try_new(Cursor::new(&buf), None).expect("ipc stream");
     for field in reader.schema().fields() {
         assert!(
-            !matches!(
-                field.data_type(),
-                DataType::Utf8View | DataType::BinaryView
-            ),
+            !matches!(field.data_type(), DataType::Utf8View | DataType::BinaryView),
             "view type leaked onto the wire: {field:?}"
         );
     }

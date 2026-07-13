@@ -33,17 +33,17 @@
 //! DST harness, not by config-driven [`crate::build`] (which stays prod-only).
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
-use object_store::memory::InMemory;
 use object_store::{Error as OsError, Result as OsResult};
 
 use verdigris_core::clock::{Clock, Millis};
@@ -306,9 +306,7 @@ impl ObjectStore for SimObjectStore {
             (entry.class, entry.mode)
         };
 
-        self.clock
-            .sleep(cost::first_byte_latency_ms(class))
-            .await;
+        self.clock.sleep(cost::first_byte_latency_ms(class)).await;
         let result = self.inner.get_opts(location, options).await?;
 
         // Meter what this retrieval cost, from the shared cost model.
@@ -369,7 +367,10 @@ mod tests {
     async fn put_get_round_trips_and_advances_sim_clock() {
         let (clock, store) = store();
         let p = Path::from("logs/hot/a.parquet");
-        store.put(&p, PutPayload::from_static(b"hello")).await.unwrap();
+        store
+            .put(&p, PutPayload::from_static(b"hello"))
+            .await
+            .unwrap();
         let got = store.get(&p).await.unwrap().bytes().await.unwrap();
         assert_eq!(&*got, b"hello");
         // put + get each advanced the simulated clock; no real time elapsed.
@@ -380,7 +381,10 @@ mod tests {
     async fn cold_object_needs_restore_before_get() {
         let (clock, store) = store();
         let p = Path::from("logs/cold/c.parquet");
-        store.put(&p, PutPayload::from_static(b"frozen")).await.unwrap();
+        store
+            .put(&p, PutPayload::from_static(b"frozen"))
+            .await
+            .unwrap();
         store.set_class(&p, StorageClass::GlacierFlexible);
 
         // Un-restored cold read fails.
@@ -411,7 +415,9 @@ mod tests {
         // Same seed ⇒ identical fault sequence ⇒ identical error count.
         async fn run(seed: u64) -> usize {
             let clock = Arc::new(SimClock::new(0));
-            let store = SimObjectStore::new(clock).with_seed(seed).with_fault_rate_ppm(500_000);
+            let store = SimObjectStore::new(clock)
+                .with_seed(seed)
+                .with_fault_rate_ppm(500_000);
             let mut errs = 0;
             for i in 0..32 {
                 let p = Path::from(format!("k/{i}"));

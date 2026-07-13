@@ -18,7 +18,11 @@ use verdigris_core::model::Tier;
 use verdigris_query::{ModeledExecutor, ScanExecutor, ScanFile, ScanPlan};
 
 #[derive(Parser)]
-#[command(name = "vdg", version, about = "Verdigris — S3-native log storage & query")]
+#[command(
+    name = "vdg",
+    version,
+    about = "Verdigris — S3-native log storage & query"
+)]
 struct Cli {
     /// Path to a config file (else $VERDIGRIS_CONFIG, else ./config/verdigris.toml).
     #[arg(long, global = true)]
@@ -194,8 +198,7 @@ fn load_config(explicit: Option<&std::path::Path>) -> anyhow::Result<Config> {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -208,7 +211,10 @@ async fn main() -> anyhow::Result<()> {
             println!("# resolved configuration\n{text}");
         }
         Command::Check => {
-            println!("storage backend: {}", verdigris_storage::describe(&cfg.storage));
+            println!(
+                "storage backend: {}",
+                verdigris_storage::describe(&cfg.storage)
+            );
             let store = verdigris_storage::build(&cfg.storage)?;
             let path = verdigris_storage::health_probe(&store).await?;
             println!("round-trip OK (probe key: {path})");
@@ -301,7 +307,10 @@ async fn run_ingest(
     // long-running server's `last 1h` queries stay populated. (This naturally
     // produces many small files — exactly what compaction, build step 4, solves.)
     if follow {
-        anyhow::ensure!(from.is_none(), "--follow generates synthetic logs; remove --from");
+        anyhow::ensure!(
+            from.is_none(),
+            "--follow generates synthetic logs; remove --from"
+        );
         let per_tick = generate.unwrap_or(200);
         println!(
             "following '{table}': +{per_tick} records every {interval}s (Ctrl-C to stop) — backend: {}",
@@ -337,7 +346,9 @@ async fn run_ingest(
                 .collect::<anyhow::Result<Vec<_>>>()?
         }
         (None, None) => {
-            anyhow::bail!("nothing to ingest: pass --generate <N>, --from <file.ndjson>, or --follow")
+            anyhow::bail!(
+                "nothing to ingest: pass --generate <N>, --from <file.ndjson>, or --follow"
+            )
         }
     };
     let total = records.len();
@@ -405,9 +416,9 @@ async fn run_lifecycle(cfg: &Config, table: &str, apply: bool) -> anyhow::Result
             eprintln!("#   aws s3api put-bucket-lifecycle-configuration --bucket {bucket} \\");
             eprintln!("#     --lifecycle-configuration file://lifecycle.json");
         }
-        _ => eprintln!(
-            "\n# (local backend has no lifecycle — this is the policy you'd apply on S3)"
-        ),
+        _ => {
+            eprintln!("\n# (local backend has no lifecycle — this is the policy you'd apply on S3)")
+        }
     }
     Ok(())
 }
@@ -499,7 +510,9 @@ async fn run_serve(
     _frontend: PathBuf,
     _role: RoleArg,
 ) -> anyhow::Result<()> {
-    anyhow::bail!("serve requires the serve feature: rebuild with `cargo run --features serve -- serve`")
+    anyhow::bail!(
+        "serve requires the serve feature: rebuild with `cargo run --features serve -- serve`"
+    )
 }
 
 async fn run_query(

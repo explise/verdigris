@@ -56,13 +56,21 @@ async fn glacier_restore_workflow_runs_in_logical_time() {
 
     // Bulk restore — the cheapest, slowest mode (~8h in the model).
     let ready_at = store.request_restore(&p, RetrievalMode::Bulk);
-    let expected_thaw = cost::restore_latency_ms(StorageClass::GlacierFlexible, RetrievalMode::Bulk);
+    let expected_thaw =
+        cost::restore_latency_ms(StorageClass::GlacierFlexible, RetrievalMode::Bulk);
     assert!(expected_thaw >= 8 * 60 * 60 * 1000, "bulk thaw is hours");
-    assert_eq!(ready_at, clock.now_millis() + expected_thaw, "ready at now + thaw");
+    assert_eq!(
+        ready_at,
+        clock.now_millis() + expected_thaw,
+        "ready at now + thaw"
+    );
 
     // Halfway through the thaw it is still locked.
     clock.advance(expected_thaw / 2);
-    assert!(store.get(&p).await.is_err(), "still thawing at the halfway mark");
+    assert!(
+        store.get(&p).await.is_err(),
+        "still thawing at the halfway mark"
+    );
 
     // Once the modeled thaw has fully elapsed in *sim* time, it reads.
     clock.advance(expected_thaw / 2);
@@ -154,7 +162,10 @@ async fn tiering_fast_forwards_months_in_milliseconds() {
     let (clock, store) = sim();
 
     let p = Path::from("logs/app.parquet");
-    store.put(&p, PutPayload::from_static(b"log")).await.unwrap();
+    store
+        .put(&p, PutPayload::from_static(b"log"))
+        .await
+        .unwrap();
 
     // Day 0: hot, queried in place.
     assert_eq!(store.class_of(&p), StorageClass::Standard);
@@ -181,7 +192,10 @@ async fn tiering_fast_forwards_months_in_milliseconds() {
     clock.advance(40 * DAY_MS);
     store.set_class(&p, demote(45).unwrap());
     assert_eq!(store.class_of(&p), StorageClass::GlacierFlexible);
-    assert!(!store.is_readable(&p), "cold object must be restored to read");
+    assert!(
+        !store.is_readable(&p),
+        "cold object must be restored to read"
+    );
     assert!(store.get(&p).await.is_err());
 
     // We simulated 45 days of lifecycle in a test that ran in microseconds.
@@ -212,11 +226,19 @@ async fn fabricated_catalog_prices_a_trillion_rows_without_bytes() {
     assert_eq!(manifest.files.len() as u64, file_count);
     assert_eq!(manifest.total_rows(), file_count * 4_000_000); // 4 trillion rows
 
-    let estimate = estimate_scan(&manifest, &[Tier::Cold], None, &[], 1e9, RetrievalMode::Standard);
+    let estimate = estimate_scan(
+        &manifest,
+        &[Tier::Cold],
+        None,
+        &[],
+        1e9,
+        RetrievalMode::Standard,
+    );
     assert_eq!(estimate.files_touched as u64, file_count);
     assert!(estimate.cold_restore);
     // Sanity: cost == declared GiB × the cold-standard retrieval rate.
     let gib = (file_count * per_file) as f64 / cost::GIB;
-    let expected = gib * cost::retrieval_usd_per_gib(StorageClass::GlacierFlexible, RetrievalMode::Standard);
+    let expected =
+        gib * cost::retrieval_usd_per_gib(StorageClass::GlacierFlexible, RetrievalMode::Standard);
     assert!((estimate.cost_usd - expected).abs() < 1e-6);
 }

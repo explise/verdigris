@@ -38,10 +38,16 @@ pub enum Predicate {
 
 impl Predicate {
     pub fn service(value: impl Into<String>) -> Self {
-        Self::Equals { column: StatColumn::Service, value: value.into() }
+        Self::Equals {
+            column: StatColumn::Service,
+            value: value.into(),
+        }
     }
     pub fn level(value: impl Into<String>) -> Self {
-        Self::Equals { column: StatColumn::Level, value: value.into() }
+        Self::Equals {
+            column: StatColumn::Level,
+            value: value.into(),
+        }
     }
     pub fn message_contains(term: impl Into<String>) -> Self {
         Self::MessageContains(term.into())
@@ -205,7 +211,11 @@ mod tests {
         assert!(!f.may_match(&[Predicate::service("auth"), Predicate::level("WARN")]));
         assert!(f.may_match(&[Predicate::service("auth"), Predicate::level("ERROR")]));
         // Legacy file (no recorded values) is never pruned — correctness over speed.
-        let legacy = DataFile { services: vec![], levels: vec![], ..f.clone() };
+        let legacy = DataFile {
+            services: vec![],
+            levels: vec![],
+            ..f.clone()
+        };
         assert!(legacy.may_match(&[Predicate::service("anything")]));
         assert!(legacy.may_match(&[Predicate::level("DEBUG")]));
     }
@@ -238,7 +248,10 @@ mod tests {
             Predicate::message_contains("kubelet"),
         ]));
         // No recorded trigrams (legacy file) → never pruned by free text.
-        let legacy = DataFile { message_trigrams: None, ..f.clone() };
+        let legacy = DataFile {
+            message_trigrams: None,
+            ..f.clone()
+        };
         assert!(legacy.may_match(&[Predicate::message_contains("kubelet")]));
     }
 }

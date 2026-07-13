@@ -64,9 +64,7 @@ impl TokensDoc {
         let h = hash_token(secret);
         // Constant-ish: we compare the already-hashed value; a wrong secret just
         // fails to match any stored hash.
-        self.tokens
-            .iter()
-            .find(|t| !t.revoked && t.hash == h)
+        self.tokens.iter().find(|t| !t.revoked && t.hash == h)
     }
 }
 

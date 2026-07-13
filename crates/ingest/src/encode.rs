@@ -78,7 +78,9 @@ pub struct FileStats {
 /// not already seen, so a low-cardinality column like `level` costs ~nothing per
 /// row.
 fn fold_distinct(batch: &RecordBatch, column: &str, out: &mut BTreeSet<String>) {
-    let Some(col) = batch.column_by_name(column) else { return };
+    let Some(col) = batch.column_by_name(column) else {
+        return;
+    };
     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
         for i in 0..arr.len() {
             if arr.is_valid(i) && !out.contains(arr.value(i)) {
@@ -167,8 +169,18 @@ impl MergeWriter {
     /// Finish the file: the encoded Parquet bytes plus the stats folded from the
     /// rows written.
     pub fn finish(self) -> Result<(Vec<u8>, FileStats)> {
-        let Self { writer, rows, min_ts, max_ts, services, levels, trigrams } = self;
-        let buf = writer.into_inner().context("closing parquet merge writer")?;
+        let Self {
+            writer,
+            rows,
+            min_ts,
+            max_ts,
+            services,
+            levels,
+            trigrams,
+        } = self;
+        let buf = writer
+            .into_inner()
+            .context("closing parquet merge writer")?;
         let stats = FileStats {
             rows,
             // An empty merge has no timestamps; don't leak the i64 sentinels into
@@ -304,7 +316,10 @@ mod tests {
             .collect();
         // The string lookup columns carry bloom filters (fast equality pruning)…
         for col in ["trace_id", "service", "level", "message"] {
-            assert!(bloomed.contains(&col.to_string()), "{col} needs a bloom filter; got {bloomed:?}");
+            assert!(
+                bloomed.contains(&col.to_string()),
+                "{col} needs a bloom filter; got {bloomed:?}"
+            );
         }
         // …but the time/int columns (pruned by min/max stats) do not.
         assert!(!bloomed.contains(&"ts".to_string()));
