@@ -6,15 +6,15 @@
 # Publish:        mkdocs gh-deploy   (pushes built HTML to a gh-pages branch)
 site_name: Verdigris
 site_description: >-
-  S3-native log storage & query engine in Rust — the layer your infrastructure
-  leaves behind. A self-hostable log platform that keeps log data in your
-  own cloud account.
+  S3-native log storage and query engine in Rust: compacted Parquet in the
+  operator's own bucket, queried in place with DataFusion, with a sans-I/O
+  control plane built for deterministic simulation testing.
 site_url: https://explise.github.io/verdigris/
 docs_dir: docs
 site_dir: site
 
-# Code is private, so no source-repo link in the header. (Add repo_url later if
-# you publish a public mirror.)
+repo_url: https://github.com/explise/verdigris
+repo_name: explise/verdigris
 
 theme:
   name: material
@@ -41,7 +41,7 @@ theme:
     - content.code.copy
     - content.code.annotate
   icon:
-    repo: material/lock
+    repo: material/github
 
 extra_css:
   - stylesheets/extra.css
@@ -71,23 +71,22 @@ validation:
 
 nav:
   - Home: index.md
-  - Get started:
-      - Quickstart: getting-started.md
-      - Install on EKS: install.md
-      - Sending logs: sending-logs.md
-  - Using Verdigris:
-      - Querying: querying.md
-      - Cost & tiering: cost.md
-      - Configuration: configuration.md
-      - FAQ: faq.md
-  - Reference:
-      - HTTP API: API.md
   - Internals:
       - Architecture: ARCHITECTURE.md
       - Testing (DST): dst-architecture.md
-      - Deployment (chart internals): deployment.md
       - Decision Records:
           - Overview: adr/README.md
           - "ADR-0002 · Manifest as Iceberg stand-in": adr/0002-manifest-as-iceberg-standin.md
           - "ADR-0003 · Ingest / query role split": adr/0003-ingest-query-role-split.md
+      - Deployment (chart internals): deployment.md
+  - Reference:
+      - HTTP API: API.md
+      - Configuration: configuration.md
+  - Running it:
+      - Quickstart: getting-started.md
+      - Install on EKS: install.md
+      - Sending logs: sending-logs.md
+      - Querying: querying.md
+      - Cost & tiering: cost.md
+  - FAQ: faq.md
   - Contributing: contributing.md
