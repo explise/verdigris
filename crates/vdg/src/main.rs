@@ -464,7 +464,8 @@ async fn run_sql(cfg: &Config, table: &str, query: &str) -> anyhow::Result<()> {
     let files: Vec<String> = manifest.files.iter().map(|f| f.path.clone()).collect();
 
     let sql = resolve_sql(query, table)?;
-    let out = verdigris_query::engine::query_table(store, table, &files, &sql).await?;
+    let limits = verdigris_query::engine::QueryLimits::from_config(&cfg.query);
+    let out = verdigris_query::engine::query_table(store, table, &files, &sql, &limits).await?;
     println!("{}", out.pretty);
     println!(
         "({} row(s) from {} file(s), engine: datafusion, read in place — no rehydration)",

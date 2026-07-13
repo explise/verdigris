@@ -20,7 +20,7 @@ use verdigris_core::estimate::select_files;
 use verdigris_core::manifest::Manifest;
 use verdigris_core::model::{Level, Tier};
 use verdigris_ingest::Ingestor;
-use verdigris_query::engine;
+use verdigris_query::engine::{self, QueryLimits, ResultTooLarge};
 
 const BASE_TS: i64 = 1_700_000_000_000;
 const TRACE: &str = "traceme-123";
@@ -62,6 +62,12 @@ fn all_paths(m: &Manifest) -> Vec<String> {
     m.files.iter().map(|f| f.path.clone()).collect()
 }
 
+/// The production ceilings. The corpus is 60 rows — nowhere near them — so these
+/// tests exercise the normal path; the bounds themselves are tested below.
+fn limits() -> QueryLimits {
+    QueryLimits::default()
+}
+
 #[tokio::test]
 async fn sql_filters_and_aggregates_in_place() {
     let (store, manifest) = seeded_table().await;
@@ -72,6 +78,7 @@ async fn sql_filters_and_aggregates_in_place() {
         "logs",
         &files,
         "SELECT service, count(*) AS c FROM logs GROUP BY service ORDER BY service",
+        &limits(),
     )
     .await
     .expect("group-by query");
@@ -98,6 +105,7 @@ async fn sql_filters_and_aggregates_in_place() {
         "logs",
         &files,
         "SELECT count(*) AS c FROM logs WHERE level = 'ERROR' AND status = 200",
+        &limits(),
     )
     .await
     .expect("filtered count");
@@ -117,6 +125,7 @@ async fn trace_id_equality_lookup_returns_the_exact_row() {
         "logs",
         &all_paths(&manifest),
         &format!("SELECT service, message, trace_id FROM logs WHERE trace_id = '{TRACE}'"),
+        &limits(),
     )
     .await
     .expect("trace lookup");
@@ -143,6 +152,7 @@ async fn engine_reads_only_the_registered_file_set() {
         "logs",
         &hot,
         "SELECT count(*) AS c, count(DISTINCT service) AS s FROM logs",
+        &limits(),
     )
     .await
     .expect("hot-only query");
@@ -172,10 +182,10 @@ async fn free_text_pruning_never_changes_results() {
         .collect();
     assert_eq!(pruned.len(), 1, "trigram stats prune to the auth file only");
 
-    let from_pruned = engine::query_table_json(store.clone(), "logs", &pruned, &sql)
+    let from_pruned = engine::query_table_json(store.clone(), "logs", &pruned, &sql, &limits())
         .await
         .expect("pruned query");
-    let from_all = engine::query_table_json(store, "logs", &all, &sql)
+    let from_all = engine::query_table_json(store, "logs", &all, &sql, &limits())
         .await
         .expect("full query");
     assert_eq!(from_pruned.len(), 20, "all auth rows found");
@@ -191,7 +201,7 @@ async fn arrow_wire_is_view_free_and_matches_the_json_path() {
     let files = all_paths(&manifest);
     let sql = "SELECT ts, level, service, message FROM logs ORDER BY ts, service";
 
-    let buf = engine::query_table_arrow(store.clone(), "logs", &files, sql)
+    let buf = engine::query_table_arrow(store.clone(), "logs", &files, sql, &limits())
         .await
         .expect("arrow query");
     let reader = StreamReader::try_new(Cursor::new(&buf), None).expect("ipc stream");
@@ -206,7 +216,7 @@ async fn arrow_wire_is_view_free_and_matches_the_json_path() {
     }
     let arrow_rows: usize = reader.map(|b| b.expect("ipc batch").num_rows()).sum();
 
-    let json_rows = engine::query_table_json(store.clone(), "logs", &files, sql)
+    let json_rows = engine::query_table_json(store.clone(), "logs", &files, sql, &limits())
         .await
         .expect("json query");
     assert_eq!(arrow_rows, 60);
@@ -217,8 +227,148 @@ async fn arrow_wire_is_view_free_and_matches_the_json_path() {
         "logs",
         &files,
         "SELECT * FROM logs WHERE service = 'no-such-service'",
+        &limits(),
     )
     .await
     .expect("empty arrow query");
     assert!(empty.is_empty(), "empty result must be an empty buffer");
+}
+
+// ── Bounded execution (issue #2) ────────────────────────────────────────────
+//
+// The acceptance bar is "oversized queries fail gracefully" — so what these pin
+// is that the failure is a *typed, actionable error* rather than an OOM kill,
+// and that the ceiling is enforced while streaming rather than after the whole
+// result is already resident.
+
+/// A `SELECT *` past the row ceiling is refused, and the error carries the
+/// numbers a client needs to retry sensibly.
+#[tokio::test]
+async fn oversized_result_is_refused_with_a_typed_error() {
+    let (store, manifest) = seeded_table().await;
+    let tight = QueryLimits {
+        max_result_rows: 10, // corpus is 60
+        ..QueryLimits::default()
+    };
+
+    let err = engine::query_table_json(
+        store,
+        "logs",
+        &all_paths(&manifest),
+        "SELECT * FROM logs",
+        &tight,
+    )
+    .await
+    .expect_err("60 rows must not pass a 10-row ceiling");
+
+    let too_large = err
+        .downcast_ref::<ResultTooLarge>()
+        .expect("must be a typed ResultTooLarge, not an opaque error");
+    assert_eq!(too_large.max_rows, 10);
+    assert!(too_large.rows > 10, "reports what it actually accumulated");
+    // The message has to tell the operator what to do about it.
+    let msg = err.to_string();
+    assert!(msg.contains("LIMIT"), "message should suggest a fix: {msg}");
+}
+
+/// The byte ceiling is independent of the row ceiling: a result well under the
+/// row limit is still refused if it is too fat.
+#[tokio::test]
+async fn byte_ceiling_trips_independently_of_the_row_ceiling() {
+    let (store, manifest) = seeded_table().await;
+    let tight = QueryLimits {
+        max_result_rows: u64::MAX, // rows can never trip
+        max_result_bytes: 1,       // ...but one byte certainly will
+        ..QueryLimits::default()
+    };
+
+    let err = engine::query_table_json(
+        store,
+        "logs",
+        &all_paths(&manifest),
+        "SELECT * FROM logs",
+        &tight,
+    )
+    .await
+    .expect_err("a 1-byte ceiling must refuse a 60-row result");
+    let too_large = err.downcast_ref::<ResultTooLarge>().expect("typed error");
+    assert_eq!(too_large.max_bytes, 1);
+    assert!(too_large.bytes > 1);
+}
+
+/// A result exactly at the ceiling is allowed — the limit is a maximum, not a
+/// strict bound, so a `LIMIT 60` against a 60-row table must still work.
+#[tokio::test]
+async fn a_result_exactly_at_the_ceiling_is_allowed() {
+    let (store, manifest) = seeded_table().await;
+    let exact = QueryLimits {
+        max_result_rows: 60,
+        ..QueryLimits::default()
+    };
+
+    let rows = engine::query_table_json(
+        store,
+        "logs",
+        &all_paths(&manifest),
+        "SELECT * FROM logs",
+        &exact,
+    )
+    .await
+    .expect("60 rows must pass a 60-row ceiling");
+    assert_eq!(rows.len(), 60);
+}
+
+/// A tiny execution pool must not break ordinary work: the sort and the GROUP BY
+/// spill to disk rather than fail. This is the difference between "bounded" and
+/// "broken" — the box stays up *and* still answers.
+#[tokio::test]
+async fn a_tiny_memory_pool_still_serves_sorts_and_aggregates() {
+    let (store, manifest) = seeded_table().await;
+    let files = all_paths(&manifest);
+    let squeezed = QueryLimits {
+        memory_pool_bytes: 2 * 1024 * 1024, // 2 MiB to run everything in
+        target_partitions: 1,
+        ..QueryLimits::default()
+    };
+
+    let rows = engine::query_table_json(
+        store.clone(),
+        "logs",
+        &files,
+        "SELECT service, count(*) AS c FROM logs GROUP BY service ORDER BY service",
+        &squeezed,
+    )
+    .await
+    .expect("an aggregate must survive a small pool");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["c"].as_i64(), Some(20));
+
+    let rows = engine::query_table_json(
+        store,
+        "logs",
+        &files,
+        "SELECT ts, service FROM logs ORDER BY ts DESC, service",
+        &squeezed,
+    )
+    .await
+    .expect("a sort must survive a small pool");
+    assert_eq!(rows.len(), 60);
+}
+
+/// The config knobs are what an operator actually turns; they must land on the
+/// limits the engine enforces.
+#[tokio::test]
+async fn limits_are_derived_from_the_config_knobs() {
+    let cfg = verdigris_core::config::QueryConfig {
+        memory_pool_mib: 64,
+        max_result_rows: 123,
+        max_result_mib: 2,
+        cores: 3,
+        ..Default::default()
+    };
+    let l = QueryLimits::from_config(&cfg);
+    assert_eq!(l.memory_pool_bytes, 64 * 1024 * 1024);
+    assert_eq!(l.max_result_rows, 123);
+    assert_eq!(l.max_result_bytes, 2 * 1024 * 1024);
+    assert_eq!(l.target_partitions, 3);
 }
