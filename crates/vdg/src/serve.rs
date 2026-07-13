@@ -1931,7 +1931,7 @@ async fn h_cost(State(st): State<AppState>, Query(q): Query<CostQuery>) -> ApiRe
         let hist = st.query_history.lock().await;
         let now = crate::now_millis();
         let mut recs: Vec<&QueryRecord> = hist.iter().collect();
-        recs.sort_by(|a, b| b.scanned_bytes.cmp(&a.scanned_bytes));
+        recs.sort_by_key(|r| std::cmp::Reverse(r.scanned_bytes));
         recs.into_iter()
             .take(5)
             .map(|r| {
