@@ -189,7 +189,7 @@ production install can separate the single manifest **writer** from the stateles
 The Helm chart renders this automatically for the S3 backend and keeps a single `--role
 all` pod for the local demo. Optional bearer-token auth gates the `/v1/*` surface; the
 static UI and `/config.json` stay open so the UI can boot. See
-[`../deploy/README.md`](../deploy/README.md).
+[`deploy/README.md`](https://github.com/explise/verdigris/blob/main/deploy/README.md).
 
 ## HTTP API
 

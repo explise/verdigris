@@ -49,7 +49,7 @@ The prototype is the reference; `web/` is where the real product goes. Both rend
 - Contract is typed in `lib/types.ts` — the authoritative shape spec.
 
 ### Cross-cutting
-- **Backend integration probed** end-to-end; results + punch list in `BACKEND_TODO.md` (backend agent has resolved most; see that file).
+- **Backend integration probed** end-to-end; remaining gaps are tracked as GitHub issues (see epic #34).
 - Engine label aligned to **`datafusion`** (ADR-001) across both UIs and mocks.
 - Pricing/contract docs: product spec in `CLAUDE.md`; frontend pointer section added there.
 
@@ -75,7 +75,7 @@ The prototype is the reference; `web/` is where the real product goes. Both rend
 12. **Logo is a placeholder glyph** — needs a real verdigris/patina mark.
 13. **Real-engine footer copy** — UI now reads `stats.engine`; confirm product wants "datafusion" surfaced to users vs a friendlier label.
 
-### Depends on backend (tracked in `BACKEND_TODO.md`)
+### Depends on backend (tracked as GitHub issues)
 14. ~~**`/v1/tail` streaming (SSE/WebSocket)**~~ **DONE (2026-07-04).** Backend serves `GET /v1/tail` as SSE; `web/` Live Tail consumes it via `EventSource` (falls back to the mock ticker in mock mode). Note: `EventSource` can't send an `Authorization` header — front a token via query param / ingress auth when `[auth]` is on.
 15. **`scanGB` time-range pruning** in the cost estimator (backend note: still tier-total, doesn't prune by the query's time window).
 16. **`expensiveQueries`** populated once query-history tracking exists; **`p99`** is modeled until logs carry a latency field.
@@ -92,6 +92,6 @@ The prototype is the reference; `web/` is where the real product goes. Both rend
 ## Where things live
 - Product spec & principles → `CLAUDE.md`
 - Prototype contract / how to extend → `frontend/AGENTS.md`
-- Web app contract / seams → this doc + `web/RESUME.md` + inline headers in `web/src/lib/*`
-- Backend punch list → `BACKEND_TODO.md`
+- Web app contract / seams → this doc + inline headers in `web/src/lib/*`
+- Backend gaps → GitHub issues (epic #34)
 - Data contract (authoritative shapes) → `web/src/lib/types.ts`

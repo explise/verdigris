@@ -36,10 +36,8 @@ jobs:
           python-version: "3.12"
       # Pinned to the versions the site was authored against; bump deliberately.
       - run: pip install mkdocs==1.6.1 mkdocs-material==9.7.6
-      # Not --strict yet: contributing.md/ARCHITECTURE.md carry 5 known links to
-      # repo files outside docs/ that strict mode rejects. Fix those, then
-      # tighten this to `mkdocs build --strict`.
-      - run: mkdocs build --site-dir _site
+      # --strict: any broken in-site link fails the deploy instead of shipping a 404.
+      - run: mkdocs build --strict --site-dir _site
       - uses: actions/upload-pages-artifact@v3
 
   deploy:
