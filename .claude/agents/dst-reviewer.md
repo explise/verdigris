@@ -24,26 +24,50 @@ The four seams: `ObjectStore`, `Clock`, `ScanExecutor`, `Rng`.
 The discipline rules apply to the **core control plane**, not to every line in the
 workspace. Before flagging anything, establish which layer the code is in.
 
-**Core / control plane — rules apply strictly:**
+The invariant is not "core is exempt where the seams live." It is the opposite, and
+sharper:
+
+> **Core holds seam *traits* and their *deterministic* implementations only.
+> Every real, nondeterministic implementation lives in the shell.**
+
+`crates/vdg/src/realclock.rs` states this in its own doc comment: *"Lives in the
+shell (not core) so the core stays free of any real time source."*
+
+**Core / control plane — rules apply strictly, with no seam exemption:**
 - `crates/core`, `crates/storage`, `crates/query`, `crates/ingest`
-- Any logic that DST must simulate: ingest batching, compaction scheduling, the
-  tiering state machine, Glacier restore workflow, Iceberg catalog/planner, the
-  cost estimator, scan fan-out
+- Any logic DST must simulate: ingest batching, compaction scheduling, the tiering
+  state machine, Glacier restore workflow, Iceberg catalog/planner, the cost
+  estimator, scan fan-out
+- This includes the seam-defining files themselves. `core/src/clock.rs` holds the
+  `Clock` trait and `SimClock`; `core/src/rng.rs` holds the `Rng` trait and
+  `SeededRng`. Neither calls a real time source or real entropy today, and neither
+  should. **A genuine `SystemTime::now()` appearing in `core/src/clock.rs` is a
+  violation, not an exemption** — it would mean a real time source had migrated
+  into core.
 
-**Seam implementations — the rules' explicit exceptions:**
-- `crates/core/src/clock.rs` *is* the `Clock` seam. `SystemTime::now()` there is
-  the point, not a violation.
-- `crates/core/src/rng.rs` *is* the `Rng` seam. Same.
-
-**Shell / binary — rules apply loosely:**
-- `crates/vdg` (`main.rs`, `serve.rs`) is the outer shell: CLI parsing, HTTP
-  handlers, request-timing telemetry. As of this writing it legitimately contains
-  `SystemTime::now()`, `Instant::now()`, and `rand::thread_rng()`. Those are **not**
-  findings on their own.
+**Shell / binary — real impls belong here:**
+- `crates/vdg` (`main.rs`, `serve.rs`, `realclock.rs`) — CLI parsing, HTTP
+  handlers, request-timing telemetry, and the production seam impls.
 
 Flag shell code only when control-plane *logic* has leaked into it — a scheduling
 decision, a tiering transition, or a cost computation that DST ought to be able to
 simulate but now can't because it reads the wall clock directly.
+
+### Known-legitimate hits — do not report these
+
+Verified against the tree; a grep of the ADR's rules surfaces exactly these, and
+every one is correct as written:
+
+| Location | Why it is fine |
+|---|---|
+| `core/src/clock.rs:2`, `core/src/rng.rs:2` | `//!` doc comments *naming* the banned calls to explain the rule. Not code. |
+| `vdg/src/realclock.rs:16` | The production `Clock` impl. Reading the wall clock is its entire job, and it lives in the shell precisely so core doesn't. |
+| `vdg/src/main.rs:278,447` | CLI-level timestamps in the shell. |
+| `vdg/src/serve.rs:343,1345` | HTTP request-latency telemetry in the shell. |
+| `vdg/src/serve.rs:1132` | `gen_secret()` mints a 256-bit auth token. This **must** use OS entropy — routing it through the injected seeded `Rng` would make auth tokens reproducible from a seed. Never "fix" this one. |
+
+Treat this table as calibration, not as a whitelist to trust blindly: verify the
+line still does what the table claims before dismissing it, since line numbers drift.
 
 ## What to flag
 
