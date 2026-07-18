@@ -22,29 +22,48 @@ restate it:
 **One entry point.** Do not hand-assemble command lists — they drift from CI.
 
 ```sh
-scripts/verify.sh <path>...       # checks relevant to those paths; sub-3s
+scripts/verify.sh [--] <path>...  # checks relevant to those paths; sub-3s
 scripts/verify.sh --all           # the full gate set; minutes
 scripts/verify.sh --all rust      # or: web | docs
 scripts/verify.sh --help
 ```
 
-Exit 0 = passed. Exit 1 = failed, with output on stderr.
+Paths may be absolute or relative to your current directory — running it from
+inside `web/` or `crates/` works.
 
-`.github/workflows/` runs the same commands. If you add a check, add it there and in
-`scripts/verify.sh` together, or the two silently diverge.
+| Exit | Meaning |
+|---|---|
+| `0` | Every applicable check ran and passed. |
+| `1` | A check failed; details on stderr. |
+| `2` | **INCOMPLETE** — a check could not run (missing toolchain). Nothing was verified for that area, so this is deliberately not success. |
+
+Exit 2 matters: a machine without `cargo` must not be able to run
+`scripts/verify.sh --all` and be told everything is fine. An unrun check is not a
+passed check.
+
+`.github/workflows/` runs the same *commands*. It does **not** run the same
+*toolchain versions* — CI pins node 20 and exact mkdocs versions; this script uses
+whatever is on your PATH, and warns on a detectable node major-version mismatch. A
+green run here means "these checks passed with my toolchain", not "CI will be
+green."
+
+If you add a check, add it to `scripts/verify.sh` **and** `.github/workflows/`
+together, or the two silently diverge.
 
 Per-path routing mirrors the workflows' `paths:` filters:
 
 | Edited | Runs | Time |
 |---|---|---|
-| `crates/**` | `cargo fmt --all` | ~0.4s |
+| `crates/**` | `rustfmt` on the named files | ~0.4s |
 | `web/**` | `npm run typecheck` | ~2.3s |
 | `frontend/**` | `node frontend/_verify.js` | ~0.8s |
 
 Two deliberate asymmetries, so nobody "fixes" them:
 
-- **`cargo fmt` rewrites rather than `--check`s in per-path mode, and never fails.**
-  Formatting is not worth interrupting an edit over. CI's `--check` lane is the gate.
+- **Per-path mode formats rather than `--check`s, and never fails.** Formatting is
+  not worth interrupting an edit over; CI's `cargo fmt --all -- --check` lane is the
+  gate. It runs `rustfmt` on the *named files only* — `cargo fmt --all` would rewrite
+  the whole workspace, so editing one file would silently mutate unrelated crates.
 - **The heavy lanes are not in per-path mode.** The three-lane test matrix and both
   clippy lanes only run under `--all`. Too slow for every edit.
 
@@ -120,16 +139,18 @@ the production seam impls.
 ### 2.3 Known-legitimate hits — do not report these
 
 Grepping the rules above surfaces exactly these. Every one is correct as written.
-Verified against the tree; line numbers drift, so confirm the line still does what
-this says before dismissing it.
 
-| Location | Why it is fine |
+Identified by symbol, not line number, so the table survives edits. If a grep hit
+is in a symbol not listed here, it is a candidate finding — do not assume the table
+covers it.
+
+| Symbol | Why it is fine |
 |---|---|
-| `core/src/clock.rs:2`, `core/src/rng.rs:2` | `//!` doc comments *naming* the banned calls to explain the rule. Not code. |
-| `vdg/src/realclock.rs:16` | The production `Clock` impl. Reading the wall clock is its job; it lives in the shell so core needn't. |
-| `vdg/src/main.rs:278,447` | CLI-level timestamps, in the shell. |
-| `vdg/src/serve.rs:343,1345` | HTTP request-latency telemetry, in the shell. |
-| `vdg/src/serve.rs:1132` | `gen_secret()` mints a 256-bit auth token. **Must** use OS entropy — routing it through the seeded `Rng` would make auth tokens reproducible from a seed. Never "fix" this one. |
+| `core/src/clock.rs`, `core/src/rng.rs` — module `//!` headers | Doc comments *naming* the banned calls to explain the rule. Not code. The rest of both files must stay clean. |
+| `RealClock::now_millis` (`vdg/src/realclock.rs`) | The production `Clock` impl. Reading the wall clock is its job; it lives in the shell so core needn't. |
+| `now_millis()`, `gen_anchored()` (`vdg/src/main.rs`) | CLI-level timestamps and seeded sample generation, in the shell. |
+| `track_metrics()`, `h_query()` (`vdg/src/serve.rs`) | HTTP request-latency telemetry, in the shell. |
+| `gen_secret()` (`vdg/src/serve.rs`) | Mints a 256-bit auth token. **Must** use OS entropy — routing it through the seeded `Rng` would make auth tokens reproducible from a seed. Never "fix" this one. |
 
 ### 2.4 What a green DST run does and does not prove
 
