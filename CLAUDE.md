@@ -2,6 +2,11 @@
 
 > The layer your infrastructure leaves behind.
 
+**Before changing code, read [`AGENTS.md`](AGENTS.md)** — the tool-neutral contract
+covering how to verify a change (`scripts/verify.sh`) and the DST discipline rules
+that are easy to violate by accident. This file is the product brief: read it for
+*what* Verdigris is and why. `AGENTS.md` is *how to work on it*.
+
 Verdigris is a plug-and-play, S3-native log storage and query engine written in
 Rust. It is a Datadog-replacement for teams who want their log data to stay in
 **their own cloud account** — no per-GB ingestion margin, no rehydration toll,

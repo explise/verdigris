@@ -1,64 +1,36 @@
 ---
-description: Run the full CI gate set locally — every lane from .github/workflows/ — and report what fails.
+description: Run the full CI gate set locally via scripts/verify.sh and report what fails.
 argument-hint: "[rust|web|docs]  (omit to run everything)"
 allowed-tools: Bash, Read, Grep, Glob, Edit
 ---
 
-Reproduce locally exactly what CI runs, so a push doesn't come back red.
+Run every gate CI runs, so a push doesn't come back red.
 
-Scope: `$ARGUMENTS` — if empty, run all three groups. If it names `rust`, `web`, or
-`docs`, run only that group.
-
-The PostToolUse hook in this repo already runs the *fast* per-file checks on every
-edit (`cargo fmt` on `crates/**`, typecheck on `web/**`, `_verify.js` on
-`frontend/**`). This command covers what the hook deliberately leaves out: the
-feature matrix, clippy, and the production builds.
-
-## rust — mirrors `.github/workflows/rust.yml`
-
-```
-cargo fmt --all -- --check
-cargo test --workspace
-cargo test --workspace --features vdg/datafusion
-cargo test --workspace --features vdg/serve
-cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy --workspace --all-targets --features vdg/serve -- -D warnings
-cargo check -p vdg --features apply
+```sh
+scripts/verify.sh --all $ARGUMENTS
 ```
 
-Why the matrix matters, from the workflow's own comment: the default build has **no
-query engine**, so code behind `datafusion`/`serve` is *invisible* to a
-default-features run. A broken example and three clippy warnings once hid exactly
-there. Do not shortcut to `cargo test --workspace` alone and call it green.
+If `$ARGUMENTS` is empty this runs all three groups (rust, web, docs); otherwise it
+runs just the named one. Exit 0 = passed, exit 1 = failed with output on stderr.
 
-`check-apply` is type-check only — its runtime needs real AWS, but it must not rot
-to the point of not compiling.
+`scripts/verify.sh` is the single source of truth for what must pass — the same
+script CI, other agents, and humans use. **Do not expand the command list inline
+here**; if a check is missing, add it to `scripts/verify.sh` and
+`.github/workflows/` together, or the two will silently diverge.
 
-## web — mirrors `.github/workflows/web.yml`
+The edit-time hook already runs the fast per-file checks. This covers what it
+deliberately skips: the three-lane test matrix, both clippy lanes, `check-apply`,
+the production web build, and `mkdocs --strict`.
 
-```
-cd web && npm ci && npm run typecheck && npm run build
-node frontend/_verify.js
-```
-
-`frontend/` is dependency-free by design — plain node, no install step. Don't add one.
-
-## docs — mirrors `.github/workflows/docs.yml`
-
-```
-mkdocs build --strict
-```
-
-`--strict` makes any broken in-site link fail rather than shipping a 404. Requires
-`mkdocs==1.6.1` + `mkdocs-material==9.7.6`; if mkdocs isn't installed locally, say
-so and skip this group rather than installing it unasked.
+Context worth carrying into your report — see `AGENTS.md` §1: the default build has
+no query engine, so `cargo test --workspace` alone is *not* green. The matrix is
+load-bearing.
 
 ## Reporting
 
-Run the groups and report a compact pass/fail table, then the actual error output
-for anything that failed — not a summary of it. If everything passes, say so in one
-line.
+Report a compact pass/fail table, then the actual error output for failures — not a
+summary of it. If everything passes, say so in one line.
 
 Fix failures only if they are clearly incidental to work already in progress this
-session. Otherwise report them and ask — a failing lane may be a real bug worth
-discussing rather than something to paper over.
+session. Otherwise report and ask: a failing lane may be a real bug worth discussing
+rather than something to paper over.
