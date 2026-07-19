@@ -54,7 +54,12 @@ async fn seeded_table() -> (Arc<dyn ObjectStore>, Manifest) {
         .await
         .expect("ingest");
     assert_eq!(written.len(), 3, "one file per tier");
-    let manifest = ingestor.load_manifest().await.expect("manifest");
+    // Hydrated: these tests exercise the pruning path, and trigrams now live in
+    // a sidecar that only text queries fetch (see Ingestor::load_manifest_for).
+    let manifest = ingestor
+        .load_manifest_with_trigrams()
+        .await
+        .expect("manifest");
     (store, manifest)
 }
 

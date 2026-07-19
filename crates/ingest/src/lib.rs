@@ -19,7 +19,7 @@ use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 use verdigris_core::batch::{BatchPolicy, Batcher, LogRecord};
 use verdigris_core::config::RoutingConfig;
-use verdigris_core::manifest::{DataFile, Manifest};
+use verdigris_core::manifest::{DataFile, Manifest, Predicate, TrigramIndex};
 use verdigris_core::model::Tier;
 
 pub use encode::FileStats;
@@ -78,6 +78,98 @@ impl Ingestor {
 
     fn manifest_path(&self) -> ObjPath {
         ObjPath::from(format!("{}/_metadata/manifest.json", self.table))
+    }
+
+    fn trigrams_path(&self) -> ObjPath {
+        ObjPath::from(format!("{}/_metadata/trigrams.json", self.table))
+    }
+
+    /// Load the trigram sidecar, or an empty one if it does not exist yet.
+    ///
+    /// Only queries carrying a text predicate need this; everything else reads
+    /// the manifest alone and never pays for it. A missing or unreadable sidecar
+    /// is not an error — it yields an empty index, which means "no text pruning",
+    /// the conservative direction.
+    pub async fn load_trigrams(&self) -> anyhow::Result<TrigramIndex> {
+        match self.store.get(&self.trigrams_path()).await {
+            Ok(res) => {
+                let bytes = res.bytes().await.context("reading trigram sidecar")?;
+                Ok(serde_json::from_slice(&bytes).unwrap_or_default())
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(TrigramIndex::default()),
+            Err(e) => Err(e).context("loading trigram sidecar"),
+        }
+    }
+
+    /// Load the manifest with trigram sets attached. Use this only for queries
+    /// with a `MessageContains` predicate; [`Self::load_manifest`] is the cheap
+    /// path everything else should take.
+    pub async fn load_manifest_with_trigrams(&self) -> anyhow::Result<Manifest> {
+        let mut m = self.load_manifest().await?;
+        m.hydrate_trigrams(&self.load_trigrams().await?);
+        Ok(m)
+    }
+
+    /// Load the manifest, fetching the trigram sidecar only if `preds` can
+    /// actually use it.
+    ///
+    /// One decision point rather than a judgement call at every query site —
+    /// the same reasoning that makes `select_files` the single pruning choke
+    /// point. Forgetting to hydrate is not a correctness bug (unhydrated
+    /// trigrams simply never prune) but it is a silent performance cliff, and
+    /// silent is the part worth designing out.
+    pub async fn load_manifest_for(&self, preds: &[Predicate]) -> anyhow::Result<Manifest> {
+        let needs_text = preds
+            .iter()
+            .any(|p| matches!(p, Predicate::MessageContains(_)));
+        if needs_text {
+            self.load_manifest_with_trigrams().await
+        } else {
+            self.load_manifest().await
+        }
+    }
+
+    /// Merge `add` into the sidecar and write it back.
+    ///
+    /// Deliberately a plain put with no compare-and-swap. Entries are keyed by
+    /// file path and data files are immutable, so two writers can only ever add
+    /// disjoint or identical entries — there is no value to lose. The cost of a
+    /// lost race is a missing entry, which means "does not prune", which is safe.
+    /// Writing this *before* the manifest commit keeps that true: a sidecar can
+    /// run ahead of the manifest (harmless orphans) but should not lag it.
+    async fn merge_trigrams(&self, add: &TrigramIndex) -> anyhow::Result<()> {
+        if add.is_empty() {
+            return Ok(());
+        }
+        let mut idx = self.load_trigrams().await?;
+        for (path, set) in &add.by_path {
+            idx.insert(path.clone(), set.clone());
+        }
+        let bytes = serde_json::to_vec(&idx).context("serializing trigram sidecar")?;
+        self.store
+            .put(&self.trigrams_path(), bytes.into())
+            .await
+            .context("writing trigram sidecar")?;
+        Ok(())
+    }
+
+    /// Drop sidecar entries whose files are no longer in `manifest`.
+    ///
+    /// Only safe to call after the manifest naming those files is committed —
+    /// see the call site in `compact_bounded`.
+    async fn prune_trigrams(&self, manifest: &Manifest) -> anyhow::Result<()> {
+        let mut idx = self.load_trigrams().await?;
+        let before = idx.len();
+        idx.retain_paths(manifest);
+        if idx.len() == before {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(&idx).context("serializing trigram sidecar")?;
+        self.store
+            .put(&self.trigrams_path(), bytes.into())
+            .await
+            .context("writing trigram sidecar")?;
+        Ok(())
     }
 
     /// Load the table manifest, or an empty one if the table is new.
@@ -151,6 +243,17 @@ impl Ingestor {
     /// concurrency: load → merge (skipping any path already present, so a retry or
     /// a content-hash duplicate can't double-count) → commit; retry on conflict.
     async fn append_files(&self, files: &[DataFile]) -> anyhow::Result<()> {
+        // Sidecar first: it may run ahead of the manifest (an entry for a file
+        // not yet listed is simply never looked up), but must not lag it, or a
+        // text query could miss pruning it was entitled to.
+        let mut incoming = TrigramIndex::default();
+        for f in files {
+            if let Some(t) = &f.message_trigrams {
+                incoming.insert(f.path.clone(), t.clone());
+            }
+        }
+        self.merge_trigrams(&incoming).await?;
+
         for _ in 0..MAX_COMMIT_RETRIES {
             let (mut manifest, base) = self.load_manifest_versioned().await?;
             let existing: HashSet<String> = manifest.files.iter().map(|f| f.path.clone()).collect();
@@ -388,6 +491,17 @@ impl Ingestor {
                 });
             }
 
+            // Sidecar for the newly written files, before the manifest points at
+            // them. Retired paths are left in place: they are cleaned up on the
+            // next successful commit, and an orphan entry is never consulted.
+            let mut incoming = TrigramIndex::default();
+            for f in &new_files {
+                if let Some(t) = &f.message_trigrams {
+                    incoming.insert(f.path.clone(), t.clone());
+                }
+            }
+            self.merge_trigrams(&incoming).await?;
+
             // Point the manifest at the new layout and commit under CAS.
             manifest.files = new_files;
             manifest.compaction_gen = generation + 1;
@@ -396,6 +510,14 @@ impl Ingestor {
                 for path in to_delete {
                     let _ = self.store.delete(&ObjPath::from(path)).await;
                 }
+                // Drop sidecar entries for the paths just retired, so it does not
+                // grow without bound as compaction rewrites files.
+                //
+                // Strictly AFTER the commit: pruning first could delete an entry
+                // the still-live manifest references, and a lost entry means a
+                // text query stops pruning that file. Best-effort — a failure
+                // leaves orphans, which are never consulted.
+                let _ = self.prune_trigrams(&manifest).await;
                 return Ok((reports, more));
             }
             // Conflict: reload and redo against the fresh manifest.
@@ -846,7 +968,30 @@ mod tests {
         .await
         .unwrap();
 
-        let m = ing.load_manifest().await.unwrap();
+        // The lean path: a manifest load carries no trigram payload at all.
+        // This is the point of the sidecar — a non-text query never pays for it.
+        let lean = ing.load_manifest().await.unwrap();
+        assert_eq!(lean.files.len(), 2);
+        assert!(
+            lean.files.iter().all(|f| f.message_trigrams.is_none()),
+            "load_manifest must not carry trigrams; they belong in the sidecar"
+        );
+        // ...and without them, a text predicate prunes nothing. Conservative, not
+        // wrong: every file survives, so no real match can be dropped.
+        assert_eq!(
+            select_files(
+                &lean,
+                &[Tier::Hot],
+                None,
+                &[Predicate::message_contains("timeout")]
+            )
+            .len(),
+            2,
+            "unhydrated trigrams must not prune"
+        );
+
+        // The text path: hydrate from the sidecar, then prune as before.
+        let m = ing.load_manifest_with_trigrams().await.unwrap();
         assert_eq!(m.files.len(), 2);
         assert!(m.files.iter().all(|f| f.message_trigrams.is_some()));
 
@@ -888,7 +1033,7 @@ mod tests {
         // Compaction merges both files and recomputes the trigram set from the
         // merged rows — both vocabularies still match, absent terms still prune.
         ing.compact(10 * 1024 * 1024).await.unwrap();
-        let m = ing.load_manifest().await.unwrap();
+        let m = ing.load_manifest_with_trigrams().await.unwrap();
         assert_eq!(m.files.len(), 1, "one compacted hot file");
         for term in ["timeout", "ointer"] {
             assert_eq!(
@@ -904,9 +1049,73 @@ mod tests {
             &[Predicate::message_contains("kubelet")]
         )
         .is_empty());
-        // The recorded stat also round-trips the manifest JSON (base64 bitmap).
+        // The recorded stat round-trips the sidecar JSON (base64 bitmap).
         let t = m.files[0].message_trigrams.as_ref().unwrap();
         assert_eq!(t.contains_term("db-primary"), Some(true));
+
+        // Compaction retires the pre-merge paths. The sidecar keeps only live
+        // entries, so it does not grow without bound as files are rewritten.
+        let idx = ing.load_trigrams().await.unwrap();
+        assert_eq!(
+            idx.len(),
+            1,
+            "sidecar should hold exactly the live compacted file"
+        );
+    }
+
+    /// `load_manifest_for` is the one place that decides whether to pay for the
+    /// sidecar, so it gets its own test: text predicates hydrate, everything
+    /// else stays lean.
+    #[tokio::test]
+    async fn load_manifest_for_fetches_trigrams_only_when_text_can_use_them() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ing = Ingestor::new(store, "logs");
+        let routing = RoutingConfig::default();
+        let policy = BatchPolicy::default();
+        ing.ingest(
+            vec![LogRecord {
+                ts_millis: 1,
+                level: verdigris_core::model::Level::Error,
+                service: "auth".into(),
+                status: Some(500),
+                message: "connection timeout to db-primary".into(),
+                trace_id: None,
+                attrs: Default::default(),
+            }],
+            &routing,
+            policy,
+        )
+        .await
+        .unwrap();
+
+        // No predicates at all, and non-text predicates: stay lean.
+        for preds in [vec![], vec![Predicate::service("auth")]] {
+            let m = ing.load_manifest_for(&preds).await.unwrap();
+            assert!(
+                m.files.iter().all(|f| f.message_trigrams.is_none()),
+                "non-text query must not fetch the trigram sidecar"
+            );
+        }
+
+        // A text predicate: hydrate.
+        let m = ing
+            .load_manifest_for(&[Predicate::message_contains("timeout")])
+            .await
+            .unwrap();
+        assert!(
+            m.files.iter().all(|f| f.message_trigrams.is_some()),
+            "text query must hydrate trigrams"
+        );
+
+        // Mixed: one text predicate is enough.
+        let m = ing
+            .load_manifest_for(&[
+                Predicate::service("auth"),
+                Predicate::message_contains("timeout"),
+            ])
+            .await
+            .unwrap();
+        assert!(m.files.iter().all(|f| f.message_trigrams.is_some()));
     }
 
     #[tokio::test]

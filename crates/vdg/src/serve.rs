@@ -449,6 +449,21 @@ async fn manifest(st: &AppState) -> anyhow::Result<(Store, Manifest)> {
     Ok((s, m))
 }
 
+/// Like [`manifest`], but fetches the trigram sidecar when `preds` can use it.
+///
+/// Query paths take this so a plain `service:`/`level:`/time query never pays to
+/// load trigrams it will not consult.
+async fn manifest_for(
+    st: &AppState,
+    preds: &[verdigris_core::manifest::Predicate],
+) -> anyhow::Result<(Store, Manifest)> {
+    let s = store(st)?;
+    let m = verdigris_ingest::Ingestor::new(s.clone(), st.table.as_str())
+        .load_manifest_for(preds)
+        .await?;
+    Ok((s, m))
+}
+
 // ───────────────────────── alerting ─────────────────────────
 
 fn alerts_path(table: &str) -> ObjPath {
@@ -1366,7 +1381,10 @@ async fn h_query(
 ) -> Result<Response, AppError> {
     let arrow = wants_arrow(&headers);
     st.metrics.queries.fetch_add(1, Ordering::Relaxed);
-    let (s, m) = manifest(&st).await?;
+    // Predicates first: they decide whether the trigram sidecar is worth
+    // fetching, so the manifest load can skip it for non-text queries.
+    let preds = verdigris_core::search::stat_predicates(&req.sql);
+    let (s, m) = manifest_for(&st, &preds).await?;
 
     // Scope the scan to the requested tiers + the query's time window — the SAME
     // selection `POST /v1/query/estimate` prices (`core::estimate::select_files`),
@@ -1380,7 +1398,6 @@ async fn h_query(
     // `service:`/`level:` equality in the query skips files proven free of the
     // value — the SAME predicates the estimate prunes on, so quote and scan stay
     // in lockstep. (Empty for raw SQL; those files prune by tier+window only.)
-    let preds = verdigris_core::search::stat_predicates(&req.sql);
     let selected = verdigris_core::estimate::select_files(&m, &tiers, window, &preds);
     if selected.is_empty() {
         let stats = json!({ "events": 0, "scannedBytes": 0, "elapsedMs": 0, "engine": "datafusion", "files": 0 });
@@ -1694,7 +1711,12 @@ struct EstimateReq {
 }
 
 async fn h_estimate(State(st): State<AppState>, Json(req): Json<EstimateReq>) -> ApiResult {
-    let (_s, m) = manifest(&st).await?;
+    let preds = req
+        .sql
+        .as_deref()
+        .map(verdigris_core::search::stat_predicates)
+        .unwrap_or_default();
+    let (_s, m) = manifest_for(&st, &preds).await?;
     let tiers: Vec<Tier> = req.tiers.iter().filter_map(|t| parse_tier(t)).collect();
 
     // Prune by the query's time window (metadata-only).
@@ -1705,12 +1727,6 @@ async fn h_estimate(State(st): State<AppState>, Json(req): Json<EstimateReq>) ->
 
     // …and by `service:`/`level:` equality, the same file-level pruning the
     // executed query applies — so the quote prices exactly what the scan reads.
-    let preds = req
-        .sql
-        .as_deref()
-        .map(verdigris_core::search::stat_predicates)
-        .unwrap_or_default();
-
     // Provisioned throughput = cores × per-core rate (the storage/compute dial).
     let throughput =
         st.cfg.query.modeled_mibps_per_core * st.cfg.query.cores as f64 * 1024.0 * 1024.0;
