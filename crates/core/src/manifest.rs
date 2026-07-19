@@ -74,6 +74,16 @@ pub struct DataFile {
     /// Distinct `level` values in this file (sorted, deduped). Empty = not recorded.
     #[serde(default)]
     pub levels: Vec<String>,
+    /// Row groups in this Parquet file. `0` = not recorded (a file predating the
+    /// row-group index), which disables row-group pruning for it.
+    ///
+    /// Recorded here, in the manifest, specifically because the row-group trigram
+    /// sets live in the *sidecar*: two objects, written at different times by
+    /// different code paths. Cross-checking one against the other is what makes
+    /// [`DataFile::row_groups_to_scan`]'s length guard mean something rather than
+    /// compare the index against itself.
+    #[serde(default)]
+    pub row_groups: u64,
     /// Character-trigram presence set over this file's `message` column, letting
     /// a free-text search skip the file when a trigram of the term is provably
     /// absent. `None` = not loaded or not recorded — **never prunes**. See
@@ -90,6 +100,16 @@ pub struct DataFile {
     /// to hydrate simply does not prune on text. Slower, never wrong.
     #[serde(skip)]
     pub message_trigrams: Option<TrigramSet>,
+    /// The same trigram idea one level down: one set per **row group**, in row-group
+    /// order. Lets a surviving file be scanned partially — file-level pruning stops
+    /// paying exactly when compaction makes files big, which is when grep hurts most.
+    ///
+    /// `None` = not loaded or not recorded, and an entry whose length disagrees with
+    /// the file's actual row-group count is treated the same way (see
+    /// [`DataFile::row_groups_to_scan`]). Sidecar-backed and `#[serde(skip)]` for the
+    /// same reasons as [`DataFile::message_trigrams`].
+    #[serde(skip)]
+    pub row_group_trigrams: Option<Vec<TrigramSet>>,
 }
 
 impl DataFile {
@@ -118,6 +138,50 @@ impl DataFile {
                 Some(t) => t.contains_term(term).unwrap_or(true),
             },
         })
+    }
+
+    /// Which of this file's row groups can hold a row satisfying `preds`?
+    ///
+    /// Returns `Some(mask)` — `mask[i] == false` proving row group `i` matchless —
+    /// or `None` meaning "no usable index, scan the whole file". The mask is only
+    /// ever an input to a skip decision, so the two ways of saying "don't know"
+    /// (`None` here, `true` in the mask) both degrade to scanning.
+    ///
+    /// `actual_row_groups` is the count read from the Parquet footer, and it must
+    /// match the recorded index exactly. A mismatch means the index describes a
+    /// *different* file than the one about to be read — a path collision, a
+    /// half-written sidecar, a writer change — and applying it would skip row groups
+    /// by index into the wrong file, which is the one failure mode that loses real
+    /// matches rather than merely costing a scan. So a mismatch reads as "not
+    /// recorded", never as a partial license.
+    ///
+    /// Only `MessageContains` narrows the mask. Equality predicates are already
+    /// handled inside Parquet by the bloom filters on `service`/`level`/`trace_id`,
+    /// which prune row groups better than a per-row-group value list would.
+    pub fn row_groups_to_scan(
+        &self,
+        preds: &[Predicate],
+        actual_row_groups: usize,
+    ) -> Option<Vec<bool>> {
+        let rgs = self.row_group_trigrams.as_ref()?;
+        if rgs.len() != actual_row_groups {
+            return None;
+        }
+        let terms: Vec<&str> = preds
+            .iter()
+            .filter_map(|p| match p {
+                Predicate::MessageContains(t) => Some(t.as_str()),
+                Predicate::Equals { .. } => None,
+            })
+            .collect();
+        if terms.is_empty() {
+            return None;
+        }
+        Some(
+            rgs.iter()
+                .map(|set| terms.iter().all(|t| set.contains_term(t).unwrap_or(true)))
+                .collect(),
+        )
     }
 }
 
@@ -152,11 +216,20 @@ pub struct TrigramIndex {
     /// Keyed by [`DataFile::path`].
     #[serde(default)]
     pub by_path: BTreeMap<String, TrigramSet>,
+    /// Per-row-group sets, same keying, in row-group order.
+    ///
+    /// A separate map rather than a richer value type in `by_path`, so a sidecar
+    /// written before row-group indexes existed still deserializes: the field is
+    /// simply absent and every file reads as "row groups not recorded". The
+    /// duplicated path keys cost a little JSON and buy a format change that cannot
+    /// break a reader in either direction.
+    #[serde(default)]
+    pub row_groups_by_path: BTreeMap<String, Vec<TrigramSet>>,
 }
 
 impl TrigramIndex {
     pub fn is_empty(&self) -> bool {
-        self.by_path.is_empty()
+        self.by_path.is_empty() && self.row_groups_by_path.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -167,6 +240,10 @@ impl TrigramIndex {
         self.by_path.insert(path.into(), set);
     }
 
+    pub fn insert_row_groups(&mut self, path: impl Into<String>, sets: Vec<TrigramSet>) {
+        self.row_groups_by_path.insert(path.into(), sets);
+    }
+
     /// Drop entries for files no longer in `manifest`, so the sidecar does not
     /// grow forever as compaction retires paths. Only ever called by the writer
     /// that also commits the manifest.
@@ -174,6 +251,8 @@ impl TrigramIndex {
         let live: std::collections::BTreeSet<&str> =
             manifest.files.iter().map(|f| f.path.as_str()).collect();
         self.by_path.retain(|p, _| live.contains(p.as_str()));
+        self.row_groups_by_path
+            .retain(|p, _| live.contains(p.as_str()));
     }
 }
 
@@ -186,6 +265,7 @@ impl Manifest {
     pub fn hydrate_trigrams(&mut self, index: &TrigramIndex) {
         for f in &mut self.files {
             f.message_trigrams = index.by_path.get(&f.path).cloned();
+            f.row_group_trigrams = index.row_groups_by_path.get(&f.path).cloned();
         }
     }
 
@@ -195,6 +275,9 @@ impl Manifest {
         for f in &self.files {
             if let Some(t) = &f.message_trigrams {
                 idx.insert(f.path.clone(), t.clone());
+            }
+            if let Some(rgs) = &f.row_group_trigrams {
+                idx.insert_row_groups(f.path.clone(), rgs.clone());
             }
         }
         idx
@@ -248,6 +331,8 @@ mod tests {
             services: vec![],
             levels: vec![],
             message_trigrams: None,
+            row_groups: 0,
+            row_group_trigrams: None,
         });
         m.add(DataFile {
             path: "logs/hot/part-1.parquet".into(),
@@ -259,6 +344,8 @@ mod tests {
             services: vec![],
             levels: vec![],
             message_trigrams: None,
+            row_groups: 0,
+            row_group_trigrams: None,
         });
         assert_eq!(m.total_bytes(), 3000);
         assert_eq!(m.total_rows(), 30);
@@ -280,6 +367,8 @@ mod tests {
             services: vec!["auth".into(), "billing".into()],
             levels: vec!["ERROR".into()],
             message_trigrams: None,
+            row_groups: 0,
+            row_group_trigrams: None,
         };
         // Present value → keep.
         assert!(f.may_match(&[Predicate::service("auth")]));
@@ -314,6 +403,8 @@ mod tests {
             services: vec![],
             levels: vec![],
             message_trigrams: Some(trigrams),
+            row_groups: 0,
+            row_group_trigrams: None,
         };
         // Present term (and an in-word substring, ILIKE semantics) → keep.
         assert!(f.may_match(&[Predicate::message_contains("timeout")]));

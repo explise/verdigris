@@ -15,6 +15,8 @@ use clap::{Parser, Subcommand};
 use verdigris_core::config::Config;
 use verdigris_core::cost::{self, RetrievalMode};
 use verdigris_core::model::Tier;
+#[cfg(feature = "datafusion")]
+use verdigris_query::index::IndexedFile;
 use verdigris_query::{ModeledExecutor, ScanExecutor, ScanFile, ScanPlan};
 
 #[derive(Parser)]
@@ -467,7 +469,7 @@ async fn run_sql(cfg: &Config, table: &str, query: &str) -> anyhow::Result<()> {
         !manifest.files.is_empty(),
         "table '{table}' has no files — ingest some logs first"
     );
-    let files: Vec<String> = manifest.files.iter().map(|f| f.path.clone()).collect();
+    let files: Vec<IndexedFile> = manifest.files.iter().map(IndexedFile::whole).collect();
 
     let sql = resolve_sql(query, table)?;
     let limits = verdigris_query::engine::QueryLimits::from_config(&cfg.query);

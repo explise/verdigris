@@ -30,6 +30,11 @@ export interface QueryStats {
   engine: string;       // "datafusion"
   files: number;
   wire: "json" | "arrow";
+  // Row groups read vs. held by the files that carry a text index. Both 0 when no
+  // scanned file is indexed, so `rowGroupsTotal > 0` is the test for "this number
+  // means something". `scannedBytes` is per-file and does not reflect the skip.
+  rowGroupsScanned?: number;
+  rowGroupsTotal?: number;
 }
 
 export interface HistogramBucket { total: number; errors: number; }

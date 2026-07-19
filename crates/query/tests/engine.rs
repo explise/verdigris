@@ -21,6 +21,7 @@ use verdigris_core::manifest::Manifest;
 use verdigris_core::model::{Level, Tier};
 use verdigris_ingest::Ingestor;
 use verdigris_query::engine::{self, QueryLimits, ResultTooLarge};
+use verdigris_query::index::IndexedFile;
 
 const BASE_TS: i64 = 1_700_000_000_000;
 const TRACE: &str = "traceme-123";
@@ -63,8 +64,9 @@ async fn seeded_table() -> (Arc<dyn ObjectStore>, Manifest) {
     (store, manifest)
 }
 
-fn all_paths(m: &Manifest) -> Vec<String> {
-    m.files.iter().map(|f| f.path.clone()).collect()
+/// Every file, scanned whole — the baseline these tests compare pruning against.
+fn all_paths(m: &Manifest) -> Vec<IndexedFile> {
+    m.files.iter().map(IndexedFile::whole).collect()
 }
 
 /// The production ceilings. The corpus is 60 rows — nowhere near them — so these
@@ -146,9 +148,9 @@ async fn trace_id_equality_lookup_returns_the_exact_row() {
 #[tokio::test]
 async fn engine_reads_only_the_registered_file_set() {
     let (store, manifest) = seeded_table().await;
-    let hot: Vec<String> = select_files(&manifest, &[Tier::Hot], None, &[])
+    let hot: Vec<IndexedFile> = select_files(&manifest, &[Tier::Hot], None, &[])
         .into_iter()
-        .map(|f| f.path.clone())
+        .map(IndexedFile::whole)
         .collect();
     assert_eq!(hot.len(), 1, "one hot file in the corpus");
 
@@ -189,14 +191,14 @@ async fn free_text_pruning_never_changes_results() {
         )]
     );
 
-    let pruned: Vec<String> = select_files(
+    let pruned: Vec<IndexedFile> = select_files(
         &manifest,
         &[Tier::Hot, Tier::Warm, Tier::Cold],
         None,
         &preds,
     )
     .into_iter()
-    .map(|f| f.path.clone())
+    .map(|f| IndexedFile::plan(f, &preds))
     .collect();
     assert_eq!(pruned.len(), 1, "trigram stats prune to the auth file only");
 

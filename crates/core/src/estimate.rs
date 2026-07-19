@@ -148,6 +148,8 @@ mod tests {
             services: vec![],
             levels: vec![],
             message_trigrams: None,
+            row_groups: 0,
+            row_group_trigrams: None,
         }
     }
 
@@ -224,6 +226,8 @@ mod tests {
             services: vec!["auth".into()],
             levels: vec!["ERROR".into()],
             message_trigrams: trigrams_of("connection timeout to db-primary"),
+            row_groups: 0,
+            row_group_trigrams: None,
         });
         m.add(DataFile {
             path: "logs/hot/billing".into(),
@@ -235,6 +239,8 @@ mod tests {
             services: vec!["billing".into()],
             levels: vec!["INFO".into()],
             message_trigrams: trigrams_of("invoice generated"),
+            row_groups: 0,
+            row_group_trigrams: None,
         });
         // A legacy file with no stats must always be scanned (no false prune).
         m.add(DataFile {
@@ -247,6 +253,8 @@ mod tests {
             services: vec![],
             levels: vec![],
             message_trigrams: None,
+            row_groups: 0,
+            row_group_trigrams: None,
         });
 
         // service:auth → the billing file is proven empty and skipped; auth + legacy stay.

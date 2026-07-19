@@ -145,6 +145,9 @@ impl Ingestor {
         for (path, set) in &add.by_path {
             idx.insert(path.clone(), set.clone());
         }
+        for (path, sets) in &add.row_groups_by_path {
+            idx.insert_row_groups(path.clone(), sets.clone());
+        }
         let bytes = serde_json::to_vec(&idx).context("serializing trigram sidecar")?;
         self.store
             .put(&self.trigrams_path(), bytes.into())
@@ -159,9 +162,12 @@ impl Ingestor {
     /// see the call site in `compact_bounded`.
     async fn prune_trigrams(&self, manifest: &Manifest) -> anyhow::Result<()> {
         let mut idx = self.load_trigrams().await?;
-        let before = idx.len();
+        // Both maps, not just `len()` (which counts file-level entries only) — a
+        // sidecar carrying row-group entries for retired paths would otherwise
+        // never be rewritten and would grow without bound.
+        let before = (idx.by_path.len(), idx.row_groups_by_path.len());
         idx.retain_paths(manifest);
-        if idx.len() == before {
+        if (idx.by_path.len(), idx.row_groups_by_path.len()) == before {
             return Ok(());
         }
         let bytes = serde_json::to_vec(&idx).context("serializing trigram sidecar")?;
@@ -296,6 +302,8 @@ impl Ingestor {
             services: stats.services,
             levels: stats.levels,
             message_trigrams: Some(stats.message_trigrams),
+            row_groups: stats.row_groups,
+            row_group_trigrams: Some(stats.row_group_trigrams),
         })
     }
 
@@ -474,6 +482,8 @@ impl Ingestor {
                         services: stats.services,
                         levels: stats.levels,
                         message_trigrams: Some(stats.message_trigrams),
+                        row_groups: stats.row_groups,
+                        row_group_trigrams: Some(stats.row_group_trigrams),
                     });
                     for f in &bin {
                         to_delete.push(f.path.clone());
@@ -498,6 +508,9 @@ impl Ingestor {
             for f in &new_files {
                 if let Some(t) = &f.message_trigrams {
                     incoming.insert(f.path.clone(), t.clone());
+                }
+                if let Some(rgs) = &f.row_group_trigrams {
+                    incoming.insert_row_groups(f.path.clone(), rgs.clone());
                 }
             }
             self.merge_trigrams(&incoming).await?;
@@ -815,6 +828,8 @@ mod tests {
             services: vec![],
             levels: vec![],
             message_trigrams: None,
+            row_groups: 0,
+            row_group_trigrams: None,
         }
     }
 
