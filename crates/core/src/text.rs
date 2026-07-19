@@ -28,6 +28,12 @@ const NUM_TRIGRAMS: usize = SYMBOLS * SYMBOLS * SYMBOLS; // 50_653
 /// Bitmap size: one bit per possible trigram.
 pub const BITMAP_BYTES: usize = NUM_TRIGRAMS.div_ceil(8); // 6_332
 
+/// Leading byte marking the sparse wire format. Chosen so a truncated or
+/// zero-filled buffer (`0x00`) is not mistaken for a valid sparse payload.
+const SPARSE_TAG: u8 = 0x01;
+/// Tag + u16 count.
+const SPARSE_HEADER: usize = 3;
+
 /// Map a char to its collapsed symbol. Every char maps somewhere (multi-byte
 /// chars land in "other"), so text and query stay aligned position-for-position.
 fn sym(c: char) -> u16 {
@@ -102,15 +108,80 @@ impl TrigramSet {
         )
     }
 
-    pub fn to_base64(&self) -> String {
-        base64_encode(&self.bits)
+    /// Number of trigrams recorded.
+    pub fn len(&self) -> usize {
+        self.bits.iter().map(|b| b.count_ones() as usize).sum()
     }
 
-    /// Decode from base64; `None` on malformed input or wrong bitmap size (a
-    /// corrupt stat must read as "not recorded", never as a pruning license).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Wire encoding. Two formats; the decoder tells them apart by length alone.
+    ///
+    /// Real bitmaps are 0.2–0.7% full — logs are templated, so the same trigrams
+    /// recur — and a dense 6,332-byte bitmap to hold ~250 set bits dominated the
+    /// manifest entry (~8.4 KB of ~8.9 KB). Storing the set indices instead costs
+    /// 2 bytes each.
+    ///
+    /// Note this is exactly what a Roaring bitmap would do here and no more:
+    /// `NUM_TRIGRAMS` (50,653) is below 65,536, so the whole space is a single
+    /// Roaring *array container* — a sorted `u16` array. Pulling in the crate
+    /// would add a dependency to core (which is deliberately dependency-free)
+    /// and produce the same bytes.
+    ///
+    /// Sparse payload: `[0x01][u16 count LE][u16 index LE]…`, so its length is
+    /// `3 + 2n` — always odd, and the dense form is always 6,332 (even). The two
+    /// can never be confused, and old manifests still decode.
+    pub fn to_base64(&self) -> String {
+        let n = self.len();
+        // Only when it actually wins; a dense set falls back to raw, never worse.
+        if SPARSE_HEADER + 2 * n < BITMAP_BYTES {
+            let mut out = Vec::with_capacity(SPARSE_HEADER + 2 * n);
+            out.push(SPARSE_TAG);
+            out.extend_from_slice(&(n as u16).to_le_bytes());
+            for idx in 0..NUM_TRIGRAMS {
+                if self.get(idx) {
+                    out.extend_from_slice(&(idx as u16).to_le_bytes());
+                }
+            }
+            base64_encode(&out)
+        } else {
+            base64_encode(&self.bits)
+        }
+    }
+
+    /// Decode from base64; `None` on malformed input (a corrupt stat must read as
+    /// "not recorded", never as a pruning license — a wrongly-decoded bitmap
+    /// could prune away real matches).
     pub fn from_base64(s: &str) -> Option<Self> {
-        let bits = base64_decode(s)?;
-        (bits.len() == BITMAP_BYTES).then_some(Self { bits })
+        let raw = base64_decode(s)?;
+
+        // Legacy/dense: exactly one bit per possible trigram.
+        if raw.len() == BITMAP_BYTES {
+            return Some(Self { bits: raw });
+        }
+
+        // Sparse: tag, count, then that many u16 indices — and nothing trailing.
+        if raw.len() < SPARSE_HEADER || raw[0] != SPARSE_TAG {
+            return None;
+        }
+        let n = u16::from_le_bytes([raw[1], raw[2]]) as usize;
+        if raw.len() != SPARSE_HEADER + 2 * n {
+            return None;
+        }
+        let mut set = Self::new();
+        for chunk in raw[SPARSE_HEADER..].chunks_exact(2) {
+            let idx = u16::from_le_bytes([chunk[0], chunk[1]]) as usize;
+            // An out-of-range index means corruption. Refuse rather than clamp:
+            // silently dropping it would under-record the set, and an
+            // under-recorded set prunes files that may hold real matches.
+            if idx >= NUM_TRIGRAMS {
+                return None;
+            }
+            set.set(idx);
+        }
+        Some(set)
     }
 }
 
@@ -214,6 +285,105 @@ mod tests {
 
     // The safety property: any substring (≥3 chars) of any recorded message must
     // never be judged absent — a false negative here would drop real search hits.
+    #[test]
+    fn sparse_encoding_shrinks_a_realistic_bitmap() {
+        // Templated log lines: the shape the 0.2-0.7% fullness figure comes from.
+        let mut t = TrigramSet::new();
+        for i in 0..200 {
+            t.insert_text(&format!("GET /v1/query status=200 latency_ms={i}"));
+        }
+        let encoded = t.to_base64();
+        let dense = base64_encode(&t.bits).len();
+        assert!(
+            encoded.len() * 4 < dense,
+            "expected a large shrink, got {} vs dense {} ({} trigrams)",
+            encoded.len(),
+            dense,
+            t.len()
+        );
+    }
+
+    #[test]
+    fn both_encodings_round_trip_and_prune_identically() {
+        let mut t = TrigramSet::new();
+        for i in 0..50 {
+            t.insert_text(&format!("connection refused to shard-{i}"));
+        }
+
+        // Sparse (what to_base64 picks) and dense must decode to the same set.
+        let sparse = TrigramSet::from_base64(&t.to_base64()).expect("sparse decodes");
+        let dense = TrigramSet::from_base64(&base64_encode(&t.bits)).expect("dense decodes");
+        assert_eq!(sparse, t, "sparse round-trip changed the set");
+        assert_eq!(dense, t, "dense round-trip changed the set");
+
+        // The property that actually matters: identical pruning decisions.
+        for term in [
+            "connection",
+            "refused",
+            "shard-7",
+            "absent-term",
+            "zzz",
+            "sh",
+        ] {
+            assert_eq!(
+                sparse.contains_term(term),
+                t.contains_term(term),
+                "sparse disagreed on {term}"
+            );
+            assert_eq!(
+                dense.contains_term(term),
+                t.contains_term(term),
+                "dense disagreed on {term}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_bitmap_falls_back_to_raw_never_worse() {
+        // A saturated set must not be inflated by the sparse path.
+        let mut t = TrigramSet::new();
+        for idx in 0..NUM_TRIGRAMS {
+            t.set(idx);
+        }
+        assert_eq!(
+            t.to_base64(),
+            base64_encode(&t.bits),
+            "a full bitmap should encode densely"
+        );
+    }
+
+    #[test]
+    fn legacy_dense_manifests_still_decode() {
+        // Forward compatibility: manifests written before the sparse format.
+        let mut t = TrigramSet::new();
+        t.insert_text("legacy payload");
+        let legacy = base64_encode(&t.bits);
+        assert_eq!(TrigramSet::from_base64(&legacy).as_ref(), Some(&t));
+    }
+
+    #[test]
+    fn corrupt_sparse_payloads_read_as_not_recorded() {
+        // Never decode a corrupt stat into a usable set: an under-recorded set
+        // would prune files that may hold real matches.
+        let bad_tag = base64_encode(&[0x02, 1, 0, 5, 0]);
+        assert_eq!(TrigramSet::from_base64(&bad_tag), None, "wrong tag");
+
+        let short = base64_encode(&[SPARSE_TAG, 9, 0, 5, 0]);
+        assert_eq!(
+            TrigramSet::from_base64(&short),
+            None,
+            "count exceeds payload"
+        );
+
+        let mut oor = vec![SPARSE_TAG, 1, 0];
+        oor.extend_from_slice(&(NUM_TRIGRAMS as u16).to_le_bytes());
+        assert_eq!(
+            TrigramSet::from_base64(&base64_encode(&oor)),
+            None,
+            "out-of-range index"
+        );
+    }
+
     #[test]
     fn no_false_negatives_for_any_recorded_substring() {
         let messages = [
