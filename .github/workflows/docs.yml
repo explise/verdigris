@@ -4,6 +4,11 @@
 # config, or this workflow itself. Deploys via the Pages artifact flow (not a
 # gh-pages branch), so every deploy is visible under Actions → docs and in the
 # github-pages environment; the Pages source must be set to "GitHub Actions".
+#
+# Pull requests BUILD but never DEPLOY. Without the pull_request trigger a
+# broken in-site link passed review unnoticed and only failed after merge, on
+# the deploy — the one place a failure is both most visible and least
+# convenient. `--strict` is only a gate if it runs before merge.
 name: docs
 
 on:
@@ -13,18 +18,25 @@ on:
       - "docs/**"
       - "mkdocs.yml"
       - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - ".github/workflows/docs.yml"
   # Manual redeploys (e.g. after a Pages config change) without an empty commit.
   workflow_dispatch:
 
+# Least privilege by default: only the deploy job gets the Pages write scopes,
+# so a pull-request run cannot touch the live site even in principle.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
-# One Pages deploy at a time; never cancel a deploy already in flight.
+# Deploys share one group and never cancel a deploy already in flight. PR builds
+# get their own per-ref group so they neither queue behind a deploy nor hold one
+# up, and a new push to a PR supersedes that PR's earlier build.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('docs-pr-{0}', github.ref) || 'pages' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -36,13 +48,21 @@ jobs:
           python-version: "3.12"
       # Pinned to the versions the site was authored against; bump deliberately.
       - run: pip install mkdocs==1.6.1 mkdocs-material==9.7.6
-      # --strict: any broken in-site link fails the deploy instead of shipping a 404.
+      # --strict: any broken in-site link fails the build instead of shipping a 404.
       - run: mkdocs build --strict --site-dir _site
+      # The artifact only feeds the deploy job, which never runs on a PR.
       - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
 
   deploy:
+    # A pull request proves the site builds; it must never publish it.
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
