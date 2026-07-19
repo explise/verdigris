@@ -12,6 +12,8 @@
 
 use crate::model::Tier;
 use crate::text::TrigramSet;
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// A stat-carrying string column whose per-file distinct values are recorded in
@@ -72,11 +74,21 @@ pub struct DataFile {
     /// Distinct `level` values in this file (sorted, deduped). Empty = not recorded.
     #[serde(default)]
     pub levels: Vec<String>,
-    /// Character-trigram presence set over this file's `message` column (~6.3 KB
-    /// bitmap, base64 in JSON), letting a free-text search skip the file when a
-    /// trigram of the term is provably absent. `None` = not recorded (legacy
-    /// file, or a corrupt stat) — never prunes. See [`crate::text`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Character-trigram presence set over this file's `message` column, letting
+    /// a free-text search skip the file when a trigram of the term is provably
+    /// absent. `None` = not loaded or not recorded — **never prunes**. See
+    /// [`crate::text`].
+    ///
+    /// Not serialized with the manifest. Trigrams are only needed by queries
+    /// carrying a `MessageContains` predicate, and they are the bulk of a
+    /// manifest entry, so they live in a sidecar
+    /// (`{table}/_metadata/trigrams.json`) that is fetched only when a text
+    /// predicate is present — see [`TrigramIndex`]. A plain
+    /// `WHERE service=… AND ts>…` no longer pays for them.
+    ///
+    /// The default is `None`, which is why this is safe: a caller that forgets
+    /// to hydrate simply does not prune on text. Slower, never wrong.
+    #[serde(skip)]
     pub message_trigrams: Option<TrigramSet>,
 }
 
@@ -119,6 +131,74 @@ pub struct Manifest {
     /// files uniquely so a run never collides with prior output.
     #[serde(default)]
     pub compaction_gen: u64,
+}
+
+/// The trigram sidecar: `file path -> trigram set`, stored separately from the
+/// manifest and fetched only by queries with a text predicate.
+///
+/// **Why keying by path makes this safe.** Data files are immutable — compaction
+/// writes new paths rather than rewriting one — so a path's trigram set is
+/// correct forever once written. A sidecar that has fallen behind the manifest
+/// can therefore only be *missing* entries, never hold wrong ones, and a missing
+/// entry yields `None`, which never prunes. That removes the need for an atomic
+/// two-object commit: the stale case degrades to "scans more files than
+/// necessary", not "drops a real match".
+///
+/// The failure direction is the whole design. Anything that made a stale sidecar
+/// able to *contradict* the manifest — reusing a path, or keying by index —
+/// would turn a benign staleness into silent data loss at query time.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TrigramIndex {
+    /// Keyed by [`DataFile::path`].
+    #[serde(default)]
+    pub by_path: BTreeMap<String, TrigramSet>,
+}
+
+impl TrigramIndex {
+    pub fn is_empty(&self) -> bool {
+        self.by_path.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_path.len()
+    }
+
+    pub fn insert(&mut self, path: impl Into<String>, set: TrigramSet) {
+        self.by_path.insert(path.into(), set);
+    }
+
+    /// Drop entries for files no longer in `manifest`, so the sidecar does not
+    /// grow forever as compaction retires paths. Only ever called by the writer
+    /// that also commits the manifest.
+    pub fn retain_paths(&mut self, manifest: &Manifest) {
+        let live: std::collections::BTreeSet<&str> =
+            manifest.files.iter().map(|f| f.path.as_str()).collect();
+        self.by_path.retain(|p, _| live.contains(p.as_str()));
+    }
+}
+
+impl Manifest {
+    /// Attach trigram sets from the sidecar, in place.
+    ///
+    /// Call this before pruning a query that carries a `MessageContains`
+    /// predicate. Files with no sidecar entry keep `None` and stay unprunable on
+    /// text, which is the conservative direction.
+    pub fn hydrate_trigrams(&mut self, index: &TrigramIndex) {
+        for f in &mut self.files {
+            f.message_trigrams = index.by_path.get(&f.path).cloned();
+        }
+    }
+
+    /// Collect the trigram sets currently attached, for writing to the sidecar.
+    pub fn extract_trigrams(&self) -> TrigramIndex {
+        let mut idx = TrigramIndex::default();
+        for f in &self.files {
+            if let Some(t) = &f.message_trigrams {
+                idx.insert(f.path.clone(), t.clone());
+            }
+        }
+        idx
+    }
 }
 
 impl Manifest {
