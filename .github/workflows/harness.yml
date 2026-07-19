@@ -1,0 +1,98 @@
+# The harness gate: covers scripts/verify.sh and the agent wiring around it.
+#
+# Why this exists: verify.sh gates every push and AGENTS.md tells contributors to
+# trust it, but it sat outside every other workflow's `paths:` filter — so a
+# change to the gate itself ran no CI at all. It had already shipped three
+# separate paths that printed "verify: OK" and exited 0 having checked nothing.
+# The thing that verifies everything else was the one thing unverified.
+name: harness
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".claude/**"
+      - "AGENTS.md"
+      - ".github/workflows/harness.yml"
+  pull_request:
+    paths:
+      - "scripts/**"
+      - ".claude/**"
+      - "AGENTS.md"
+      - ".github/workflows/harness.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # shellcheck catches the class of shell bug the self-test cannot: unquoted
+      # expansions, misused [ ], subshell scoping.
+      #
+      # Pinned rather than using the runner's preinstalled copy: versions differ
+      # in which code they emit for the same construct (a trap-invoked function
+      # is SC2317 on older releases, SC2329 on newer), so an unpinned runner
+      # upgrade silently breaks this lane. That exact drift already failed this
+      # workflow once. Bump deliberately, same as node 20 and the mkdocs pins.
+      - name: shellcheck (pinned)
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+        run: |
+          set -euo pipefail
+          # Extracted into RUNNER_TEMP, not /usr/local/bin — the latter is
+          # root-owned on the runner and the write would need sudo.
+          mkdir -p "$RUNNER_TEMP/sc"
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
+            | tar -xJf - --strip-components=1 -C "$RUNNER_TEMP/sc" "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+          "$RUNNER_TEMP/sc/shellcheck" --version
+          "$RUNNER_TEMP/sc/shellcheck" scripts/verify.sh scripts/verify_selftest.sh .claude/hooks/on-edit.sh
+
+      # rustfmt is what per-path mode shells out to; without it the format-scoping
+      # cases would report SKIP and silently cover nothing.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # Matches web.yml's pin. The web-dependent self-test cases need a real
+      # node_modules, so this must install before the self-test runs.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+
+      # Every case must actually run here. A SKIP in CI means a dependency above
+      # is missing and that case is covering nothing — fail rather than pass
+      # quietly, which is the exact bug this workflow exists to prevent.
+      - name: self-test
+        run: |
+          out=$(scripts/verify_selftest.sh 2>&1); rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" != 0 ]; then exit "$rc"; fi
+          if printf '%s' "$out" | grep -q 'skipped=[1-9]'; then
+            echo "::error::self-test skipped cases in CI; a toolchain is missing" >&2
+            exit 1
+          fi
+
+      # The self-test restores the files it temporarily dirties. If it didn't,
+      # every later run starts from a corrupted tree.
+      - name: self-test left the tree clean
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::verify_selftest.sh left the working tree dirty:" >&2
+            git status --porcelain >&2
+            git diff >&2
+            exit 1
+          fi
+
+      # verify.sh must survive being pointed at the whole repo, not just the
+      # paths the self-test hand-picks.
+      - name: verify.sh over all tracked files
+        run: git ls-files -z | xargs -0 scripts/verify.sh --
