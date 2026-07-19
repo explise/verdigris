@@ -25,17 +25,37 @@ use verdigris_core::text::TrigramSet;
 /// whole row groups that can't contain an equality match — the fast path for
 /// "find this `trace_id`", "this `service`'s errors", "`level = 'ERROR'`" — so a
 /// rare-value lookup reads a handful of row groups instead of every row.
-/// (Substring `message ILIKE '%…%'` still scans; an inverted index for arbitrary
-/// grep is future work — M1.2 stretch.)
-fn writer_props() -> Result<WriterProperties> {
+/// Substring `message ILIKE '%…%'` is not something a bloom filter can answer, so
+/// it is pruned instead by the trigram sets `MergeWriter` folds per row group —
+/// coarser than a full inverted index (no positions, no ranking) but enough to skip
+/// the row groups a term provably cannot appear in.
+fn writer_props(row_group_rows: usize) -> Result<WriterProperties> {
     Ok(WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
         .set_column_bloom_filter_enabled(ColumnPath::from("trace_id"), true)
         .set_column_bloom_filter_enabled(ColumnPath::from("service"), true)
         .set_column_bloom_filter_enabled(ColumnPath::from("level"), true)
         .set_column_bloom_filter_enabled(ColumnPath::from("message"), true)
+        .set_max_row_group_row_count(Some(row_group_rows))
         .build())
 }
+
+/// Rows per row group — the granularity of the per-row-group trigram index.
+///
+/// Pinned rather than left to arrow-rs's default (1,024×1,024) for two reasons.
+/// It is the unit `MergeWriter` slices and folds trigrams against, so a default
+/// that shifted under us would silently misalign index entries from the row groups
+/// they describe. And it is a search-latency knob: file-level pruning stops paying
+/// once compaction produces 256 MiB files, and at a million rows a group such a
+/// file holds only a handful of them — too coarse to make grep interactive. 128Ki
+/// keeps groups big enough to compress and scan well while giving a compacted file
+/// enough of them for a rare term to skip nearly all of it.
+///
+/// Cost of the finer granularity is the index itself: real sets run 0.2–0.7% full,
+/// so a sparse-encoded group set is well under 1 KiB, and even a few hundred groups
+/// per file stay far inside the 1%-of-data-bytes ceiling (asserted in
+/// `crates/ingest/tests/row_group_index.rs`).
+pub const ROWS_PER_ROW_GROUP: usize = 128 * 1024;
 
 /// Rows per decoded batch when streaming a source file through compaction.
 /// Caps the live Arrow batch regardless of how large the source file's row
@@ -71,6 +91,14 @@ pub struct FileStats {
     /// Trigram presence set over the `message` column — plan-time file skip for
     /// free-text search (see `verdigris_core::text`).
     pub message_trigrams: TrigramSet,
+    /// Row groups emitted. Always equals `row_group_trigrams.len()` — they are
+    /// derived from the same cuts — and is carried separately because it goes to
+    /// the manifest while the sets go to the sidecar.
+    pub row_groups: u64,
+    /// The same, one entry per row group in row-group order, so a file that
+    /// survives plan-time pruning can still skip most of its own row groups.
+    /// `message_trigrams` is exactly the union of these.
+    pub row_group_trigrams: Vec<TrigramSet>,
 }
 
 /// Fold a Utf8 column's distinct non-null values into `out` (sorted+deduped by
@@ -110,21 +138,64 @@ pub struct MergeWriter {
     max_ts: i64,
     services: BTreeSet<String>,
     levels: BTreeSet<String>,
-    trigrams: TrigramSet,
+    /// Trigrams of the row group currently open. Folded into `row_group_trigrams`
+    /// at each cut; the file-level set is their union, taken in `finish`.
+    group_trigrams: TrigramSet,
+    /// Rows written into the currently open row group.
+    rows_in_group: usize,
+    /// Rows per row group. [`ROWS_PER_ROW_GROUP`] in production; overridable so a
+    /// test can produce many row groups from few rows.
+    row_group_rows: usize,
+    row_group_trigrams: Vec<TrigramSet>,
 }
 
 impl MergeWriter {
     pub fn new(schema: SchemaRef) -> Result<Self> {
+        Self::with_row_group_rows(schema, ROWS_PER_ROW_GROUP)
+    }
+
+    /// A writer cutting row groups every `row_group_rows` rows.
+    ///
+    /// Exists for tests: exercising multi-row-group behaviour at the production
+    /// 128Ki would mean encoding hundreds of thousands of rows per case, so the
+    /// index tests would be slow enough not to run. The cut/fold logic is the same
+    /// at any size — only the constant differs — so a test at 512 rows covers the
+    /// same code the production path takes.
+    pub fn with_row_group_rows(schema: SchemaRef, row_group_rows: usize) -> Result<Self> {
+        anyhow::ensure!(row_group_rows > 0, "row group size must be positive");
         Ok(Self {
-            writer: ArrowWriter::try_new(Vec::new(), schema, Some(writer_props()?))
+            writer: ArrowWriter::try_new(Vec::new(), schema, Some(writer_props(row_group_rows)?))
                 .context("creating parquet merge writer")?,
             rows: 0,
             min_ts: i64::MAX,
             max_ts: i64::MIN,
             services: BTreeSet::new(),
             levels: BTreeSet::new(),
-            trigrams: TrigramSet::new(),
+            group_trigrams: TrigramSet::new(),
+            rows_in_group: 0,
+            row_group_rows,
+            row_group_trigrams: Vec::new(),
         })
+    }
+
+    /// Close the open row group and bank its trigram set.
+    ///
+    /// `ArrowWriter::flush` is a no-op when nothing is buffered, which is what
+    /// makes this safe to call unconditionally: the writer auto-flushes on
+    /// reaching `row_group_rows` too, so at a cut point the group may already
+    /// be closed. Either way exactly one row group has been emitted for the rows
+    /// folded into `group_trigrams`, which is the invariant the index rests on.
+    fn cut_row_group(&mut self) -> Result<()> {
+        if self.rows_in_group == 0 {
+            return Ok(());
+        }
+        self.writer.flush().context("flushing row group")?;
+        self.row_group_trigrams.push(std::mem::replace(
+            &mut self.group_trigrams,
+            TrigramSet::new(),
+        ));
+        self.rows_in_group = 0;
+        Ok(())
     }
 
     /// Write one batch and fold its stats.
@@ -132,30 +203,51 @@ impl MergeWriter {
     /// Stats come from the rows actually merged rather than being inherited from
     /// the inputs' manifest entries, so a compacted file still prunes by
     /// service/level/trigram even when some input predates those stats.
+    ///
+    /// The batch is sliced at row-group boundaries and each slice folded before it
+    /// is written, so a trigram set never spans a cut. Doing it any other way — say
+    /// folding the whole batch then letting the writer split it — would attribute a
+    /// slice's trigrams to whichever group happened to be open, and a row group
+    /// whose recorded set is missing a term its rows actually contain is a false
+    /// negative: the scan would skip a real match.
     pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.rows += batch.num_rows() as u64;
-        if let Some(col) = batch.column_by_name("ts") {
-            if let Some(arr) = col.as_any().downcast_ref::<TimestampMillisecondArray>() {
-                for i in 0..arr.len() {
-                    if arr.is_valid(i) {
-                        self.min_ts = self.min_ts.min(arr.value(i));
-                        self.max_ts = self.max_ts.max(arr.value(i));
+        let total = batch.num_rows();
+        let mut offset = 0;
+        while offset < total {
+            let room = self.row_group_rows - self.rows_in_group;
+            let take = room.min(total - offset);
+            let slice = batch.slice(offset, take);
+
+            self.rows += take as u64;
+            if let Some(col) = slice.column_by_name("ts") {
+                if let Some(arr) = col.as_any().downcast_ref::<TimestampMillisecondArray>() {
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            self.min_ts = self.min_ts.min(arr.value(i));
+                            self.max_ts = self.max_ts.max(arr.value(i));
+                        }
                     }
                 }
             }
-        }
-        fold_distinct(batch, "service", &mut self.services);
-        fold_distinct(batch, "level", &mut self.levels);
-        if let Some(col) = batch.column_by_name("message") {
-            if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                for i in 0..arr.len() {
-                    if arr.is_valid(i) {
-                        self.trigrams.insert_text(arr.value(i));
+            fold_distinct(&slice, "service", &mut self.services);
+            fold_distinct(&slice, "level", &mut self.levels);
+            if let Some(col) = slice.column_by_name("message") {
+                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            self.group_trigrams.insert_text(arr.value(i));
+                        }
                     }
                 }
             }
+            self.writer.write(&slice).context("writing record batch")?;
+
+            self.rows_in_group += take;
+            offset += take;
+            if self.rows_in_group == self.row_group_rows {
+                self.cut_row_group()?;
+            }
         }
-        self.writer.write(batch).context("writing record batch")?;
         Ok(())
     }
 
@@ -168,7 +260,10 @@ impl MergeWriter {
 
     /// Finish the file: the encoded Parquet bytes plus the stats folded from the
     /// rows written.
-    pub fn finish(self) -> Result<(Vec<u8>, FileStats)> {
+    pub fn finish(mut self) -> Result<(Vec<u8>, FileStats)> {
+        // Bank the trailing partial group before the writer closes it for us, so
+        // the index has an entry for every row group the file ends up with.
+        self.cut_row_group()?;
         let Self {
             writer,
             rows,
@@ -176,11 +271,16 @@ impl MergeWriter {
             max_ts,
             services,
             levels,
-            trigrams,
+            row_group_trigrams,
+            ..
         } = self;
         let buf = writer
             .into_inner()
             .context("closing parquet merge writer")?;
+        let mut trigrams = TrigramSet::new();
+        for g in &row_group_trigrams {
+            trigrams.union_with(g);
+        }
         let stats = FileStats {
             rows,
             // An empty merge has no timestamps; don't leak the i64 sentinels into
@@ -190,16 +290,20 @@ impl MergeWriter {
             services: services.into_iter().collect(),
             levels: levels.into_iter().collect(),
             message_trigrams: trigrams,
+            row_groups: row_group_trigrams.len() as u64,
+            row_group_trigrams,
         };
         Ok((buf, stats))
     }
 }
 
-/// Encode `records` to Parquet bytes (zstd-compressed). Errors on an empty batch
-/// — callers roll non-empty files only.
-pub fn encode_parquet(records: &[LogRecord]) -> Result<(Vec<u8>, FileStats)> {
-    anyhow::ensure!(!records.is_empty(), "refusing to encode an empty batch");
-
+/// Build the Arrow batch for `records`, in the table's schema.
+///
+/// Split out from [`encode_parquet`] so a caller that needs a differently
+/// configured writer — the row-group index tests, which cut groups far smaller than
+/// production — builds its rows through the same code the production path uses,
+/// rather than a lookalike that could drift from the real schema.
+pub fn records_to_batch(records: &[LogRecord]) -> Result<RecordBatch> {
     let ts: ArrayRef = Arc::new(TimestampMillisecondArray::from_iter_values(
         records.iter().map(|r| r.ts_millis),
     ));
@@ -224,50 +328,29 @@ pub fn encode_parquet(records: &[LogRecord]) -> Result<(Vec<u8>, FileStats)> {
         }
     })));
 
-    let schema = log_schema();
-    let batch = RecordBatch::try_new(
-        schema.clone(),
+    RecordBatch::try_new(
+        log_schema(),
         vec![ts, level, service, status, message, trace_id, attrs_json],
     )
-    .context("building record batch")?;
+    .context("building record batch")
+}
 
-    let mut buf: Vec<u8> = Vec::new();
-    {
-        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(writer_props()?))
-            .context("creating parquet writer")?;
-        writer.write(&batch).context("writing record batch")?;
-        writer.close().context("closing parquet writer")?;
-    }
+/// Encode `records` to Parquet bytes (zstd-compressed). Errors on an empty batch
+/// — callers roll non-empty files only.
+pub fn encode_parquet(records: &[LogRecord]) -> Result<(Vec<u8>, FileStats)> {
+    anyhow::ensure!(!records.is_empty(), "refusing to encode an empty batch");
+    let batch = records_to_batch(records)?;
 
-    let mut min_ts = i64::MAX;
-    let mut max_ts = i64::MIN;
-    for r in records {
-        min_ts = min_ts.min(r.ts_millis);
-        max_ts = max_ts.max(r.ts_millis);
-    }
-
-    // Distinct service/level values, so a `service:auth` / `level:error` query can
-    // skip this whole file at plan time when the value is absent (sorted+deduped
-    // via BTreeSet — deterministic, no RNG/HashMap order), plus the message
-    // trigram set so free-text searches can skip the file the same way.
-    let mut svc = std::collections::BTreeSet::new();
-    let mut lvl = std::collections::BTreeSet::new();
-    let mut trigrams = TrigramSet::new();
-    for r in records {
-        svc.insert(r.service.clone());
-        lvl.insert(r.level.as_str().to_string());
-        trigrams.insert_text(&r.message);
-    }
-
-    let stats = FileStats {
-        rows: records.len() as u64,
-        min_ts,
-        max_ts,
-        services: svc.into_iter().collect(),
-        levels: lvl.into_iter().collect(),
-        message_trigrams: trigrams,
-    };
-    Ok((buf, stats))
+    // Through `MergeWriter` rather than a second hand-rolled writer + stats fold.
+    // The stats it produces — distinct service/level for plan-time file skip, the
+    // message trigrams for free-text skip, and the per-row-group sets — are then
+    // the same code on both write paths, so an ingested file and a compacted one
+    // cannot come to disagree about what a stat means. (That mattered here: a
+    // second fold would also have had to re-derive row-group boundaries, and
+    // getting those subtly wrong is a false negative, not a slow query.)
+    let mut w = MergeWriter::new(log_schema())?;
+    w.write(&batch)?;
+    w.finish()
 }
 
 #[cfg(test)]

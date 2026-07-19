@@ -53,6 +53,7 @@ use verdigris_core::manifest::Manifest;
 use verdigris_core::model::Tier;
 use verdigris_ingest::wire::JsonLog;
 use verdigris_query::engine::{QueryLimits, ResultTooLarge};
+use verdigris_query::index::IndexedFile;
 use verdigris_storage::Store;
 
 /// Which HTTP surface this node exposes (from `vdg serve --role`).
@@ -542,7 +543,7 @@ const ALERTS_CAS_RETRIES: usize = 4;
 async fn measure(
     s: &Store,
     table: &str,
-    files: &[String],
+    files: &[IndexedFile],
     sql: &str,
     limits: &QueryLimits,
 ) -> anyhow::Result<f64> {
@@ -583,7 +584,7 @@ async fn evaluate_all(
         let m = verdigris_ingest::Ingestor::new(s.clone(), table)
             .load_manifest()
             .await?;
-        let files: Vec<String> = m.files.iter().map(|f| f.path.clone()).collect();
+        let files: Vec<IndexedFile> = m.files.iter().map(IndexedFile::whole).collect();
         let now = clock.now_millis();
         // Webhooks for this pass, held until the state they announce is committed.
         let mut notifications: Vec<(String, Value)> = Vec::new();
@@ -1404,7 +1405,13 @@ async fn h_query(
         return Ok(query_response(arrow, Vec::new(), &stats, &Vec::new()));
     }
     let scanned_bytes: u64 = selected.iter().map(|f| f.bytes).sum();
-    let files: Vec<String> = selected.iter().map(|f| f.path.clone()).collect();
+    // Same predicates again, one level down: `select_files` decided which files to
+    // open, this decides which row groups inside them to read. A file kept because
+    // the term's trigrams appear *somewhere* in it can still skip most of itself.
+    let files: Vec<IndexedFile> = selected
+        .iter()
+        .map(|f| IndexedFile::plan(f, &preds))
+        .collect();
 
     // The frontend search bar sends its DSL in `sql`; raw SQL is passed through.
     // A malformed query is a 400, not a 200-with-empty-rows, so the client can
@@ -1457,12 +1464,23 @@ async fn h_query(
         .iter()
         .filter_map(|b| b.get("total").and_then(Value::as_i64))
         .sum();
+    // What the row-group text index actually saved, over the files that carry one.
+    // `scannedBytes` is charged at file granularity (that is what the estimate
+    // quoted, and what a cold-tier GET really costs), so without this a free-text
+    // search that skipped 98% of a file's row groups looks identical to one that
+    // read all of it. Both zero when no file in the scan is indexed.
+    let (rg_scanned, rg_total) = files
+        .iter()
+        .filter_map(|f| f.scanned_row_groups())
+        .fold((0usize, 0usize), |(s, t), (fs, ft)| (s + fs, t + ft));
     let stats = json!({
         "events": events,
         "scannedBytes": scanned_bytes,
         "elapsedMs": elapsed,
         "engine": "datafusion",
         "files": files.len(),
+        "rowGroupsScanned": rg_scanned,
+        "rowGroupsTotal": rg_total,
     });
 
     // Audit / expensiveQueries: record who ran what, and what it scanned/cost.
@@ -1546,7 +1564,7 @@ fn time_range(m: &Manifest) -> (i64, i64) {
 async fn histogram(
     s: &Store,
     table: &str,
-    files: &[String],
+    files: &[IndexedFile],
     min_ts: i64,
     max_ts: i64,
     limits: &QueryLimits,
@@ -1879,7 +1897,7 @@ async fn h_config(State(st): State<AppState>) -> ApiResult {
 async fn h_metrics(State(st): State<AppState>) -> ApiResult {
     let (s, m) = manifest(&st).await?;
     let total_gib = m.total_bytes() as f64 / cost::GIB;
-    let files: Vec<String> = m.files.iter().map(|f| f.path.clone()).collect();
+    let files: Vec<IndexedFile> = m.files.iter().map(IndexedFile::whole).collect();
     let table = st.table.as_str();
 
     // Per-service volume (real), proportional to row share.
@@ -2123,7 +2141,7 @@ async fn h_alert_create(
     let m = verdigris_ingest::Ingestor::new(s.clone(), st.table.as_str())
         .load_manifest()
         .await?;
-    let files: Vec<String> = m.files.iter().map(|f| f.path.clone()).collect();
+    let files: Vec<IndexedFile> = m.files.iter().map(IndexedFile::whole).collect();
     let value = measure(&s, st.table.as_str(), &files, &rule.sql, &limits(&st))
         .await
         .map_err(AppError::bad_request)?;
@@ -2250,7 +2268,7 @@ async fn tail_poll(st: &AppState, since_ts: i64) -> anyhow::Result<(Vec<Value>, 
     let Some(newest) = m.files.iter().max_by_key(|f| f.max_ts) else {
         return Ok((Vec::new(), since_ts));
     };
-    let files = vec![newest.path.clone()];
+    let files = vec![IndexedFile::whole(newest)];
     let table = st.table.as_str();
 
     // `arrow_cast(ts, 'Int64')` surfaces the underlying epoch-millis so we can

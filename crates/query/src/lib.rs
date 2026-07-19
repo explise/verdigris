@@ -96,6 +96,8 @@ impl ScanExecutor for ModeledExecutor {
 /// store and runs SQL. Feature-gated behind `datafusion`.
 #[cfg(feature = "datafusion")]
 pub mod engine;
+#[cfg(feature = "datafusion")]
+pub mod index;
 
 #[cfg(test)]
 mod tests {

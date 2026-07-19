@@ -109,6 +109,8 @@ async fn estimator_matches_what_the_store_bills() {
             services: vec![],
             levels: vec![],
             message_trigrams: None,
+            row_groups: 0,
+            row_group_trigrams: None,
         });
         // Materialize the bytes and tag the object's storage class to match.
         let payload = PutPayload::from(vec![0u8; bytes as usize]);
@@ -221,6 +223,8 @@ async fn fabricated_catalog_prices_a_trillion_rows_without_bytes() {
             services: vec![],
             levels: vec![],
             message_trigrams: None,
+            row_groups: 0,
+            row_group_trigrams: None,
         });
     }
     assert_eq!(manifest.files.len() as u64, file_count);

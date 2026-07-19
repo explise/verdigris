@@ -141,10 +141,12 @@ bursty table can't flood the stream. The web UI consumes it via `EventSource`.
 
 Grounded in the current implementation, so you know what to expect:
 
-- **Text search** over columnar Parquet is `ILIKE`-based today. Fast "grep this stack trace"
-  search (bloom filters / inverted index) is future work — `WHERE level='error'` is fast,
-  arbitrary substring search over huge scans is not yet optimized.
+- **Text search** over columnar Parquet is `ILIKE`-based, accelerated by character-trigram
+  skip indexes at both file and row-group granularity: a "grep this stack trace" search for a
+  rare term reads only the row groups whose trigrams admit it. It is a skip index, not an
+  inverted index — no ranking, no phrase search — and `attrs_json` is not indexed.
 - **Query-time tier filtering** is not wired: a query currently scans all tiers regardless of
   the UI's tier pills. Only the *cost estimate* is tier-aware (see [Cost & tiering](cost.md)).
-- Estimate/scan pruning is by time window and coarse file min/max stats; finer
-  predicate/row-group pruning is on the roadmap.
+- Estimate/scan pruning is by time window, file min/max stats, `service`/`level` value
+  stats, and trigram skip indexes (file + row group). The *estimate* is deliberately
+  file-granular, so it never under-quotes a scan that row-group pruning then shortens.

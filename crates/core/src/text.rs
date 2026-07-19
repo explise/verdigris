@@ -108,6 +108,20 @@ impl TrigramSet {
         )
     }
 
+    /// Fold `other` into this set.
+    ///
+    /// Used to build a file-level set from its row-group sets: a file's trigrams
+    /// are exactly the union of its row groups', so the two levels are recorded
+    /// once and derived rather than accumulated twice over the same rows. That
+    /// also makes them consistent by construction — a file-level set that had
+    /// drifted from the union of its parts could prune a file whose row groups
+    /// still claim a match.
+    pub fn union_with(&mut self, other: &TrigramSet) {
+        for (dst, src) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *dst |= *src;
+        }
+    }
+
     /// Number of trigrams recorded.
     pub fn len(&self) -> usize {
         self.bits.iter().map(|b| b.count_ones() as usize).sum()

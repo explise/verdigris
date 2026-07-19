@@ -112,7 +112,7 @@ the CAS retry loop degrades; partitions are what make large-table pruning cheap.
 - Existing JSON-manifest tables migrate or are read compatibly.
 *Effort: L · Priority: P1 (scale unlock; can trail auth/search).*
 
-**M1.2 — Fast text search over columnar Parquet. ✅ DONE (2026-07-06) — equality path; substring file-pruning added 2026-07-05; within-file inverted index deferred.**
+**M1.2 — Fast text search over columnar Parquet. ✅ DONE (2026-07-06) — equality path; substring file-pruning added 2026-07-05; row-group pruning added 2026-07-19.**
 Shipped: Parquet is now written with **bloom filters** on `trace_id`, `service`, `level`,
 `message` (`crates/ingest/src/encode.rs` `writer_props`, used by both ingest AND compaction),
 and the query engine enables `bloom_filter_on_read` + `pushdown_filters` + `reorder_filters`
@@ -129,9 +129,22 @@ negatives by construction, and the estimator prices the pruned set (same `select
 Trigrams (not word tokens) because ILIKE is substring: `auth` must match
 `authentication`. Recorded at ingest, recomputed from merged rows at compaction; legacy
 files without the stat are never pruned.
-*Still deferred:* within a surviving file the ILIKE still scans rows (a row-group-level
-token/trigram structure or full inverted index is the remaining stretch), and
-`attrs_json` matches don't prune.
+*Row-group grep (2026-07-19, [#23](https://github.com/explise/verdigris/issues/23)):* the
+same trigram idea one level down. `MergeWriter` cuts row groups at a pinned 128Ki rows
+(`encode::ROWS_PER_ROW_GROUP`) and folds one trigram set per group as it writes, so a file
+that survives file-level pruning still skips the row groups a term provably cannot be in.
+The sets ride the existing sidecar (`TrigramIndex.row_groups_by_path`) and reach DataFusion
+as a per-file `ParquetAccessPlan` via `IndexedParquetTable`
+(`crates/query/src/index.rs`) — `ListingTable` offers no hook for an external index.
+Safety is the same contract as `may_match`: an index is applied only when its length agrees
+with the row-group count recorded in the manifest, so a stale or mismatched sidecar degrades
+to a full scan rather than skipping into the wrong file. Verified: pruned and unpruned
+queries return byte-identical rows across common/rare/absent/in-word/case-mismatched terms
+(`crates/query/tests/row_group_pruning.rs`), every substring of every message is admitted by
+its own row group's set (`crates/ingest/tests/row_group_index.rs`), a rare term reads < 5% of
+row groups, and the index costs < 1% of data bytes.
+*Still deferred:* `attrs_json` matches don't prune, and there is no ranking or phrase
+search — this is a skip index, not an inverted index.
 *Effort: L · Priority: P0.*
 
 **M1.3 — Finish the DST harness (madsim, DataFusion-in-sim, calibration).**

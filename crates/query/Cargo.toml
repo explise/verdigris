@@ -44,6 +44,12 @@ verdigris-ingest.workspace = true
 name = "engine"
 required-features = ["datafusion"]
 
+# Likewise the row-group pruning tests: they assert on what DataFusion actually
+# reads, which needs DataFusion.
+[[test]]
+name = "row_group_pruning"
+required-features = ["datafusion"]
+
 # Same for the pruning example: it drives DataFusion directly to print the real
 # scan metrics, so it can't build in the default (ModeledExecutor) config.
 [[example]]

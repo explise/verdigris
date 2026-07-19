@@ -20,6 +20,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::json::ArrayWriter;
 use datafusion::arrow::util::pretty::pretty_format_batches;
+use datafusion::catalog::TableProvider;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
@@ -31,6 +32,8 @@ use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use futures::StreamExt;
 use object_store::ObjectStore;
 use verdigris_core::config::QueryConfig;
+
+use crate::index::{IndexedFile, IndexedParquetTable};
 
 /// The result of a SQL query (CLI/pretty path).
 pub struct QueryOutput {
@@ -131,7 +134,7 @@ impl std::error::Error for ResultTooLarge {}
 async fn collect_batches(
     store: Arc<dyn ObjectStore>,
     table: &str,
-    files: &[String],
+    files: &[IndexedFile],
     sql: &str,
     limits: &QueryLimits,
 ) -> anyhow::Result<Vec<RecordBatch>> {
@@ -174,9 +177,14 @@ async fn collect_batches(
     ctx.register_object_store(base.as_ref(), store);
 
     // Register the exact files from the manifest as the table's paths.
+    //
+    // The schema still comes from `ListingTable`'s inference over those paths —
+    // one read of one footer, and it keeps schema handling identical to before —
+    // but the table that gets registered is [`IndexedParquetTable`], so each file
+    // can carry the row-group access plan its trigram index implies.
     let urls = files
         .iter()
-        .map(|f| ListingTableUrl::parse(format!("verdigris://store/{f}")))
+        .map(|f| ListingTableUrl::parse(format!("verdigris://store/{}", f.path)))
         .collect::<Result<Vec<_>, _>>()
         .context("parsing file urls")?;
     let options = ListingOptions::new(Arc::new(ParquetFormat::default()));
@@ -185,7 +193,10 @@ async fn collect_batches(
         .infer_schema(&ctx.state())
         .await
         .context("inferring schema from parquet")?;
-    let provider = ListingTable::try_new(config).context("creating listing table")?;
+    let schema = ListingTable::try_new(config)
+        .context("creating listing table")?
+        .schema();
+    let provider = IndexedParquetTable::new(schema, base, files.to_vec());
     ctx.register_table(table, Arc::new(provider))
         .context("registering table")?;
 
@@ -234,7 +245,7 @@ async fn collect_bounded(df: DataFrame, limits: &QueryLimits) -> anyhow::Result<
 pub async fn query_table(
     store: Arc<dyn ObjectStore>,
     table: &str,
-    files: &[String],
+    files: &[IndexedFile],
     sql: &str,
     limits: &QueryLimits,
 ) -> anyhow::Result<QueryOutput> {
@@ -250,7 +261,7 @@ pub async fn query_table(
 pub async fn query_table_json(
     store: Arc<dyn ObjectStore>,
     table: &str,
-    files: &[String],
+    files: &[IndexedFile],
     sql: &str,
     limits: &QueryLimits,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
@@ -277,7 +288,7 @@ pub async fn query_table_json(
 pub async fn query_table_arrow(
     store: Arc<dyn ObjectStore>,
     table: &str,
-    files: &[String],
+    files: &[IndexedFile],
     sql: &str,
     limits: &QueryLimits,
 ) -> anyhow::Result<Vec<u8>> {

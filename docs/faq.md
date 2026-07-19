@@ -132,8 +132,9 @@ partial, it says so here and is tracked as an issue whose acceptance criteria ar
   ([#27](https://github.com/explise/verdigris/issues/27))
 - `/v1/pipelines` is a shape-correct placeholder; `spendSeries` in `/v1/cost` is empty (no
   spend history store yet, [#33](https://github.com/explise/verdigris/issues/33)).
-- Free-text pruning is **file-level only** — inside a surviving file, `ILIKE` scans rows.
-  ([#23](https://github.com/explise/verdigris/issues/23))
+- Free-text pruning is trigram-based and prunes at both the **file** and the **row-group**
+  level; `attrs_json` matches still don't prune, and there is no ranking or phrase search
+  (it is a skip index, not a full inverted index).
 - OTLP is **JSON-only**; default OTel exporters speak protobuf and need their encoding set
   to `http/json`.
 
