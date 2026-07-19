@@ -32,9 +32,25 @@ jobs:
       - uses: actions/checkout@v4
 
       # shellcheck catches the class of shell bug the self-test cannot: unquoted
-      # expansions, misused [ ], subshell scoping. Preinstalled on ubuntu-latest.
-      - name: shellcheck
-        run: shellcheck scripts/verify.sh scripts/verify_selftest.sh .claude/hooks/on-edit.sh
+      # expansions, misused [ ], subshell scoping.
+      #
+      # Pinned rather than using the runner's preinstalled copy: versions differ
+      # in which code they emit for the same construct (a trap-invoked function
+      # is SC2317 on older releases, SC2329 on newer), so an unpinned runner
+      # upgrade silently breaks this lane. That exact drift already failed this
+      # workflow once. Bump deliberately, same as node 20 and the mkdocs pins.
+      - name: shellcheck (pinned)
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+        run: |
+          set -euo pipefail
+          # Extracted into RUNNER_TEMP, not /usr/local/bin — the latter is
+          # root-owned on the runner and the write would need sudo.
+          mkdir -p "$RUNNER_TEMP/sc"
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
+            | tar -xJf - --strip-components=1 -C "$RUNNER_TEMP/sc" "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+          "$RUNNER_TEMP/sc/shellcheck" --version
+          "$RUNNER_TEMP/sc/shellcheck" scripts/verify.sh scripts/verify_selftest.sh .claude/hooks/on-edit.sh
 
       # rustfmt is what per-path mode shells out to; without it the format-scoping
       # cases would report SKIP and silently cover nothing.

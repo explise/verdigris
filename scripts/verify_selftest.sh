@@ -35,7 +35,10 @@ FMT_UNNAMED="crates/ingest/src/schema.rs"
 FMT_NAMED_ORIG=$(cat "$FMT_NAMED")
 FMT_UNNAMED_ORIG=$(cat "$FMT_UNNAMED")
 
-# shellcheck disable=SC2329  # invoked via `trap ... EXIT`, not directly.
+# Invoked via `trap ... EXIT`, which shellcheck cannot see. Older versions flag
+# the body as unreachable (SC2317); newer ones flag the function as uncalled
+# (SC2329). Both are suppressed so this passes regardless of the version in use.
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   rm -rf "$TMPROOT"
   # Restore verbatim rather than via git, so this is safe on a dirty tree.
