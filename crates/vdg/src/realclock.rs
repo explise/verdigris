@@ -5,9 +5,6 @@ use async_trait::async_trait;
 use std::time::{SystemTime, UNIX_EPOCH};
 use verdigris_core::clock::{Clock, Millis};
 
-// Not yet constructed by any command — the seam is in place ahead of the
-// control-plane logic that will use it.
-#[allow(dead_code)]
 pub struct RealClock;
 
 #[async_trait]
