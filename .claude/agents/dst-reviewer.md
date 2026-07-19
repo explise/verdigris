@@ -49,4 +49,4 @@ clock can no longer control when a merge fires" beats "avoid SystemTime".
 If you find nothing, say so plainly. Do not pad the review.
 
 If a change alters timing assumptions, say how the calibration model gets re-fit —
-per §2.4, the sim is only as truthful as the model fed to `ModeledExecutor`.
+per §2.5, the sim is only as truthful as the model fed to `ModeledExecutor`.

@@ -9,10 +9,26 @@ use std::sync::Mutex;
 /// Milliseconds since an arbitrary epoch. Logical, not wall-clock.
 pub type Millis = u64;
 
+/// Microseconds on a monotonic timeline whose origin is arbitrary. Only
+/// differences are meaningful — never compare across `Clock` instances.
+pub type Micros = u64;
+
 #[async_trait]
 pub trait Clock: Send + Sync {
-    /// Current logical time in milliseconds.
+    /// Current logical time in milliseconds, as an epoch-style timestamp.
+    ///
+    /// This is *wall* time: it can jump forwards or backwards (NTP). Use it to
+    /// stamp events, never to measure how long something took.
     fn now_millis(&self) -> Millis;
+
+    /// A monotonic reading for measuring durations.
+    ///
+    /// Separate from [`Clock::now_millis`] for two reasons that both bit us:
+    /// wall time is not monotonic, so an NTP step mid-request produces a
+    /// negative or wildly inflated duration; and millisecond resolution rounds
+    /// every sub-millisecond request to zero, which silently destroys the p50
+    /// of any fast endpoint. Subtract two readings to get elapsed microseconds.
+    fn monotonic_micros(&self) -> Micros;
 
     /// Advance/await `ms`. Under simulation this advances logical time with no
     /// real waiting; in production it really sleeps.
@@ -49,6 +65,13 @@ impl Default for SimClock {
 impl Clock for SimClock {
     fn now_millis(&self) -> Millis {
         *self.now.lock().expect("sim clock poisoned")
+    }
+
+    /// Under simulation the monotonic timeline *is* logical time — it only ever
+    /// moves forward (there is no NTP to step it), so deriving it from the same
+    /// counter keeps a single source of truth and makes durations exact.
+    fn monotonic_micros(&self) -> Micros {
+        self.now_millis().saturating_mul(1_000)
     }
 
     async fn sleep(&self, ms: Millis) {

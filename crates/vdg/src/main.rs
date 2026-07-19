@@ -442,7 +442,7 @@ async fn apply_lifecycle(
 /// `RealClock` per call; `serve` threads a shared `Arc<dyn Clock>` instead.
 fn shell_now_millis() -> i64 {
     use verdigris_core::clock::Clock;
-    crate::realclock::RealClock.now_millis() as i64
+    crate::realclock::RealClock::new().now_millis() as i64
 }
 
 /// Accept either raw SQL (passed through) or the search DSL (compiled to SQL).

@@ -138,21 +138,39 @@ the production seam impls.
 
 ### 2.3 Known-legitimate hits — do not report these
 
-Grepping the rules above surfaces exactly these. Every one is correct as written.
+**This rule is enforced, not just documented.** `crates/vdg/tests/seams.rs` greps
+for every banned call and fails the build on any hit that is not in its `EXEMPT`
+table. It runs in every lane of the matrix, including the default offline one.
 
-Identified by symbol, not line number, so the table survives edits. If a grep hit
-is in a symbol not listed here, it is a candidate finding — do not assume the table
-covers it.
+**That test is the source of truth for exemptions — not this file.** An earlier
+version of this section listed symbols by hand, and went stale the moment the
+Clock seam was wired: it still named four functions as legitimate wall-clock
+callers after every one of them had been converted. Read `EXEMPT` in that test
+rather than trusting a prose list here.
 
-| Symbol | Why it is fine |
+As of writing there are exactly two exemptions, and a second test pins that count
+so a third cannot be added without the change appearing in the diff:
+
+| Exemption | Why |
 |---|---|
-| `core/src/clock.rs`, `core/src/rng.rs` — module `//!` headers | Doc comments *naming* the banned calls to explain the rule. Not code. The rest of both files must stay clean. |
-| `RealClock::now_millis` (`vdg/src/realclock.rs`) | The production `Clock` impl. Reading the wall clock is its job; it lives in the shell so core needn't. |
-| `now_millis()`, `gen_anchored()` (`vdg/src/main.rs`) | CLI-level timestamps and seeded sample generation, in the shell. |
-| `track_metrics()`, `h_query()` (`vdg/src/serve.rs`) | HTTP request-latency telemetry, in the shell. |
-| `gen_secret()` (`vdg/src/serve.rs`) | Mints a 256-bit auth token. **Must** use OS entropy — routing it through the seeded `Rng` would make auth tokens reproducible from a seed. Never "fix" this one. |
+| `crates/vdg/src/realclock.rs` (whole file) | The production `Clock` impl. Reading the wall clock is its job; it lives in the shell so core needn't. |
+| `gen_secret()` in `vdg/src/serve.rs` (function-scoped) | Mints a 256-bit auth token. **Must** use OS entropy — routing it through the seeded `Rng` would make auth tokens reproducible from a seed. Never "fix" this one. |
 
-### 2.4 What a green DST run does and does not prove
+Doc comments naming a banned call are not violations — the gate strips comments
+and string literals before matching, so explaining *why* a seam is used does not
+break the build.
+
+### 2.4 Measuring durations
+
+`Clock` exposes two readings, and mixing them up is the mistake to avoid:
+
+- `now_millis()` — wall time, for **stamping events**. Can step forwards or
+  backwards (NTP). Never subtract two of these to time something.
+- `monotonic_micros()` — monotonic, for **measuring durations**. Subtract two
+  readings. Microsecond resolution, because millisecond rounding flattens every
+  sub-millisecond request to zero and destroys the p50 of fast endpoints.
+
+### 2.5 What a green DST run does and does not prove
 
 Proves: orchestration, scheduling, tiering decisions, restore workflows,
 cost-estimate accuracy, and the *timing model* at scale.

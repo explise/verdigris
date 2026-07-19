@@ -14,7 +14,7 @@ The suite runs in well under a second. That speed is the point: these tests cove
 trillion-row / petabyte scenarios in **logical time**, so no real bytes move. A slow
 DST run is itself a signal that something started doing real work.
 
-Read **`AGENTS.md` §2.4** before reporting the result. The two things that matter:
+Read **`AGENTS.md` §2.5** before reporting the result. The two things that matter:
 
 - A green run proves orchestration, scheduling, tiering, restore workflows,
   cost-estimate accuracy, and the timing model. It does **not** prove absolute GB/s

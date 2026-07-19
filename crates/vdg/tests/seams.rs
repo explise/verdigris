@@ -78,12 +78,36 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// True if `line` is a comment or a string literal mentioning the pattern
-/// rather than calling it. The ADR and several doc comments name these calls in
-/// order to forbid them; naming is not calling.
-fn is_prose(line: &str) -> bool {
+/// Strip the parts of a line that mention a pattern without calling it, so the
+/// remaining text is code only. The ADR and many doc comments name these calls
+/// in order to forbid them, and naming is not calling — an earlier version
+/// matched only lines *starting* with `//`, so a trailing explanatory comment
+/// or an error string containing the pattern failed the build.
+fn code_only(line: &str) -> String {
     let t = line.trim_start();
-    t.starts_with("//") || t.starts_with("*") || t.starts_with("#!") || t.starts_with("///")
+    // Whole-line comments, including block-comment openers and continuations.
+    if t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') || t.starts_with("#!") {
+        return String::new();
+    }
+    // Trailing `//` comment.
+    let head = match line.find("//") {
+        Some(i) => &line[..i],
+        None => line,
+    };
+    // String literals. Crude but adequate: drop everything between double
+    // quotes, so `bail!("do not call thread_rng")` no longer trips the gate.
+    let mut out = String::with_capacity(head.len());
+    let mut in_str = false;
+    let mut prev_backslash = false;
+    for ch in head.chars() {
+        match ch {
+            '"' if !prev_backslash => in_str = !in_str,
+            _ if !in_str => out.push(ch),
+            _ => {}
+        }
+        prev_backslash = ch == '\\' && !prev_backslash;
+    }
+    out
 }
 
 #[test]
@@ -118,13 +142,22 @@ fn no_wall_clock_or_entropy_outside_the_seams() {
             continue;
         };
         let mut current_fn = String::new();
+        // Brace depth at which the current function body started. `current_fn`
+        // is cleared when we return to it, so a `static`/`const`/macro at module
+        // level after an exempt function does NOT inherit that exemption.
+        let mut fn_depth: Option<i32> = None;
+        let mut depth: i32 = 0;
 
         for (i, line) in text.lines().enumerate() {
+            let code = code_only(line);
             let trimmed = line.trim_start();
-            if trimmed.starts_with("fn ")
-                || trimmed.starts_with("pub fn ")
-                || trimmed.starts_with("async fn ")
-                || trimmed.starts_with("pub async fn ")
+            if fn_depth.is_none()
+                && (trimmed.starts_with("fn ")
+                    || trimmed.starts_with("pub fn ")
+                    || trimmed.starts_with("async fn ")
+                    || trimmed.starts_with("pub async fn ")
+                    || trimmed.starts_with("pub(crate) fn ")
+                    || trimmed.starts_with("pub async fn "))
             {
                 current_fn = trimmed
                     .split('(')
@@ -133,13 +166,13 @@ fn no_wall_clock_or_entropy_outside_the_seams() {
                     .rsplit(' ')
                     .next()
                     .unwrap_or("")
+                    .trim_end_matches('<')
                     .to_string();
+                fn_depth = Some(depth);
             }
-            if is_prose(line) {
-                continue;
-            }
+
             for (pat, why) in BANNED {
-                if !line.contains(pat) {
+                if !code.contains(pat) {
                     continue;
                 }
                 let scoped = format!("{rel}:{current_fn}");
@@ -150,10 +183,23 @@ fn no_wall_clock_or_entropy_outside_the_seams() {
                     "{}:{} in `{}` — {} ({})",
                     rel,
                     i + 1,
-                    current_fn,
+                    if current_fn.is_empty() {
+                        "<module level>"
+                    } else {
+                        current_fn.as_str()
+                    },
                     pat,
                     why
                 ));
+            }
+
+            depth += code.matches('{').count() as i32;
+            depth -= code.matches('}').count() as i32;
+            if let Some(d) = fn_depth {
+                if depth <= d {
+                    fn_depth = None;
+                    current_fn.clear();
+                }
             }
         }
     }
@@ -170,10 +216,13 @@ fn no_wall_clock_or_entropy_outside_the_seams() {
 /// grows, that should be a deliberate, reviewed act rather than a quiet drift.
 #[test]
 fn exemption_list_stays_small() {
-    assert!(
-        EXEMPT.len() <= 3,
-        "exemptions grew to {} — each one is a hole in the determinism claim. \
-         Justify it in review before raising this bound.",
-        EXEMPT.len()
+    // Pinned exactly, not bounded: with a `<=` bound an exemption could be added
+    // without any test failing, which is precisely the quiet drift this guards
+    // against. Changing the list must show up in the diff as a changed number.
+    assert_eq!(
+        EXEMPT.len(),
+        2,
+        "the exemption list changed — each entry is a hole in the determinism \
+         claim, so update this count deliberately and justify it in review"
     );
 }

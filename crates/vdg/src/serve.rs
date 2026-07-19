@@ -341,22 +341,29 @@ impl HttpMetrics {
     }
 }
 
+/// What the metrics middleware needs. A named struct rather than a tuple so the
+/// fields are self-describing and a future addition is a one-line change here
+/// instead of an edit at both the handler signature and the layer call — and so
+/// two same-shaped `Arc` fields cannot be silently swapped.
+#[derive(Clone)]
+struct MetricsCtx {
+    metrics: Arc<HttpMetrics>,
+    clock: Arc<dyn Clock>,
+}
+
 /// Middleware: time every request and record its status + latency.
 async fn track_metrics(
-    State((metrics, clock)): State<(Arc<HttpMetrics>, Arc<dyn Clock>)>,
+    State(MetricsCtx { metrics, clock }): State<MetricsCtx>,
     req: Request,
     next: Next,
 ) -> Response {
-    // Read through the `Clock` seam rather than `Instant::now()`, so request
-    // latency is observable in logical time under simulation. `saturating_sub`
-    // because a wall clock can step backwards (NTP) where a monotonic Instant
-    // could not — a backwards step reports 0ms rather than underflowing.
-    let start = clock.now_millis();
+    // Durations come from the monotonic reading, never from `now_millis`: wall
+    // time can step (NTP) and its millisecond resolution would round every
+    // sub-millisecond request to zero, flattening the p50 of fast endpoints.
+    let start = clock.monotonic_micros();
     let res = next.run(req).await;
-    metrics.observe(
-        clock.now_millis().saturating_sub(start) as f64,
-        res.status().as_u16(),
-    );
+    let micros = clock.monotonic_micros().saturating_sub(start);
+    metrics.observe(micros as f64 / 1000.0, res.status().as_u16());
     res
 }
 
@@ -786,6 +793,31 @@ pub async fn serve(
     frontend: PathBuf,
     role: Role,
 ) -> anyhow::Result<()> {
+    serve_with_clock(
+        cfg,
+        table,
+        port,
+        frontend,
+        role,
+        Arc::new(crate::realclock::RealClock::new()),
+    )
+    .await
+}
+
+/// `serve` with the `Clock` seam supplied by the caller.
+///
+/// This is the injection point ADR-001 requires: production passes `RealClock`,
+/// a simulation passes `SimClock` and drives the whole service — schedulers
+/// included — in logical time. Without it the seam is threaded but unreachable,
+/// which is the failure mode this seam exists to prevent.
+pub async fn serve_with_clock(
+    cfg: Config,
+    table: String,
+    port: u16,
+    frontend: PathBuf,
+    role: Role,
+    clock: Arc<dyn Clock>,
+) -> anyhow::Result<()> {
     // Auth setup (BEFORE cfg moves into the shared state). `[auth].token` (or
     // VERDIGRIS_API_TOKEN), when set, is the BOOTSTRAP ADMIN secret — use it to
     // issue per-user tokens via POST /v1/auth/tokens; those persist in the store
@@ -833,7 +865,7 @@ pub async fn serve(
         metrics: Arc::new(HttpMetrics::new()),
         query_history: Arc::new(tokio::sync::Mutex::new(boot_history)),
         compaction: Arc::new(CompactionMetrics::new()),
-        clock: Arc::new(crate::realclock::RealClock),
+        clock,
     };
 
     // Alert evaluator. On a writer role (the single manifest writer owns alert
@@ -986,7 +1018,10 @@ pub async fn serve(
         .layer(DefaultBodyLimit::max(max_body))
         .layer(CorsLayer::permissive())
         .layer(middleware::from_fn_with_state(
-            (metrics, metrics_clock),
+            MetricsCtx {
+                metrics,
+                clock: metrics_clock,
+            },
             track_metrics,
         ))
         .with_state(state);
@@ -1370,7 +1405,7 @@ async fn h_query(
     };
 
     // Run the query once, in the negotiated wire (never both).
-    let t0 = st.clock.now_millis();
+    let t0 = st.clock.monotonic_micros();
     let (arrow_body, json_rows) = if arrow {
         let bytes = verdigris_query::engine::query_table_arrow(
             s.clone(),
@@ -1394,7 +1429,7 @@ async fn h_query(
         .map_err(AppError::from_query)?;
         (Vec::new(), Value::Array(rows))
     };
-    let elapsed = st.clock.now_millis().saturating_sub(t0);
+    let elapsed = st.clock.monotonic_micros().saturating_sub(t0) / 1_000;
 
     let (min_ts, max_ts) = time_range(&m);
     let histogram = histogram(&s, st.table.as_str(), &files, min_ts, max_ts, &limits(&st))
