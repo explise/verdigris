@@ -46,6 +46,7 @@ use verdigris_core::alert::{
 };
 use verdigris_core::auth::{self, ApiToken, Role as AuthRole, TokensDoc};
 use verdigris_core::batch::{BatchPolicy, LogRecord};
+use verdigris_core::clock::Clock;
 use verdigris_core::config::{Config, StorageConfig};
 use verdigris_core::cost::{self, RetrievalMode};
 use verdigris_core::manifest::Manifest;
@@ -119,12 +120,18 @@ struct AppState {
     /// Observability for the background auto-compaction scheduler. Updated by the
     /// scheduler task; read (with a live pending count) by `/v1/metrics`.
     compaction: Arc<CompactionMetrics>,
+    /// The `Clock` seam (ADR-001). Every time read in this service goes through
+    /// here — never `SystemTime::now()` directly — so a test can substitute
+    /// `SimClock` and drive the service in logical time. `RealClock` in prod.
+    clock: Arc<dyn Clock>,
 }
 
 /// Counters for background auto-compaction. The live "pending files" figure is
 /// computed on demand from the manifest (see [`h_metrics`]); these track history.
 struct CompactionMetrics {
-    /// Wall-clock ms of the last run that merged files (0 = never).
+    /// Clock time (epoch ms) at which the last merging run finished — a
+    /// timestamp, not a duration (0 = never). Read through the `Clock` seam, so
+    /// under simulation this is logical time.
     last_run_ms: AtomicU64,
     /// Scheduler runs that actually merged files.
     runs_total: AtomicU64,
@@ -334,18 +341,29 @@ impl HttpMetrics {
     }
 }
 
+/// What the metrics middleware needs. A named struct rather than a tuple so the
+/// fields are self-describing and a future addition is a one-line change here
+/// instead of an edit at both the handler signature and the layer call — and so
+/// two same-shaped `Arc` fields cannot be silently swapped.
+#[derive(Clone)]
+struct MetricsCtx {
+    metrics: Arc<HttpMetrics>,
+    clock: Arc<dyn Clock>,
+}
+
 /// Middleware: time every request and record its status + latency.
 async fn track_metrics(
-    State(metrics): State<Arc<HttpMetrics>>,
+    State(MetricsCtx { metrics, clock }): State<MetricsCtx>,
     req: Request,
     next: Next,
 ) -> Response {
-    let start = std::time::Instant::now();
+    // Durations come from the monotonic reading, never from `now_millis`: wall
+    // time can step (NTP) and its millisecond resolution would round every
+    // sub-millisecond request to zero, flattening the p50 of fast endpoints.
+    let start = clock.monotonic_micros();
     let res = next.run(req).await;
-    metrics.observe(
-        start.elapsed().as_secs_f64() * 1000.0,
-        res.status().as_u16(),
-    );
+    let micros = clock.monotonic_micros().saturating_sub(start);
+    metrics.observe(micros as f64 / 1000.0, res.status().as_u16());
     res
 }
 
@@ -539,6 +557,7 @@ async fn evaluate_all(
     table: &str,
     lock: &tokio::sync::Mutex<()>,
     limits: &QueryLimits,
+    clock: &Arc<dyn Clock>,
 ) -> anyhow::Result<()> {
     let _g = lock.lock().await;
     for _ in 0..ALERTS_CAS_RETRIES {
@@ -550,7 +569,7 @@ async fn evaluate_all(
             .load_manifest()
             .await?;
         let files: Vec<String> = m.files.iter().map(|f| f.path.clone()).collect();
-        let now = crate::now_millis() as u64;
+        let now = clock.now_millis();
         // Webhooks for this pass, held until the state they announce is committed.
         let mut notifications: Vec<(String, Value)> = Vec::new();
         for a in doc.alerts.iter_mut() {
@@ -616,10 +635,12 @@ async fn notify_webhook(url: &str, payload: Value) -> anyhow::Result<()> {
 /// what it merged. Cheap when nothing is pending (no data is touched). Holds the
 /// ingest lock across the pass to avoid CAS thrash with local ingests (cross-
 /// replica writers are still resolved by the manifest CAS inside `compact`).
+#[allow(clippy::too_many_arguments)]
 async fn maybe_compact(
     s: &Store,
     table: &str,
     ingest_lock: &tokio::sync::Mutex<()>,
+    clock: &Arc<dyn Clock>,
     target_bytes: u64,
     trigger: usize,
     max_merge_files: usize,
@@ -662,7 +683,7 @@ async fn maybe_compact(
         metrics.runs_total.fetch_add(1, Ordering::Relaxed);
         metrics
             .last_run_ms
-            .store(crate::now_millis() as u64, Ordering::Relaxed);
+            .store(clock.now_millis(), Ordering::Relaxed);
         tracing::info!(files_merged = total_merged, passes, "auto-compaction ran");
     }
     Ok(())
@@ -675,13 +696,14 @@ async fn seed_example_alerts(
     s: &Store,
     table: &str,
     lock: &tokio::sync::Mutex<()>,
+    clock: &Arc<dyn Clock>,
 ) -> anyhow::Result<()> {
     let _g = lock.lock().await;
     let (existing, base) = load_alerts_versioned(s, table).await?;
     if !existing.alerts.is_empty() {
         return Ok(());
     }
-    let now = crate::now_millis() as u64;
+    let now = clock.now_millis();
     let mk =
         |id: &str, name: &str, sql: String, cmp: Comparator, threshold: f64, sev: &str| Alert {
             rule: AlertRule {
@@ -771,6 +793,31 @@ pub async fn serve(
     frontend: PathBuf,
     role: Role,
 ) -> anyhow::Result<()> {
+    serve_with_clock(
+        cfg,
+        table,
+        port,
+        frontend,
+        role,
+        Arc::new(crate::realclock::RealClock::new()),
+    )
+    .await
+}
+
+/// `serve` with the `Clock` seam supplied by the caller.
+///
+/// This is the injection point ADR-001 requires: production passes `RealClock`,
+/// a simulation passes `SimClock` and drives the whole service — schedulers
+/// included — in logical time. Without it the seam is threaded but unreachable,
+/// which is the failure mode this seam exists to prevent.
+pub async fn serve_with_clock(
+    cfg: Config,
+    table: String,
+    port: u16,
+    frontend: PathBuf,
+    role: Role,
+    clock: Arc<dyn Clock>,
+) -> anyhow::Result<()> {
     // Auth setup (BEFORE cfg moves into the shared state). `[auth].token` (or
     // VERDIGRIS_API_TOKEN), when set, is the BOOTSTRAP ADMIN secret — use it to
     // issue per-user tokens via POST /v1/auth/tokens; those persist in the store
@@ -818,6 +865,7 @@ pub async fn serve(
         metrics: Arc::new(HttpMetrics::new()),
         query_history: Arc::new(tokio::sync::Mutex::new(boot_history)),
         compaction: Arc::new(CompactionMetrics::new()),
+        clock,
     };
 
     // Alert evaluator. On a writer role (the single manifest writer owns alert
@@ -828,12 +876,13 @@ pub async fn serve(
             let table = state.table.clone();
             let lock = state.alerts_lock.clone();
             let lim = limits(&state);
-            let _ = seed_example_alerts(&s, table.as_str(), &lock).await;
-            let _ = evaluate_all(&s, table.as_str(), &lock, &lim).await;
+            let clock = state.clock.clone();
+            let _ = seed_example_alerts(&s, table.as_str(), &lock, &clock).await;
+            let _ = evaluate_all(&s, table.as_str(), &lock, &lim, &clock).await;
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(15)).await;
-                    if let Err(e) = evaluate_all(&s, table.as_str(), &lock, &lim).await {
+                    if let Err(e) = evaluate_all(&s, table.as_str(), &lock, &lim, &clock).await {
                         tracing::warn!(error = %e, "alert scheduler tick failed");
                     }
                 }
@@ -850,6 +899,7 @@ pub async fn serve(
             let cm = state.compaction.clone();
             let lock = state.ingest_lock.clone();
             let ccfg = state.cfg.compaction.clone();
+            let clock = state.clock.clone();
             tokio::spawn(async move {
                 let target = ccfg.target_bytes();
                 let interval = Duration::from_secs(ccfg.interval_secs.max(1));
@@ -859,6 +909,7 @@ pub async fn serve(
                         &s,
                         table.as_str(),
                         &lock,
+                        &clock,
                         target,
                         ccfg.trigger_pending_files,
                         ccfg.max_merge_files_per_pass,
@@ -962,10 +1013,17 @@ pub async fn serve(
     // process — it's rejected (413) before being buffered into memory. The
     // metrics layer is outermost so it times the full request.
     let metrics = state.metrics.clone();
+    let metrics_clock = state.clock.clone();
     let app = app
         .layer(DefaultBodyLimit::max(max_body))
         .layer(CorsLayer::permissive())
-        .layer(middleware::from_fn_with_state(metrics, track_metrics))
+        .layer(middleware::from_fn_with_state(
+            MetricsCtx {
+                metrics,
+                clock: metrics_clock,
+            },
+            track_metrics,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
@@ -1152,7 +1210,7 @@ async fn h_token_create(
         return Err(AppError::bad_request("name is required"));
     }
     let secret = gen_secret();
-    let now = crate::now_millis() as u64;
+    let now = st.clock.now_millis();
     let seq = st.alert_seq.fetch_add(1, Ordering::Relaxed);
     let token = ApiToken {
         id: format!("tok-{now}-{seq}"),
@@ -1228,7 +1286,7 @@ async fn h_audit_queries(State(st): State<AppState>) -> ApiResult {
         Some(q) => q,
         None => st.query_history.lock().await.iter().cloned().collect(),
     };
-    let now = crate::now_millis();
+    let now = st.clock.now_millis() as i64;
     let out: Vec<Value> = hist
         .iter()
         .rev()
@@ -1318,7 +1376,7 @@ async fn h_query(
     if tiers.is_empty() {
         tiers = Tier::ALL.to_vec();
     }
-    let window = verdigris_core::search::time_window(&req.sql, crate::now_millis());
+    let window = verdigris_core::search::time_window(&req.sql, st.clock.now_millis() as i64);
     // `service:`/`level:` equality in the query skips files proven free of the
     // value — the SAME predicates the estimate prunes on, so quote and scan stay
     // in lockstep. (Empty for raw SQL; those files prune by tier+window only.)
@@ -1337,12 +1395,17 @@ async fn h_query(
     let sql = if verdigris_core::search::looks_like_sql(&req.sql) {
         req.sql.clone()
     } else {
-        verdigris_core::search::to_sql(&req.sql, st.table.as_str(), crate::now_millis(), 200)
-            .map_err(AppError::bad_request)?
+        verdigris_core::search::to_sql(
+            &req.sql,
+            st.table.as_str(),
+            st.clock.now_millis() as i64,
+            200,
+        )
+        .map_err(AppError::bad_request)?
     };
 
     // Run the query once, in the negotiated wire (never both).
-    let t0 = std::time::Instant::now();
+    let t0 = st.clock.monotonic_micros();
     let (arrow_body, json_rows) = if arrow {
         let bytes = verdigris_query::engine::query_table_arrow(
             s.clone(),
@@ -1366,7 +1429,7 @@ async fn h_query(
         .map_err(AppError::from_query)?;
         (Vec::new(), Value::Array(rows))
     };
-    let elapsed = t0.elapsed().as_millis() as u64;
+    let elapsed = st.clock.monotonic_micros().saturating_sub(t0) / 1_000;
 
     let (min_ts, max_ts) = time_range(&m);
     let histogram = histogram(&s, st.table.as_str(), &files, min_ts, max_ts, &limits(&st))
@@ -1402,7 +1465,7 @@ async fn h_query(
         )
     });
     let rec = QueryRecord {
-        ts_millis: crate::now_millis(),
+        ts_millis: st.clock.now_millis() as i64,
         user,
         sql: req.sql.clone(),
         scanned_bytes,
@@ -1638,7 +1701,7 @@ async fn h_estimate(State(st): State<AppState>, Json(req): Json<EstimateReq>) ->
     let window = req
         .sql
         .as_deref()
-        .and_then(|q| verdigris_core::search::time_window(q, crate::now_millis()));
+        .and_then(|q| verdigris_core::search::time_window(q, st.clock.now_millis() as i64));
 
     // …and by `service:`/`level:` equality, the same file-level pruning the
     // executed query applies — so the quote prices exactly what the scan reads.
@@ -1929,7 +1992,7 @@ async fn h_cost(State(st): State<AppState>, Query(q): Query<CostQuery>) -> ApiRe
     // Top recent queries by scanned bytes, from the audit ring.
     let expensive: Vec<Value> = {
         let hist = st.query_history.lock().await;
-        let now = crate::now_millis();
+        let now = st.clock.now_millis() as i64;
         let mut recs: Vec<&QueryRecord> = hist.iter().collect();
         recs.sort_by_key(|r| std::cmp::Reverse(r.scanned_bytes));
         recs.into_iter()
@@ -1964,7 +2027,7 @@ async fn h_cost(State(st): State<AppState>, Query(q): Query<CostQuery>) -> ApiRe
 async fn h_alerts(State(st): State<AppState>) -> ApiResult {
     let s = store(&st)?;
     let doc = load_alerts(&s, st.table.as_str()).await?;
-    let now = crate::now_millis() as u64;
+    let now = st.clock.now_millis();
     let out: Vec<Value> = doc
         .alerts
         .iter()
@@ -2027,7 +2090,7 @@ async fn h_alert_create(
     }
     let s = store(&st)?;
     let _g = st.alerts_lock.lock().await;
-    let now = crate::now_millis() as u64;
+    let now = st.clock.now_millis();
     let seq = st.alert_seq.fetch_add(1, Ordering::Relaxed);
     let rule = AlertRule {
         id: format!("alert-{now}-{seq}"),
@@ -2082,7 +2145,7 @@ async fn h_pipelines(State(st): State<AppState>) -> ApiResult {
     let (_s, m) = manifest(&st).await?;
     let (_min_ts, max_ts) = time_range(&m);
     // Ingest lag = how stale the newest record is.
-    let lag_secs = ((crate::now_millis() - max_ts).max(0)) / 1000;
+    let lag_secs = ((st.clock.now_millis() as i64 - max_ts).max(0)) / 1000;
     // Parquet roll cadence ≈ table time-span / file count.
     let (min_ts, _mx) = time_range(&m);
     let span_secs = ((max_ts - min_ts).max(0)) / 1000;
@@ -2127,7 +2190,7 @@ async fn h_tail(State(st): State<AppState>) -> Sse<impl Stream<Item = Result<Eve
     // only newly-arriving rows, not the whole backlog.
     let last_ts = match manifest(&st).await {
         Ok((_s, m)) => m.files.iter().map(|f| f.max_ts).max().unwrap_or(0),
-        Err(_) => crate::now_millis(),
+        Err(_) => st.clock.now_millis() as i64,
     };
 
     let init = TailState {
@@ -2261,9 +2324,14 @@ mod tests {
         let lock = tokio::sync::Mutex::new(());
         let metrics = CompactionMetrics::new();
         let target = 10 * 1024 * 1024;
+        // Drive the production scheduler with `SimClock`, not the wall clock —
+        // this is the point of the seam. A fixed non-zero start stands in for a
+        // real epoch so `last_run_ms` is distinguishable from "never ran" (0).
+        let clock: Arc<dyn Clock> =
+            Arc::new(verdigris_core::clock::SimClock::new(1_700_000_000_000));
 
         // Trigger far above pending -> no-op; files and counters untouched.
-        maybe_compact(&s, "logs", &lock, target, 10_000, 128, &metrics)
+        maybe_compact(&s, "logs", &lock, &clock, target, 10_000, 128, &metrics)
             .await
             .unwrap();
         assert_eq!(metrics.runs_total.load(Ordering::Relaxed), 0);
@@ -2275,7 +2343,7 @@ mod tests {
 
         // Low trigger + tiny per-pass budget -> multiple bounded passes drain the
         // backlog fully; files shrink and metrics record one run.
-        maybe_compact(&s, "logs", &lock, target, 2, 2, &metrics)
+        maybe_compact(&s, "logs", &lock, &clock, target, 2, 2, &metrics)
             .await
             .unwrap();
         let after = ing.load_manifest().await.unwrap().files.len();

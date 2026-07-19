@@ -275,11 +275,7 @@ async fn main() -> anyhow::Result<()> {
 /// Generate `n` synthetic records anchored so the newest is ~now, keeping
 /// relative time windows (`last 1h`) populated. Avg inter-arrival ~200ms.
 fn gen_anchored(n: usize, seed: u64) -> Vec<verdigris_core::batch::LogRecord> {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let start = now_ms - (n as i64) * 200;
+    let start = shell_now_millis() - (n as i64) * 200;
     verdigris_ingest::generate::generate(n, seed, start)
 }
 
@@ -441,13 +437,12 @@ async fn apply_lifecycle(
     )
 }
 
-/// Current wall-clock time in epoch millis (shell-only; core stays sans-I/O).
-#[cfg(feature = "datafusion")]
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+/// Current time in epoch millis, read through the `Clock` seam rather than
+/// calling `SystemTime::now()` here. The CLI is one-shot so it constructs
+/// `RealClock` per call; `serve` threads a shared `Arc<dyn Clock>` instead.
+fn shell_now_millis() -> i64 {
+    use verdigris_core::clock::Clock;
+    crate::realclock::RealClock::new().now_millis() as i64
 }
 
 /// Accept either raw SQL (passed through) or the search DSL (compiled to SQL).
@@ -457,7 +452,7 @@ fn resolve_sql(query: &str, table: &str) -> anyhow::Result<String> {
     if search::looks_like_sql(query) {
         Ok(query.to_string())
     } else {
-        search::to_sql(query, table, now_millis(), 200)
+        search::to_sql(query, table, shell_now_millis(), 200)
             .map_err(|e| anyhow::anyhow!("search query error: {e}"))
     }
 }
