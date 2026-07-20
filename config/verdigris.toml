@@ -20,7 +20,18 @@ path = "./data"
 
 [query]
 # Query speed is a provisioned dial, decoupled from storage.
-modeled_mibps_per_core = 250.0
+#
+# `modeled_mibps_per_core` is MiB of *stored Parquet* per second per core — it
+# divides `ScanPlan::total_bytes()` in `ModeledExecutor`. Measured, not guessed:
+# see `docs/load-test.md`. DataFusion over MinIO at 8 cores sustained 892 MiB/s
+# on a 4-column scan and 635 MiB/s on a full-projection aggregate, i.e. 79-111
+# MiB/s/core; 100 is the round number in that band. The previous value of 250 was
+# a placeholder and only a metadata-only COUNT(*) (which reads no column data)
+# ever reached it.
+#
+# Still optimistic in one direction: measured against local MinIO, so it carries
+# no real-S3 first-byte latency. Treat it as the CPU-side decode ceiling.
+modeled_mibps_per_core = 100.0
 cores = 4
 
 # Severity-based write-time routing: which tier each level lands in.

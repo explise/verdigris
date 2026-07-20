@@ -252,8 +252,13 @@ impl Default for StorageConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct QueryConfig {
-    /// Modeled per-core scan throughput (MiB/s) used by the ModeledExecutor and
-    /// as the calibration target for the real executor.
+    /// Modeled per-core scan throughput, in MiB of *stored Parquet* per second
+    /// per core — it divides `ScanPlan::total_bytes()` in `ModeledExecutor`.
+    ///
+    /// Measured rather than guessed (`docs/load-test.md`): DataFusion over MinIO
+    /// at 8 cores sustained 79-111 MiB/s/core across realistic scan shapes.
+    /// ADR-001 requires this be calibrated, not assumed — the sim is only as
+    /// truthful as the latency model fed to it.
     pub modeled_mibps_per_core: f64,
     /// Provisioned query cores. Also caps the real engine's target partitions —
     /// each partition carries its own buffers, so this bounds concurrency and
@@ -280,7 +285,7 @@ pub struct QueryConfig {
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
-            modeled_mibps_per_core: 250.0,
+            modeled_mibps_per_core: 100.0,
             cores: 4,
             // Sized so the engine, the accumulated result and the rest of the
             // process all fit inside a 2 GB box with headroom.
