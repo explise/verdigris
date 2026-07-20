@@ -6,6 +6,11 @@ members = [
     "crates/query",
     "crates/vdg", "crates/ingest",
 ]
+# The load generator is deliberately outside the workspace: it must read the real
+# clock to measure anything, and `crates/vdg/tests/seams.rs` fails the build on
+# wall-clock calls anywhere under `crates/`. Excluding it keeps that gate strict
+# and keeps the generator's HTTP/TLS deps out of the workspace lockfile and CI.
+exclude = ["bench/loadgen"]
 
 [workspace.package]
 version = "0.0.1"

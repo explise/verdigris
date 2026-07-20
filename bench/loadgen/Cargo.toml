@@ -1,0 +1,27 @@
+[package]
+name = "verdigris-loadgen"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+# Deliberately NOT a workspace member (see `exclude` in the root Cargo.toml).
+#
+# Two reasons, both about keeping the product build honest:
+#   1. `crates/vdg/tests/seams.rs` recursively scans `crates/` and fails the build
+#      on any wall-clock or unseeded-entropy call outside its two-entry EXEMPT
+#      table. A load generator *must* read real time to measure anything, so it
+#      does not belong under `crates/`. Living here keeps the DST discipline gate
+#      meaningful rather than growing an exemption for benchmark code.
+#   2. An excluded crate has its own lockfile, so `reqwest` and its TLS stack never
+#      enter the workspace `Cargo.lock` and never get compiled by CI.
+[dependencies]
+verdigris-core = { path = "../../crates/core" }
+verdigris-ingest = { path = "../../crates/ingest" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

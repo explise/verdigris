@@ -1,0 +1,70 @@
+# Load-test image for the ingest node.
+#
+# Separate from the root `Dockerfile` for two reasons:
+#   1. That one uses `RUN --mount=type=cache`, which requires BuildKit. Machines
+#      without the buildx plugin fall back to the legacy builder and fail on it.
+#      This file uses plain layers so it builds anywhere.
+#   2. It skips the web/ Vite stage entirely. The load test drives HTTP endpoints;
+#      building a SolidJS bundle to benchmark ingest is pure build latency.
+#
+# The runtime half is kept deliberately identical to the production image —
+# same base, same non-root uid, same tini — so this measures the shipped binary's
+# behaviour and not a debug build in a different environment.
+
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+
+# --- dependency cache layer -------------------------------------------------
+# Copy only the manifests and build against stub sources. This layer is keyed on
+# Cargo.toml/Cargo.lock alone, so editing anything under crates/ leaves it valid
+# and only our own five crates recompile in the layer below.
+#
+# Without this split, `COPY crates` sat directly above the build and any source
+# edit forced a from-scratch rebuild of the whole dependency tree — DataFusion,
+# Arrow and Parquet included, ~10-20 min per run. That cost lands on every
+# benchmark iteration, which is exactly when it hurts most.
+#
+# This is the BuildKit-free equivalent of `RUN --mount=type=cache`; see the note
+# at the top of this file for why we can't use that here.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/core/Cargo.toml    crates/core/Cargo.toml
+COPY crates/storage/Cargo.toml crates/storage/Cargo.toml
+COPY crates/query/Cargo.toml   crates/query/Cargo.toml
+COPY crates/ingest/Cargo.toml  crates/ingest/Cargo.toml
+COPY crates/vdg/Cargo.toml     crates/vdg/Cargo.toml
+# Stubs only need to exist and compile; cargo builds every *declared* dependency
+# regardless of whether the stub source references it, so the cache is complete.
+# Same feature set as the real build — `serve` pulls in datafusion, the big one.
+RUN mkdir -p crates/core/src crates/storage/src crates/query/src \
+             crates/ingest/src crates/vdg/src \
+    && : > crates/core/src/lib.rs \
+    && : > crates/storage/src/lib.rs \
+    && : > crates/query/src/lib.rs \
+    && : > crates/ingest/src/lib.rs \
+    && echo 'fn main() {}' > crates/vdg/src/main.rs \
+    && cargo build --release --features "serve apply" -p vdg
+
+# --- real sources -----------------------------------------------------------
+COPY crates ./crates
+# COPY carries mtimes from the build context, which can predate the stub build
+# above. Touch so cargo reliably sees our own crates as dirty; cached dependency
+# artifacts are untouched and are reused.
+RUN find crates -name '*.rs' -exec touch {} + \
+    && cargo build --release --features "serve apply" -p vdg \
+    && cp /src/target/release/vdg /usr/local/bin/vdg
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tini ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -u 10001 -m verdigris
+
+COPY --from=builder /usr/local/bin/vdg /usr/local/bin/vdg
+RUN mkdir -p /app/data /app/config && chown -R verdigris:verdigris /app
+
+USER verdigris
+ENV VERDIGRIS_CONFIG=/app/config/loadtest.toml
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/bin/tini", "--", "vdg"]
+CMD ["serve", "--port", "8080", "--table", "logs", "--role", "ingest"]

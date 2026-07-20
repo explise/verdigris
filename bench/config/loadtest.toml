@@ -1,0 +1,54 @@
+# Verdigris config for the ingest load test (see `docs/load-test.md`).
+#
+# Differs from `config/verdigris.toml` in exactly one intentional way: storage is
+# S3 (MinIO) rather than the local filesystem, so the run exercises the real
+# object-store path — CAS manifest commits, PUT latency, retry — instead of a
+# `fs::write`. Everything else is left at production defaults so the numbers
+# describe shipped behaviour, not a tuned-for-benchmark configuration.
+
+[storage]
+backend = "s3"
+bucket = "verdigris"
+region = "us-east-1"
+endpoint = "http://minio:9000"
+allow_http = true
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+prefix = ""
+
+[query]
+# The values this load test exists to replace with measurements. Left at their
+# defaults on purpose: calibrating against an already-calibrated config would be
+# circular.
+modeled_mibps_per_core = 250.0
+cores = 4
+
+[routing]
+error = "hot"
+warn = "warm"
+info = "warm"
+debug = "cold"
+
+[lifecycle]
+hot_to_warm_days = 3
+warm_to_cold_days = 30
+expire_days = 400
+
+[auth]
+enabled = false
+
+[ingest]
+max_body_bytes = 16777216   # 16 MiB
+max_inflight = 32
+max_batch_rows = 100000
+max_batch_bytes = 134217728 # 128 MiB
+
+[compaction]
+# Left ENABLED at defaults. Disabling it would produce a prettier curve that
+# lies: compaction competing with ingest for CPU and IO is production behaviour
+# and is hypothesis 5 in the brief. The ramp measures it rather than hiding it.
+enabled = true
+target_mib = 256
+trigger_pending_files = 16
+max_merge_files_per_pass = 128
+interval_secs = 300
