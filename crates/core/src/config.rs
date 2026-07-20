@@ -5,6 +5,7 @@
 //! This module is pure: it defines the types and parses a TOML *string*. Locating
 //! and *reading* the config file is I/O and lives in the `vdg` shell.
 
+use crate::batch::BatchPolicy;
 use crate::model::{Level, Tier};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -35,13 +36,38 @@ pub struct IngestConfig {
     /// Max concurrent in-flight ingest requests; beyond this the server sheds with
     /// 429 (backpressure) instead of queueing bodies in memory unboundedly.
     pub max_inflight: usize,
+    /// Roll a Parquet file once a tier's buffer reaches this many rows.
+    ///
+    /// Exposed on the HTTP path (not just the CLI) because otherwise the *client's*
+    /// request size silently decides the PUT rate: `Ingestor::ingest` flushes any
+    /// leftover buffer at the end of every call, so each POST writes at least one
+    /// file per tier it touches regardless of these thresholds. Without a server-side
+    /// knob, a batch-size-vs-throughput sweep would only be measuring the load
+    /// generator. See `docs/load-test.md`.
+    pub max_batch_rows: usize,
+    /// Roll a Parquet file once a tier's buffer reaches this many bytes
+    /// (`LogRecord::approx_bytes`, so in-memory size — not the compressed size).
+    pub max_batch_bytes: usize,
 }
 
 impl Default for IngestConfig {
     fn default() -> Self {
+        let batch = BatchPolicy::default();
         Self {
             max_body_bytes: 16 * 1024 * 1024, // 16 MiB
             max_inflight: 32,
+            max_batch_rows: batch.max_rows,
+            max_batch_bytes: batch.max_bytes,
+        }
+    }
+}
+
+impl IngestConfig {
+    /// The configured file-rolling policy for the HTTP ingest path.
+    pub fn batch_policy(&self) -> BatchPolicy {
+        BatchPolicy {
+            max_rows: self.max_batch_rows,
+            max_bytes: self.max_batch_bytes,
         }
     }
 }
@@ -310,6 +336,27 @@ mod tests {
             _ => panic!("expected s3"),
         }
         assert_eq!(c.query.cores, 8);
+    }
+
+    #[test]
+    fn batch_policy_defaults_match_and_are_overridable() {
+        // Absent [ingest] section must reproduce BatchPolicy::default() exactly:
+        // wiring the HTTP path to config is only safe if it is a no-op by default.
+        let c = Config::default();
+        let d = BatchPolicy::default();
+        assert_eq!(c.ingest.batch_policy().max_rows, d.max_rows);
+        assert_eq!(c.ingest.batch_policy().max_bytes, d.max_bytes);
+
+        let toml = r#"
+            [ingest]
+            max_batch_rows = 5000
+            max_batch_bytes = 8388608
+        "#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert_eq!(c.ingest.batch_policy().max_rows, 5_000);
+        assert_eq!(c.ingest.batch_policy().max_bytes, 8 * 1024 * 1024);
+        // Untouched neighbours keep their defaults.
+        assert_eq!(c.ingest.max_inflight, 32);
     }
 
     #[test]
