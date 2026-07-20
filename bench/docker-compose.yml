@@ -1,0 +1,85 @@
+# Ingest load-test stack: MinIO + a single Verdigris ingest node.
+#
+#   docker compose -f bench/docker-compose.yml up -d --build
+#   cargo run --release --manifest-path bench/loadgen/Cargo.toml -- --url http://localhost:8080
+#
+# Images are pinned by digest-bearing tag so a rerun months from now measures the
+# same software. A benchmark nobody can re-run is a screenshot.
+#
+# Exactly ONE vdg node, by design: per ADR-0003 the ingest role is the single
+# manifest writer. Scaling this service to 2 replicas would not double throughput,
+# it would produce manifest CAS conflicts — which is itself hypothesis 3, and is
+# measured by ramping load against one node rather than by adding nodes.
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      # Silence the update nag so it does not appear in captured logs.
+      MINIO_UPDATE: "off"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    # MinIO is the system under test's storage, not the thing being measured.
+    # Give it room so it is not the artificial bottleneck, and record what it got.
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 2g
+
+  # One-shot: create the bucket, then exit. `vdg` fails its health probe without it.
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/verdigris &&
+      echo 'bucket ready'
+      "
+
+  vdg:
+    build:
+      context: ..
+      dockerfile: bench/Dockerfile.vdg
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      VERDIGRIS_CONFIG: /app/config/loadtest.toml
+      # Bound the server's thread pool explicitly. Left unset, tokio sizes it to
+      # the host's core count, so a "MiB/s per core" figure would be divided by a
+      # number nobody recorded — and the calibration constant would be unusable.
+      TOKIO_WORKER_THREADS: "${VDG_WORKER_THREADS:-8}"
+      RUST_LOG: "warn"
+    volumes:
+      - ./config/loadtest.toml:/app/config/loadtest.toml:ro
+    ports:
+      - "8080:8080"
+    # `all`, not `ingest`: still exactly one manifest writer (what ADR-0003
+    # requires), but the read routes stay mounted so the run can prove the
+    # ingest -> Parquet -> query round trip and scrape /v1/pipelines. With
+    # --role ingest those routes 404 and the load test would only ever prove
+    # that bytes were accepted, never that they are readable afterwards.
+    command: ["serve", "--port", "8080", "--table", "logs", "--role", "all"]
+    deploy:
+      resources:
+        limits:
+          cpus: "${VDG_CPUS:-8}"
+          memory: 4g
+
+volumes:
+  minio-data:

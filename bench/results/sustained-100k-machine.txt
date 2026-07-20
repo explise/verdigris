@@ -1,0 +1,11 @@
+date_utc=2026-07-19T17:16:10Z
+host_cpus=16
+host_mem_kb=12246692
+kernel=6.18.33.2-microsoft-standard-WSL2
+docker=29.6.2
+vdg_cpus=8
+vdg_worker_threads=8
+git_commit=72d531b
+git_dirty=8
+scenario=sustained 100k rec/s (20.51 MiB/s), 70s, fixed rate, single step
+note=compaction interval_secs=300 so no pass fires in 70s

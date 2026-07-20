@@ -1,5 +1,7 @@
-# Rust build output
+# Rust build output. `bench/loadgen` is excluded from the workspace, so it builds
+# into its own target dir that the anchored rule above would miss.
 /target
+/bench/loadgen/target
 
 # Local data written by the default (offline) storage backend
 /data
