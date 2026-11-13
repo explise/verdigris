@@ -23,7 +23,9 @@ worth recording" below). It was fixed at 19:32 on the run date. `sustained.json`
 (19:18), `run1-archive/*` (19:08), and the `body-*`/`conc-*` sweeps were written
 before that and are not evidence of ingest throughput. Everything post-fix carries
 a `replayed_requests` field that the fix added; those artifacts do not, which
-identifies them without trusting a file timestamp.
+identifies them without trusting a file timestamp. (`corpus_mib` would be the
+other useful marker, but the generator only echoes `--corpus-mib` at startup — no
+artifact records it, pre- or post-fix.)
 
 Withdrawn or qualified by this revision:
 
@@ -149,8 +151,8 @@ M1.1, and the one clean comparison in the artifacts points at it — see below.
 `latest.json`'s 100 MiB/s step, which reached **68.6 MiB/s** at the same
 concurrency. The likely difference is stack state: the `c2`/`b2` sweeps ran
 against a stack that accumulated files as they went, while `latest.json` started
-from a wiped volume. Within that same run the next step fell to 57.6 MiB/s, so
-whatever the fresh bucket bought had partly eroded within 40s.
+from a wiped volume. Within that same run the next step — 25s later — fell to 57.6
+MiB/s, so whatever the fresh bucket bought had partly eroded already.
 
 If manifest growth explains the 41.9 vs 68.6 gap, that is a direct H3 signal. This
 report does not establish it: the two runs differ in more than file count, and no
