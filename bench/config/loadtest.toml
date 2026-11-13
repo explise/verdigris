@@ -19,9 +19,12 @@ secret_access_key = "minioadmin"
 prefix = ""
 
 [query]
-# The values this load test exists to replace with measurements. Left at their
-# defaults on purpose: calibrating against an already-calibrated config would be
-# circular.
+# The values this load test exists to replace with measurements. `cores` is left
+# at its default on purpose: calibrating against an already-calibrated config
+# would be circular. `modeled_mibps_per_core` is pinned to the 250.0 placeholder
+# that this bench was built to replace, not the 100.0 the harness later measured
+# — a bench config that quietly inherits the calibrated value cannot be used to
+# re-derive it.
 modeled_mibps_per_core = 250.0
 cores = 4
 

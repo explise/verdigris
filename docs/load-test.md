@@ -151,7 +151,7 @@ Three caveats that must travel with any number from this harness:
 | Bloom filters | same | trace_id, service, level, message |
 | `compaction.trigger_pending_files` | `config.rs` | 16 |
 | `compaction.interval_secs` | same | 300 (30 in `bench/config/loadtest.toml`) |
-| `query.modeled_mibps_per_core` | same | 250.0 ← the guess being calibrated |
+| `query.modeled_mibps_per_core` | same | 100.0, measured (250.0 was the placeholder) |
 
 **`ROWS_PER_ROW_GROUP` is not a perf knob.** It is pinned at 128 Ki deliberately:
 the trigram row-group index is positional (set *i* describes row group *i*), so a
