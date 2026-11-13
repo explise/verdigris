@@ -29,6 +29,22 @@ use verdigris_core::model::Level;
 use verdigris_ingest::Ingestor;
 use verdigris_storage::Store;
 
+/// The premise of the ignored tests, pinned where it can run everywhere: the S3
+/// backend has conditional put on unless told otherwise, so `build()`'s S3 arm
+/// gets real CAS with no extra configuration.
+///
+/// It is worth a test of its own because the failure mode is silent: with
+/// conditional put disabled, `AmazonS3::put_opts` returns `NotImplemented`, and
+/// `commit_manifest` reads that as "backend cannot do CAS" and falls back to a
+/// plain put — last-write-wins, exactly the lost update the CAS exists to stop.
+#[test]
+fn s3_backend_enables_conditional_put_by_default() {
+    assert!(matches!(
+        object_store::aws::S3ConditionalPut::default(),
+        object_store::aws::S3ConditionalPut::ETagMatch
+    ));
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
