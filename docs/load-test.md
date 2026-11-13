@@ -73,7 +73,8 @@ the generator's allocator.
 
 ## Findings (2026-07-19)
 
-Full writeup with all tables: [`bench/results/RESULTS.md`](../bench/results/RESULTS.md).
+Full writeup with all tables:
+[`bench/results/RESULTS.md`](https://github.com/explise/verdigris/blob/main/bench/results/RESULTS.md).
 
 Ingest saturates at **~43 MiB/s (~205k records/s)** on a 16-core host, and the
 limit is **serialization, not any hardware resource** — the node used 0.84 of its

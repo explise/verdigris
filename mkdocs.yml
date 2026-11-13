@@ -74,6 +74,7 @@ nav:
   - Internals:
       - Architecture: ARCHITECTURE.md
       - Testing (DST): dst-architecture.md
+      - Ingest load test & calibration: load-test.md
       - Decision Records:
           - Overview: adr/README.md
           - "ADR-0002 · Manifest as Iceberg stand-in": adr/0002-manifest-as-iceberg-standin.md
