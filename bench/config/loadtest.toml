@@ -1,10 +1,12 @@
 # Verdigris config for the ingest load test (see `docs/load-test.md`).
 #
-# Differs from `config/verdigris.toml` in exactly one intentional way: storage is
-# S3 (MinIO) rather than the local filesystem, so the run exercises the real
-# object-store path — CAS manifest commits, PUT latency, retry — instead of a
-# `fs::write`. Everything else is left at production defaults so the numbers
-# describe shipped behaviour, not a tuned-for-benchmark configuration.
+# Differs from `config/verdigris.toml` in exactly two intentional ways, both
+# noted at the key that carries them: storage is S3 (MinIO) rather than the local
+# filesystem, so the run exercises the real object-store path — CAS manifest
+# commits, PUT latency, retry — instead of a `fs::write`; and the compaction
+# check cadence is shortened so a run of the length this harness produces
+# actually contains a pass. Everything else is left at production defaults so the
+# numbers describe shipped behaviour, not a tuned-for-benchmark configuration.
 
 [storage]
 backend = "s3"
@@ -44,11 +46,29 @@ max_batch_rows = 100000
 max_batch_bytes = 134217728 # 128 MiB
 
 [compaction]
-# Left ENABLED at defaults. Disabling it would produce a prettier curve that
-# lies: compaction competing with ingest for CPU and IO is production behaviour
-# and is hypothesis 5 in the brief. The ramp measures it rather than hiding it.
+# ENABLED — and only the *cadence* is shortened from production.
+#
+# `interval_secs` is how often the scheduler checks, not whether compaction
+# happens. Production crosses `trigger_pending_files = 16` within a second of
+# sustained load (a request writes one file per tier it touches — ~30 files/s at
+# 40 MiB/s), so a node compacts on every tick from its first one onward; the
+# cadence decides how much of a backlog each pass drains, not whether there is
+# one.
+#
+# What is not negotiable is the first tick: the scheduler sleeps before its first
+# pass, so a run shorter than `interval_secs` never compacts at all. At the
+# production 300s, no run in `bench/results/` — the longest is 165s — ever
+# reached a tick, so all of them measured a node with compaction switched off
+# while the config claimed it was on (#48). 30s is chosen against the default
+# ramp in `run-loadtest.sh`: the generator stops after two non-improving steps,
+# so a run is 2-3 steps of 20s plus 5s settles — ~45s at worst, ~75s typically —
+# and 30s puts at least one tick inside even that shortest run. Retune if you
+# change `--steps`/`--step-secs`; the script prints whether a pass was observed.
+#
+# Enabled rather than off: disabling it would produce a prettier curve that lies
+# about hypothesis 5.
 enabled = true
 target_mib = 256
 trigger_pending_files = 16
 max_merge_files_per_pass = 128
-interval_secs = 300
+interval_secs = 30

@@ -71,6 +71,35 @@ echo "==> ramping"
 kill "$SAMPLER" 2>/dev/null || true
 SAMPLER=""
 
+# Whether compaction ran is a fact about the run, not about the config: the
+# scheduler starts its first pass only after `compaction.interval_secs`, so a
+# short ramp against "compaction enabled" can have compacted nothing (#48).
+comp_stats=$(curl -s --max-time 180 http://localhost:8080/v1/metrics 2>/dev/null | python3 -c '
+import sys, json
+c = json.load(sys.stdin)["compaction"]
+print(c["runsTotal"], c["filesMergedTotal"], c["pendingFiles"], str(c["enabled"]).lower())
+' 2>/dev/null) || comp_stats=""
+
+echo "==> compaction observed"
+if [[ -z "$comp_stats" ]]; then
+  echo "!! could not read /v1/metrics; compaction unverified for this run" >&2
+else
+  read -r runs merged pending enabled <<<"$comp_stats"
+  echo "  enabled=$enabled runs=$runs files_merged=$merged still_pending=$pending"
+  # Record it next to machine.txt's config, so a curve can never again be read
+  # as having measured compaction when its run never reached a tick.
+  {
+    echo "compaction_enabled=$enabled"
+    echo "compaction_runs=$runs"
+    echo "compaction_files_merged=$merged"
+  } >> "$RESULTS/machine.txt"
+  if [[ "$enabled" == true && "$runs" -eq 0 ]]; then
+    echo "!! compaction is enabled but no pass ran: this run was shorter than" >&2
+    echo "   compaction.interval_secs (bench/config/loadtest.toml), so the curve" >&2
+    echo "   does not exercise compaction. Lengthen --steps/--step-secs." >&2
+  fi
+fi
+
 echo "==> peak CPU by container"
 awk -F, 'NR>1 {if ($3+0 > m[$2]) m[$2]=$3+0} END {for (c in m) printf "  %-28s %6.1f%%\n", c, m[c]}' \
   "$RESULTS/resources.csv" | sort
