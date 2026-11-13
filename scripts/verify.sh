@@ -168,6 +168,13 @@ check_rust() {
   have cargo || { note_skip "cargo not installed; the entire rust group was not run"; return; }
   run "fmt"               cargo fmt --all -- --check
   run "test (default)"    cargo test --workspace
+  # The default lane runs the DST suite at seed 0 only. A seed sweep only proves
+  # anything with faults injected (the harness does that), so this is the
+  # per-PR batch from issue #10 — keep the seed count in sync with
+  # .github/workflows/dst-sweep.yml. The 100k nightly sweep is not an edit-time
+  # check and stays out of this script.
+  run "dst sweep (256)"   env DST_SEED_COUNT=256 \
+    cargo test -p verdigris-storage --test dst -- --nocapture
   run "test (datafusion)" cargo test --workspace --features vdg/datafusion
   run "test (serve)"      cargo test --workspace --features vdg/serve
   run "clippy (default)"  cargo clippy --workspace --all-targets -- -D warnings

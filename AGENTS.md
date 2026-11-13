@@ -75,8 +75,13 @@ once hid exactly there. `cargo test --workspace` alone is not green.
 The deterministic-simulation suite is fast enough to run constantly:
 
 ```sh
-cargo test -p verdigris-storage --test dst    # 4 tests, ~0.4s
+cargo test -p verdigris-storage --test dst                    # 4 tests, ~0.5s, seed 0
+DST_SEED_COUNT=256 cargo test -p verdigris-storage --test dst  # per-PR seed sweep, ~1s
 ```
+
+The second command is the batch that `scripts/verify.sh --all rust` and
+`.github/workflows/dst-sweep.yml` run; it sweeps seeds with faults injected (see
+`docs/dst-architecture.md`). Without `DST_SEED_COUNT` the suite runs one seed.
 
 ---
 
@@ -182,6 +187,7 @@ a green DST run as evidence of real-world throughput.
 
 A DST failure is deterministic and fully reproducible: one seed reproduces the run.
 Report the seed and the failing assertion, and trace it to the implicated seam.
+The suite's seed sweep prints the exact rerun command with every failure.
 
 Be especially suspicious of `estimator_matches_what_the_store_bills` failing — that
 means the sim cost model and the user-facing estimator have diverged, which is the
