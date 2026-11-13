@@ -185,8 +185,9 @@ impl TrigramSet {
             return None;
         }
         let mut set = Self::new();
-        for chunk in raw[SPARSE_HEADER..].chunks_exact(2) {
-            let idx = u16::from_le_bytes([chunk[0], chunk[1]]) as usize;
+        // Length was checked to be exactly header + 2n, so the remainder is empty.
+        for chunk in raw[SPARSE_HEADER..].as_chunks::<2>().0 {
+            let idx = u16::from_le_bytes(*chunk) as usize;
             // An out-of-range index means corruption. Refuse rather than clamp:
             // silently dropping it would under-record the set, and an
             // under-recorded set prunes files that may hold real matches.
