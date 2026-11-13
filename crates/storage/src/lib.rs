@@ -2,8 +2,8 @@
 //!
 //! Everything in the system reads/writes bytes through `object_store::ObjectStore`
 //! (a trait). [`build`] turns config into a concrete backend, so the same code
-//! path runs against the local filesystem, an in-memory store, or S3/MinIO with
-//! only a config change. The [`SimObjectStore`] (DST) plugs in here too — it is a
+//! path runs against the local filesystem, an in-memory store, S3/MinIO, or GCS
+//! with only a config change. The [`SimObjectStore`] (DST) plugs in here too — it is a
 //! real `ObjectStore`, so it drops into the same `Store` handle, but it is wired
 //! by the simulation harness (it needs seam handles) rather than by [`build`],
 //! which stays prod-only.
@@ -12,9 +12,11 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use object_store::aws::AmazonS3Builder;
+use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjPath;
+use object_store::prefix::PrefixStore;
 // 0.13 moved put/get/delete into the ObjectStoreExt convenience trait.
 use object_store::{ObjectStore, ObjectStoreExt};
 use verdigris_core::config::StorageConfig;
@@ -66,6 +68,30 @@ pub fn build(cfg: &StorageConfig) -> anyhow::Result<Store> {
             let s3 = b.build().context("building S3 client")?;
             Ok(Arc::new(s3))
         }
+        StorageConfig::Gcs {
+            bucket,
+            service_account,
+            endpoint,
+            prefix,
+        } => {
+            // Same shape as the S3 arm: standard env chain first, explicit
+            // config second, so GCE/GKE workload identity needs no config.
+            let mut b = GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket);
+            if let Some(p) = service_account {
+                b = b.with_service_account_path(p);
+            }
+            if let Some(e) = endpoint {
+                b = b.with_base_url(e);
+            }
+            let gcs = b.build().context("building GCS client")?;
+            // Unlike the S3 arm's dormant prefix, this one is honoured: all
+            // keys are namespaced under it, keeping several log trees in one
+            // bucket from colliding.
+            match prefix.as_deref() {
+                Some(p) if !p.is_empty() => Ok(Arc::new(PrefixStore::new(gcs, p))),
+                _ => Ok(Arc::new(gcs)),
+            }
+        }
     }
 }
 
@@ -79,6 +105,12 @@ pub fn describe(cfg: &StorageConfig) -> String {
         } => match endpoint {
             Some(e) => format!("s3 bucket '{bucket}' via {e}"),
             None => format!("s3 bucket '{bucket}' (aws)"),
+        },
+        StorageConfig::Gcs {
+            bucket, endpoint, ..
+        } => match endpoint {
+            Some(e) => format!("gcs bucket '{bucket}' via {e}"),
+            None => format!("gcs bucket '{bucket}' (google cloud)"),
         },
     }
 }
@@ -111,5 +143,29 @@ mod tests {
         let store = build(&StorageConfig::Memory).unwrap();
         let path = health_probe(&store).await.unwrap();
         assert_eq!(path.as_ref(), "_verdigris/.health-probe");
+    }
+
+    #[test]
+    fn describes_gcs_bucket_and_endpoint() {
+        // No client is constructed here: `describe` is pure, so this stays
+        // runnable on a machine with no GCP credentials.
+        let cfg = StorageConfig::Gcs {
+            bucket: "verdigris-logs".to_string(),
+            service_account: None,
+            endpoint: None,
+            prefix: None,
+        };
+        assert_eq!(describe(&cfg), "gcs bucket 'verdigris-logs' (google cloud)");
+
+        let cfg = StorageConfig::Gcs {
+            bucket: "verdigris-logs".to_string(),
+            service_account: None,
+            endpoint: Some("http://localhost:4443".to_string()),
+            prefix: Some("logs".to_string()),
+        };
+        assert_eq!(
+            describe(&cfg),
+            "gcs bucket 'verdigris-logs' via http://localhost:4443"
+        );
     }
 }

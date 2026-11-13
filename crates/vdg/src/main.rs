@@ -414,6 +414,15 @@ async fn run_lifecycle(cfg: &Config, table: &str, apply: bool) -> anyhow::Result
             eprintln!("#   aws s3api put-bucket-lifecycle-configuration --bucket {bucket} \\");
             eprintln!("#     --lifecycle-configuration file://lifecycle.json");
         }
+        // The policy printed above is the S3 shape — `core::lifecycle` renders an
+        // S3 `LifecycleConfiguration`. GCS expresses the same intent in a
+        // different schema, so say that rather than handing over JSON that
+        // `gcloud` would reject.
+        verdigris_core::config::StorageConfig::Gcs { bucket, .. } => {
+            eprintln!("\n# GCS lifecycle is not implemented: the policy above is the S3");
+            eprintln!("# schema, which a GCS bucket cannot consume. Translate it by hand:");
+            eprintln!("#   gcloud storage buckets update gs://{bucket} --lifecycle-file=<gcs-lifecycle.json>");
+        }
         _ => {
             eprintln!("\n# (local backend has no lifecycle — this is the policy you'd apply on S3)")
         }

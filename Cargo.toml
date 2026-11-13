@@ -33,7 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 # Versions aligned with DataFusion 54 so our Arc<dyn ObjectStore> and Parquet
 # bytes interop cleanly with the query engine (object_store 0.13, arrow/parquet 58).
-object_store = { version = "0.13", features = ["aws"] }
+object_store = { version = "0.13", features = ["aws", "gcp"] }
 bytes = "1"
 rand = "0.8"
 futures = "0.3"

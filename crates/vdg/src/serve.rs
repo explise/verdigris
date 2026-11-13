@@ -1857,6 +1857,7 @@ async fn h_settings(State(st): State<AppState>) -> ApiResult {
         }
         StorageConfig::Local { path } => (format!("local://{}", path.display()), String::new()),
         StorageConfig::Memory => ("memory://".to_string(), String::new()),
+        StorageConfig::Gcs { bucket, .. } => (bucket.clone(), String::new()),
     };
 
     Ok(Json(json!({
@@ -1888,6 +1889,7 @@ async fn h_config(State(st): State<AppState>) -> ApiResult {
             (format!("local://{}", path.display()), "local".to_string())
         }
         StorageConfig::Memory => ("memory://".to_string(), "local".to_string()),
+        StorageConfig::Gcs { bucket, .. } => (format!("gs://{bucket}"), String::new()),
     };
     let table = st.table.as_str();
 
