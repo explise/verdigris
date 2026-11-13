@@ -64,10 +64,14 @@ struct Args {
     /// content the server has already stored — which it deduplicates by content
     /// hash, skipping the manifest commit and inflating throughput. The corpus
     /// must therefore cover every step's offered bytes, not just one step's;
-    /// the generator warns before the ramp when it does not, and
     /// `replayed_requests`/`replayed_requests_total` in the results report
     /// whether it happened.
-    #[arg(long, default_value_t = 1536)]
+    ///
+    /// 3072 covers the two steps a default ramp runs before the saturation rule
+    /// stops it (50 MiB/s x 20s + 100 MiB/s x 20s = 3000 MiB). The old 1536 did
+    /// not, so the *default* invocation was already replaying from its second
+    /// step — the artifact this harness exists to prevent.
+    #[arg(long, default_value_t = 3072)]
     corpus_mib: usize,
 
     /// Stop early once a step's accepted rate fails to improve on the best seen
@@ -506,25 +510,33 @@ async fn main() -> Result<()> {
         corpus.window(0).0.len() as f64 / 1024.0 / 1024.0,
     );
 
-    // Worst case offered bytes: no early stop, every step runs its full
-    // `step_secs`. Exceeding the corpus means the tail of the run resends
-    // content and measures deduplicated writes, so say so before the ramp —
-    // loudly, but not fatally: early saturation legitimately ends a run short
-    // of this bound, and failing hard would break existing invocations.
-    let worst_case_mib: f64 = (0..args.steps)
-        .map(|i| (args.start_mibps + args.step_mibps * i as f64) * args.step_secs as f64)
-        .sum();
-    if worst_case_mib > args.corpus_mib as f64 {
+    // How many whole steps the corpus can fund before the run starts replaying.
+    // Steps offer `rate x step_secs` regardless of how fast the server accepts,
+    // so this is exact — but the ramp stops after two non-improving steps, so
+    // the configured `--steps` is a ceiling rather than a plan. Warn only when
+    // the corpus cannot fund the two steps the stop rule needs to conclude:
+    // warning on the worst case would fire on every default invocation, and an
+    // always-on warning is one nobody reads. Beyond two steps the run-scoped
+    // `replayed_requests` counter is the authoritative signal.
+    let mut covered_steps = 0usize;
+    let mut covered_mib = 0.0f64;
+    for i in 0..args.steps {
+        let step_mib = (args.start_mibps + args.step_mibps * i as f64) * args.step_secs as f64;
+        if covered_mib + step_mib > args.corpus_mib as f64 {
+            break;
+        }
+        covered_mib += step_mib;
+        covered_steps += 1;
+    }
+    if covered_steps < 2 {
+        let two_step_mib = args.start_mibps * args.step_secs as f64
+            + (args.start_mibps + args.step_mibps) * args.step_secs as f64;
         eprintln!(
-            "WARNING: the ramp can offer {worst_case_mib:.0} MiB (up to {:.1} MiB/s x {} steps x \
-             {} s) but the corpus is {} MiB. Every request past the corpus replays content the \
-             server deduplicates by hash, so accepted throughput will read high. Raise \
-             --corpus-mib to at least {:.0}.",
-            args.start_mibps + args.step_mibps * (args.steps.saturating_sub(1)) as f64,
-            args.steps,
-            args.step_secs,
+            "WARNING: a {0} MiB corpus funds {covered_steps} of the ramp's steps \
+             ({covered_mib:.0} MiB offered); the ramp needs two to tell saturation from a \
+             fluke, and every request past the corpus replays content the server \
+             deduplicates by hash. Raise --corpus-mib to at least {two_step_mib:.0}.",
             args.corpus_mib,
-            worst_case_mib.ceil(),
         );
     }
 
