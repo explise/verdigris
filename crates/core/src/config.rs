@@ -1,6 +1,6 @@
 //! Configuration types + parsing. Everything that touches the outside world is
 //! selected here so the same binary runs fully offline (local filesystem) or
-//! against S3/MinIO with only a config change — no recompile.
+//! against S3/MinIO or GCS with only a config change — no recompile.
 //!
 //! This module is pure: it defines the types and parses a TOML *string*. Locating
 //! and *reading* the config file is I/O and lives in the `vdg` shell.
@@ -233,6 +233,21 @@ pub enum StorageConfig {
         #[serde(default)]
         prefix: Option<String>,
     },
+    /// Google Cloud Storage. Credentials come from the standard GCP chain
+    /// (application default credentials, a workload-identity metadata server,
+    /// or `GOOGLE_APPLICATION_CREDENTIALS`) unless a key file is named here.
+    Gcs {
+        bucket: String,
+        /// Path to a service-account JSON key.
+        #[serde(default)]
+        service_account: Option<String>,
+        /// Custom endpoint, e.g. a local GCS emulator.
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// Optional key prefix within the bucket.
+        #[serde(default)]
+        prefix: Option<String>,
+    },
 }
 
 fn default_local_path() -> PathBuf {
@@ -341,6 +356,56 @@ mod tests {
             _ => panic!("expected s3"),
         }
         assert_eq!(c.query.cores, 8);
+    }
+
+    #[test]
+    fn parses_gcs_toml() {
+        // Bucket is the only required key; everything else is optional.
+        let toml = r#"
+            [storage]
+            backend = "gcs"
+            bucket = "verdigris-logs"
+        "#;
+        let c: Config = toml::from_str(toml).unwrap();
+        match c.storage {
+            StorageConfig::Gcs {
+                bucket,
+                service_account,
+                endpoint,
+                prefix,
+            } => {
+                assert_eq!(bucket, "verdigris-logs");
+                assert!(service_account.is_none());
+                assert!(endpoint.is_none());
+                assert!(prefix.is_none());
+            }
+            _ => panic!("expected gcs"),
+        }
+
+        // Explicit key file + emulator endpoint + prefix.
+        let toml = r#"
+            [storage]
+            backend = "gcs"
+            bucket = "verdigris-logs"
+            service_account = "/etc/verdigris/gcs.json"
+            endpoint = "http://localhost:4443"
+            prefix = "logs"
+        "#;
+        let c: Config = toml::from_str(toml).unwrap();
+        match c.storage {
+            StorageConfig::Gcs {
+                bucket,
+                service_account,
+                endpoint,
+                prefix,
+            } => {
+                assert_eq!(bucket, "verdigris-logs");
+                assert_eq!(service_account.as_deref(), Some("/etc/verdigris/gcs.json"));
+                assert_eq!(endpoint.as_deref(), Some("http://localhost:4443"));
+                assert_eq!(prefix.as_deref(), Some("logs"));
+            }
+            _ => panic!("expected gcs"),
+        }
     }
 
     #[test]

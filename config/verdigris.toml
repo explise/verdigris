@@ -1,8 +1,8 @@
 # Verdigris configuration — default profile.
 #
 # Out of the box this runs FULLY OFFLINE: logs land on the local filesystem,
-# queries are modeled. Switch `backend` to "s3" to point at real S3 or a local
-# MinIO; nothing else in the binary changes.
+# queries are modeled. Switch `backend` to "s3" (S3 or MinIO) or "gcs" (Google
+# Cloud Storage) to point at object storage; nothing else in the binary changes.
 
 [storage]
 backend = "local"
@@ -17,6 +17,13 @@ path = "./data"
 # access_key_id = "minioadmin"         # or leave unset to use AWS env/profile
 # secret_access_key = "minioadmin"
 # prefix = ""
+
+# --- Google Cloud Storage example (uncomment and set backend = "gcs") -------
+# backend = "gcs"
+# bucket = "verdigris"
+# service_account = "/etc/verdigris/gcs.json"  # key file; omit for ADC / workload identity
+# endpoint = "http://localhost:4443"           # only for a GCS emulator
+# prefix = "logs"                              # optional key prefix within the bucket
 
 [query]
 # Query speed is a provisioned dial, decoupled from storage.

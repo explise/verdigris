@@ -2,7 +2,7 @@
 
 Verdigris is configured by a single TOML file. Everything that touches the outside world is
 selected here, so the **same binary** runs fully offline against the local filesystem or
-against S3/MinIO with only a config change — no recompile.
+against S3/MinIO or Google Cloud Storage with only a config change — no recompile.
 
 ## Where the config comes from
 
@@ -24,7 +24,7 @@ Every section is optional; omit a section to take its defaults. The sections are
 
 ## Storage (`[storage]`)
 
-Selected by a `backend` tag. Three backends:
+Selected by a `backend` tag. Four backends:
 
 === "Local (default)"
 
@@ -53,6 +53,38 @@ Selected by a `backend` tag. Three backends:
 
     Any S3-compatible endpoint works. On EKS, leave the credentials out and use IRSA; on
     MinIO, set `endpoint` + `allow_http`.
+
+=== "Google Cloud Storage"
+
+    ```toml
+    [storage]
+    backend = "gcs"
+    bucket = "my-company-logs"
+    service_account = "/etc/verdigris/gcs.json"  # optional — service-account key file
+    endpoint = "http://localhost:4443"           # optional — GCS emulator
+    prefix = "logs"                              # optional key prefix within the bucket
+    ```
+
+    Credentials resolve through the standard Google chain, so on GCE/GKE you normally
+    leave `service_account` unset: application default credentials, the metadata server
+    (workload identity), or `GOOGLE_APPLICATION_CREDENTIALS`. Naming a key file here
+    overrides that chain. `prefix` is honoured — every key is namespaced under it.
+
+    Against a local emulator, point `endpoint` at it **and** give `service_account` a
+    key file containing `"disable_oauth": true`; otherwise the client still tries to mint
+    an OAuth token before it ever sends a request.
+
+    The manifest commit relies on conditional writes; `object_store`'s GCS client maps a
+    create put to `ifGenerationMatch: 0` and an update put to a generation precondition,
+    so concurrent writers get a precondition error and retry rather than silently
+    overwriting each other.
+
+    !!! note "Not yet exercised end-to-end"
+        Config parsing is covered by tests, and the bundled `object_store` GCS client maps
+        create/update puts to generation preconditions, but this backend has not been run
+        against a real GCS bucket. Validate a first deployment yourself: `vdg check`
+        round-trips a probe object, then run two concurrent ingests to confirm a CAS
+        conflict is retried rather than lost.
 
 === "Memory"
 
@@ -139,6 +171,7 @@ Behavior when enabled:
 | `VERDIGRIS_CONFIG` | path to the config file (see resolution order above) |
 | `VERDIGRIS_API_TOKEN` | overrides `auth.token` (preferred way to supply the secret) |
 | Standard AWS chain (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, IRSA web-identity, …) | resolves S3 credentials for the `s3` backend when they aren't set inline |
+| `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_SERVICE_ACCOUNT`, `GOOGLE_BUCKET`, `GOOGLE_BASE_URL` | GCS credential file, bucket and endpoint for the `gcs` backend; a `service_account` set in config overrides them, and without one the chain falls back to application-default credentials / workload identity |
 
 ## A complete example
 
