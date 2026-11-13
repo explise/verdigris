@@ -1,0 +1,41 @@
+{
+  "config": {
+    "url": "http://localhost:8080",
+    "path": "/v1/ingest",
+    "seed": 42,
+    "body_bytes": 4194304,
+    "lines_per_body": 19503,
+    "mean_line_bytes": 215.054,
+    "concurrency": 16,
+    "step_secs": 12,
+    "settle_secs": 0,
+    "cpus": 16
+  },
+  "steps": [
+    {
+      "target_mibps": 400.0,
+      "offered_mibps": 41.935481005143735,
+      "accepted_mibps": 41.935481005143735,
+      "accepted_records_per_sec": 200381.89035792783,
+      "parquet_mibps": 3.119802809605559,
+      "compression_ratio": 13.441708840067905,
+      "ok": 140,
+      "too_many_429": 0,
+      "too_large_413": 0,
+      "other_err": 0,
+      "transport_err": 0,
+      "files_written": 420,
+      "puts_per_sec": 30.823241094897377,
+      "mean_file_bytes": 106132.5880952381,
+      "p50_ms": 1517.85,
+      "p99_ms": 1696.209,
+      "elapsed_secs": 13.626081654,
+      "server_records_delta": 2730420.0,
+      "server_mean_latency_ms": 1445.971631205674,
+      "replayed_requests": 0
+    }
+  ],
+  "peak_accepted_mibps": 41.935481005143735,
+  "peak_accepted_records_per_sec": 200381.89035792783,
+  "saturated": false
+}

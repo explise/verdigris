@@ -1,0 +1,9 @@
+date_utc=2026-07-19T16:40:07Z
+host_cpus=16
+host_mem_kb=12246688
+kernel=6.18.33.2-microsoft-standard-WSL2
+docker=29.6.2
+vdg_cpus=8
+vdg_worker_threads=8
+git_commit=72d531b
+git_dirty=8

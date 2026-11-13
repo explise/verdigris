@@ -45,7 +45,7 @@ use verdigris_core::alert::{
     self, Alert, AlertRule, AlertStatus, AlertsDoc, Comparator, State as AlertState, Transition,
 };
 use verdigris_core::auth::{self, ApiToken, Role as AuthRole, TokensDoc};
-use verdigris_core::batch::{BatchPolicy, LogRecord};
+use verdigris_core::batch::LogRecord;
 use verdigris_core::clock::Clock;
 use verdigris_core::config::{Config, StorageConfig};
 use verdigris_core::cost::{self, RetrievalMode};
@@ -1651,6 +1651,38 @@ fn ingest_permit(st: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, App
     })
 }
 
+/// The write path shared by `/v1/ingest` and `/v1/otlp/logs`: encode and PUT
+/// concurrently, then serialize only the manifest commit.
+///
+/// The lock scope is the point. It previously wrapped the whole of
+/// `Ingestor::ingest`, which made every request wait out the *encode* of the one
+/// ahead of it — and encode is the expensive half. Measured on a 16-core host,
+/// that pinned ingest at ~43 MiB/s with the node using 0.84 of its 8 cores:
+/// throughput was flat from concurrency 1 to 32 while p50 latency scaled linearly
+/// (107 -> 3023 ms), the signature of a one-at-a-time server. See
+/// `docs/load-test.md`.
+///
+/// Only `commit_files` needs mutual exclusion — it read-modify-writes a single
+/// `manifest.json`. Encoding and PUTting outside the lock is safe because data
+/// files are content-addressed, so concurrent writers cannot collide on a path.
+/// Concurrency stays bounded by the `ingest_sem` permit the caller already holds,
+/// which is what keeps in-flight bodies from piling up in memory.
+async fn ingest_write_then_commit(
+    st: &AppState,
+    ingestor: &verdigris_ingest::Ingestor,
+    records: Vec<LogRecord>,
+) -> Result<Vec<verdigris_core::manifest::DataFile>, AppError> {
+    let written = ingestor
+        .write_batches(records, &st.cfg.routing, st.cfg.ingest.batch_policy())
+        .await?;
+
+    if !written.is_empty() {
+        let _guard = st.ingest_lock.lock().await;
+        ingestor.commit_files(&written).await?;
+    }
+    Ok(written)
+}
+
 async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
     let _permit = ingest_permit(&st)?;
     let (records, skipped, first_err) = parse_ingest_body(&body);
@@ -1662,15 +1694,9 @@ async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
     }
     let ingested = records.len();
 
-    // Serialize writes: the manifest is read-modify-written, so concurrent
-    // ingests in this process must not interleave. Held only for the batch.
-    let _guard = st.ingest_lock.lock().await;
-
     let s = store(&st)?;
     let ingestor = verdigris_ingest::Ingestor::new(s, st.table.as_str());
-    let written = ingestor
-        .ingest(records, &st.cfg.routing, BatchPolicy::default())
-        .await?;
+    let written = ingest_write_then_commit(&st, &ingestor, records).await?;
     let bytes: u64 = written.iter().map(|f| f.bytes).sum();
     st.metrics
         .ingest_records
@@ -1698,15 +1724,9 @@ async fn h_otlp(State(st): State<AppState>, body: String) -> ApiResult {
     }
     let ingested = records.len();
 
-    // Same serialization guarantee as /v1/ingest: the manifest is read-modify-
-    // written, so concurrent writes in this process must not interleave.
-    let _guard = st.ingest_lock.lock().await;
-
     let s = store(&st)?;
     let ingestor = verdigris_ingest::Ingestor::new(s, st.table.as_str());
-    let written = ingestor
-        .ingest(records, &st.cfg.routing, BatchPolicy::default())
-        .await?;
+    let written = ingest_write_then_commit(&st, &ingestor, records).await?;
     let bytes: u64 = written.iter().map(|f| f.bytes).sum();
     st.metrics
         .ingest_records
@@ -2298,6 +2318,7 @@ async fn tail_poll(st: &AppState, since_ts: i64) -> anyhow::Result<(Vec<Value>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use verdigris_core::batch::BatchPolicy;
     use verdigris_core::model::Level;
 
     #[test]
