@@ -59,11 +59,14 @@ struct Args {
     #[arg(long, default_value_t = 42)]
     seed: u64,
 
-    /// Size of the pre-generated NDJSON corpus (MiB). Must exceed the bytes a
-    /// single step will send, or requests start replaying content the server has
-    /// already stored — which it deduplicates by content hash, skipping the
-    /// manifest commit and inflating throughput. `replayed_requests` in the
-    /// results reports whether this happened.
+    /// Size of the pre-generated NDJSON corpus (MiB), and the upper bound on
+    /// distinct content the whole run can send. Requests past the end replay
+    /// content the server has already stored — which it deduplicates by content
+    /// hash, skipping the manifest commit and inflating throughput. The corpus
+    /// must therefore cover every step's offered bytes, not just one step's;
+    /// the generator warns before the ramp when it does not, and
+    /// `replayed_requests`/`replayed_requests_total` in the results report
+    /// whether it happened.
     #[arg(long, default_value_t = 1536)]
     corpus_mib: usize,
 
@@ -108,8 +111,8 @@ struct Corpus {
 
 impl Corpus {
     /// The `n`-th request window, as a zero-copy slice. Wraps around when the
-    /// corpus is exhausted; `wrapped()` reports whether that happened so a run
-    /// that silently started replaying content is visible in the results.
+    /// corpus is exhausted; the returned flag reports whether that happened, so
+    /// a run that silently started replaying content is visible in the results.
     fn window(&self, n: usize) -> (bytes::Bytes, bool) {
         let windows = (self.line_offsets.len() - 1) / self.lines_per_body;
         let idx = n % windows.max(1);
@@ -125,6 +128,12 @@ impl Corpus {
 
 /// Build the corpus once, sized so a whole run can be served without replaying
 /// content (see the `Corpus` doc comment for why replay corrupts the numbers).
+///
+/// One streaming pass: each record is serialized and dropped before the next is
+/// built, so peak memory is the NDJSON buffer plus the offset index rather than
+/// buffer + index + every `LogRecord` at once. The index costs ~8 bytes per line
+/// (~109 MB for a 2600 MiB corpus at ~215 B/line); that is the price of
+/// zero-copy `Bytes::slice` windows and is accounted for here rather than hidden.
 fn build_corpus(seed: u64, body_bytes: usize, corpus_bytes: usize) -> Result<Corpus> {
     // Sample to learn the mean serialized line size, then size everything by it.
     let sample = verdigris_ingest::generate::generate(1_000, seed, 0);
@@ -137,12 +146,11 @@ fn build_corpus(seed: u64, body_bytes: usize, corpus_bytes: usize) -> Result<Cor
         // Whole windows only, so the last request is the same size as the rest.
         .next_multiple_of(lines_per_body);
 
-    let records = verdigris_ingest::generate::generate(total_lines, seed, 0);
     let mut buf = String::with_capacity(corpus_bytes + 1024);
     let mut line_offsets = Vec::with_capacity(total_lines + 1);
-    for r in &records {
+    for r in verdigris_ingest::generate::generate_iter(total_lines, seed, 0) {
         line_offsets.push(buf.len());
-        buf.push_str(&ndjson_line(r));
+        buf.push_str(&ndjson_line(&r));
         buf.push('\n');
     }
     line_offsets.push(buf.len());
@@ -282,6 +290,10 @@ async fn run_step(
     client: &reqwest::Client,
     args: &Args,
     corpus: &Arc<Corpus>,
+    // Run-scoped request cursor, shared across steps so step N continues where
+    // step N-1 stopped. A per-step cursor restarts at window 0 and resends the
+    // same bytes, which the server deduplicates by content hash.
+    cursor: &Arc<AtomicU64>,
     target_mibps: f64,
 ) -> Result<StepResult> {
     let endpoint = format!("{}{}", args.url, args.path);
@@ -298,9 +310,10 @@ async fn run_step(
     let start = Instant::now();
     let deadline = start + Duration::from_secs(args.step_secs);
 
-    // One shared cursor, so every request across every worker gets a distinct
-    // window. Per-worker counters would hand each worker the same sequence.
-    let cursor = Arc::new(AtomicU64::new(0));
+    // One shared cursor across every worker *and* every step, so no two requests
+    // in the run carry the same window. `Corpus::window`'s wrap flag is then a
+    // truthful whole-run replay signal, which is what `replayed_requests` claims
+    // to report.
     let replayed = Arc::new(AtomicU64::new(0));
 
     let mut workers = Vec::with_capacity(args.concurrency);
@@ -309,7 +322,7 @@ async fn run_step(
         let endpoint = endpoint.clone();
         let corpus = Arc::clone(corpus);
         let counters = Arc::clone(&counters);
-        let cursor = Arc::clone(&cursor);
+        let cursor = Arc::clone(cursor);
         let replayed = Arc::clone(&replayed);
         // Stagger workers across one interval so they do not all fire together.
         let worker_interval = interval * args.concurrency as u32;
@@ -448,6 +461,10 @@ async fn run_step(
 struct Report {
     config: ReportConfig,
     steps: Vec<StepResult>,
+    /// Requests across the whole run that reused corpus content already sent.
+    /// Any value above zero means those requests were deduplicated server-side,
+    /// so the curve understates the work a replay-free run would demand.
+    replayed_requests_total: u64,
     peak_accepted_mibps: f64,
     peak_accepted_records_per_sec: f64,
     saturated: bool,
@@ -459,6 +476,10 @@ struct ReportConfig {
     path: String,
     seed: u64,
     body_bytes: usize,
+    /// Corpus actually built, in MiB. This — not the requested `--corpus-mib` —
+    /// bounds how much distinct content the run could send; the corpus is rounded
+    /// up to whole request windows.
+    corpus_mib: usize,
     lines_per_body: usize,
     mean_line_bytes: f64,
     concurrency: usize,
@@ -485,6 +506,28 @@ async fn main() -> Result<()> {
         corpus.window(0).0.len() as f64 / 1024.0 / 1024.0,
     );
 
+    // Worst case offered bytes: no early stop, every step runs its full
+    // `step_secs`. Exceeding the corpus means the tail of the run resends
+    // content and measures deduplicated writes, so say so before the ramp —
+    // loudly, but not fatally: early saturation legitimately ends a run short
+    // of this bound, and failing hard would break existing invocations.
+    let worst_case_mib: f64 = (0..args.steps)
+        .map(|i| (args.start_mibps + args.step_mibps * i as f64) * args.step_secs as f64)
+        .sum();
+    if worst_case_mib > args.corpus_mib as f64 {
+        eprintln!(
+            "WARNING: the ramp can offer {worst_case_mib:.0} MiB (up to {:.1} MiB/s x {} steps x \
+             {} s) but the corpus is {} MiB. Every request past the corpus replays content the \
+             server deduplicates by hash, so accepted throughput will read high. Raise \
+             --corpus-mib to at least {:.0}.",
+            args.start_mibps + args.step_mibps * (args.steps.saturating_sub(1)) as f64,
+            args.steps,
+            args.step_secs,
+            args.corpus_mib,
+            worst_case_mib.ceil(),
+        );
+    }
+
     let client = reqwest::Client::builder()
         // Generous: at saturation a request can legitimately take many seconds,
         // and a client-side timeout would be indistinguishable from server
@@ -509,10 +552,13 @@ async fn main() -> Result<()> {
     let mut steps = Vec::new();
     let mut peak = 0.0f64;
     let mut saturated = false;
+    // One cursor for the whole run: steps continue through the corpus instead of
+    // each restarting at window 0 (see `run_step`).
+    let cursor = Arc::new(AtomicU64::new(0));
 
     for i in 0..args.steps {
         let target = args.start_mibps + args.step_mibps * i as f64;
-        let r = run_step(&client, &args, &corpus, target).await?;
+        let r = run_step(&client, &args, &corpus, &cursor, target).await?;
 
         println!(
             "{:>8.0} {:>10.1} {:>10.1} {:>12.0} {:>8.1} {:>7} {:>8.1} {:>9.1} {:>8.1}x",
@@ -552,6 +598,7 @@ async fn main() -> Result<()> {
         .iter()
         .map(|s| s.accepted_records_per_sec)
         .fold(0.0f64, f64::max);
+    let replayed_requests_total: u64 = steps.iter().map(|s| s.replayed_requests).sum();
 
     let report = Report {
         config: ReportConfig {
@@ -559,6 +606,7 @@ async fn main() -> Result<()> {
             path: args.path.clone(),
             seed: args.seed,
             body_bytes: args.body_bytes,
+            corpus_mib: (corpus.buf.len() as f64 / (1024.0 * 1024.0)).round() as usize,
             lines_per_body: corpus.lines_per_body,
             mean_line_bytes: corpus.mean_line_bytes,
             concurrency: args.concurrency,
@@ -567,6 +615,7 @@ async fn main() -> Result<()> {
             cpus: std::thread::available_parallelism().map_or(0, |n| n.get()),
         },
         steps,
+        replayed_requests_total,
         peak_accepted_mibps: peak,
         peak_accepted_records_per_sec: peak_records,
         saturated,
@@ -582,5 +631,53 @@ async fn main() -> Result<()> {
         "\npeak accepted: {:.1} MiB/s ({:.0} records/s) — written to {}",
         report.peak_accepted_mibps, report.peak_accepted_records_per_sec, args.out
     );
+    // The per-step count lives in the JSON; repeat the run-level total on the
+    // console so a replaying run cannot look clean at the terminal either.
+    if report.replayed_requests_total > 0 {
+        eprintln!(
+            "WARNING: {} requests replayed corpus content already sent — throughput is \
+             overstated. Raise --corpus-mib.",
+            report.replayed_requests_total
+        );
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The generated corpus must be a whole number of request windows whose
+    /// offsets describe exactly the bytes in `buf`: a miscount here slices a
+    /// request mid-line, and a partial trailing window makes the last request a
+    /// different size from the rest. Adjacent windows must also be distinct
+    /// content, since identical bodies dedupe server-side (see `Corpus`).
+    #[test]
+    fn corpus_is_whole_windows_of_distinct_lines() {
+        let c = build_corpus(7, 64 * 1024, 1024 * 1024).expect("build a 1 MiB corpus");
+        let total_lines = c.windows() * c.lines_per_body;
+
+        assert!(
+            c.line_offsets.windows(2).all(|w| w[0] < w[1]),
+            "line offsets must strictly increase"
+        );
+        assert_eq!(c.line_offsets[0], 0);
+        assert_eq!(
+            c.line_offsets.len(),
+            total_lines + 1,
+            "one offset per line plus the sentinel"
+        );
+        assert_eq!(
+            *c.line_offsets.last().unwrap(),
+            c.buf.len(),
+            "the sentinel must be buf.len()"
+        );
+        assert_eq!(c.windows(), total_lines / c.lines_per_body);
+
+        let (first, first_replay) = c.window(0);
+        let (second, second_replay) = c.window(1);
+        assert!(!first_replay, "window 0 is never a replay");
+        assert!(!second_replay, "window 1 exists in a multi-window corpus");
+        assert_ne!(first, second, "adjacent windows must carry distinct bytes");
+    }
 }
