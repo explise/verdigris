@@ -126,6 +126,58 @@ stays a known fallback if we ever call `aws-sdk-s3` directly.)
 - **Glacier restore UX:** drive the restore state machine through bulk/standard/expedited
   timings and fault injection without a single real (slow, costly) retrieval.
 
+## Seed sweeps: what the sweep proves (issue #10)
+
+The scenarios in `crates/storage/tests/dst.rs` are seeded — but a seed is only
+load-bearing when something nondeterministic depends on it. At zero fault
+injection every seed replays the identical script, so "sweeping seeds" would be a
+fast green lane that tests nothing. The sweep therefore injects
+`SimObjectStore` faults, and each swept scenario retries the operations it
+expects to succeed (a GET that may fault; a cold object's refusal is *not*
+retried, because that refusal is the assertion).
+
+One code path serves three scales, selected by environment:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DST_SEED_FIRST` | `0` | first seed in the window |
+| `DST_SEED_COUNT` | `1` | number of seeds in the window |
+| `DST_FAULT_PPM` | `50000` (5%) | injected-fault rate per fallible store op |
+
+`cargo test -p verdigris-storage --test dst` runs one seed, so a developer waits
+for nothing. The per-PR lane sets `DST_SEED_COUNT=256`
+(`scripts/verify.sh`, `.github/workflows/dst-sweep.yml`). The nightly lane sets
+`DST_SEED_COUNT=100000` at two rates — 2% and 10% — in a window that advances
+with the workflow run number, so successive nights explore new seeds rather than
+replaying the same 100k. The nightly is `schedule:`-only and cannot block a PR.
+
+Every seed runs twice and the two runs must agree on retry count, final logical
+time, and metered bytes/dollars. That equality is the reproducibility claim: a
+seed that passes once and fails on an identical re-run would make every failure
+report unreproducible, so it fails as loudly as an assertion.
+
+A failure prints the scenario, the seed and the exact command that reruns it:
+
+```
+DST failure: scenario `estimator_matches_what_the_store_bills`, seed 137
+<the assertion that broke>
+reproduce with:
+  DST_SEED_FIRST=137 DST_SEED_COUNT=1 DST_FAULT_PPM=50000 cargo test -p verdigris-storage --test dst
+```
+
+A batch also refuses `DST_FAULT_PPM=0` outright, and asserts that faults landed on
+more than zero but fewer than all seeds — so the vacuous sweep cannot come back
+through an environment variable.
+
+**What this proves:** the tiering end state, the restore state machine and the
+estimator-vs-billed invariant survive fault sequences, not just the happy path,
+and every seed in the window is reproducible. **What it does not prove:** that
+the fault model resembles real S3 failures — injection is an independent
+per-operation Bernoulli draw, not a correlated outage, latency spike or partial
+write. A scenario that demonstrates modeled time only (the fabricated
+million-file catalog, which does no store I/O) stays at fault rate 0 and is not
+swept.
+
 ## Open questions to resolve before scaffolding
 
 - Confirm `object_store`'s trait is object-safe / async-trait-shaped enough to back both

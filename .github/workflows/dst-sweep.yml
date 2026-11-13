@@ -1,0 +1,127 @@
+# The DST seed sweep (issue #10).
+#
+# "One seed reproduces an entire run" only means something once faults make seeds
+# differ: at zero fault injection every seed replays the identical script, so a
+# "sweep" is a fast green lane that tests nothing. `crates/storage/tests/dst.rs`
+# therefore drives `SimObjectStore` faults (`DST_FAULT_PPM`) and retries the
+# operations a scenario expects to succeed, which is what this workflow sweeps.
+#
+# Two lanes, deliberately separate:
+#   batch   — bounded 256-seed batch on PRs and main. Keep in sync with
+#             `scripts/verify.sh`'s "dst sweep" check.
+#   nightly — 100k seeds per fault rate in a window that moves with the run
+#             number, so successive nights explore new seeds instead of
+#             re-running the same 100k forever. Scheduled or manual only, never
+#             on a PR, so it cannot block one.
+#
+# A failing seed prints its scenario, its seed and a command that reruns exactly
+# that seed; the failing job's step summary repeats that block. Issue auto-filing
+# is deliberately not wired: a `gh issue create` step needs `issues: write` on a
+# scheduled run and silently no-ops when the token lacks it, which is worse than
+# a log line a human is already paged by.
+name: dst-sweep
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/storage/**"
+      - "crates/core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/verify.sh"
+      - ".github/workflows/dst-sweep.yml"
+  pull_request:
+    paths:
+      - "crates/storage/**"
+      - "crates/core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/verify.sh"
+      - ".github/workflows/dst-sweep.yml"
+  schedule:
+    # Nightly, off the hour to stay clear of the other crons.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Must match the "dst sweep" check in scripts/verify.sh.
+  PR_SEED_COUNT: "256"
+
+jobs:
+  batch:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dst-sweep
+      # `--nocapture` puts the per-scenario "N faults across M seeds" line in the
+      # log, so a green run is evidence that faults were actually injected rather
+      # than a sweep over a dead fault path.
+      - name: seed sweep
+        run: |
+          set -o pipefail
+          DST_SEED_COUNT="$PR_SEED_COUNT" \
+            cargo test -p verdigris-storage --test dst -- --nocapture 2>&1 | tee dst-sweep.log
+      - name: failure summary
+        if: failure()
+        run: |
+          {
+            echo "## DST seed sweep failure"
+            echo
+            echo 'The block below names the failing scenario and seed, and gives'
+            echo 'the command that reruns exactly that seed.'
+            echo
+            echo '```'
+            grep -A12 'DST failure:' dst-sweep.log 2>/dev/null \
+              || tail -n 40 dst-sweep.log 2>/dev/null \
+              || echo 'no log captured: the build failed before the sweep ran'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        # Two rates, not one: a fault that only matters when faults are dense is
+        # invisible at the low rate, and a run that only converges when faults are
+        # rare is invisible at the high one.
+        fault_ppm: [20000, 100000]
+    runs-on: ubuntu-latest
+    env:
+      DST_SEED_COUNT: "100000"
+      DST_FAULT_PPM: ${{ matrix.fault_ppm }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dst-sweep-nightly-${{ matrix.fault_ppm }}
+      - name: seed sweep
+        run: |
+          set -o pipefail
+          DST_SEED_FIRST=$(( GITHUB_RUN_NUMBER * DST_SEED_COUNT )) \
+            cargo test -p verdigris-storage --test dst -- --nocapture 2>&1 | tee dst-sweep.log
+      - name: failure summary
+        if: failure()
+        run: |
+          {
+            echo "## DST nightly sweep failure (${{ matrix.fault_ppm }} ppm)"
+            echo
+            echo 'The block below names the failing scenario and seed, and gives'
+            echo 'the command that reruns exactly that seed.'
+            echo
+            echo '```'
+            grep -A12 'DST failure:' dst-sweep.log 2>/dev/null \
+              || tail -n 40 dst-sweep.log 2>/dev/null \
+              || echo 'no log captured: the build failed before the sweep ran'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
