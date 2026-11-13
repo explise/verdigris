@@ -24,6 +24,13 @@ pub async fn apply(storage: &StorageConfig, policy: &LifecyclePolicy) -> anyhow:
             endpoint,
             ..
         } => (bucket.clone(), region.clone(), endpoint.clone()),
+        // GCS is a supported storage backend, so "set backend = s3" would be
+        // wrong advice: the gap is the feature, not the config.
+        StorageConfig::Gcs { .. } => anyhow::bail!(
+            "lifecycle --apply does not support GCS: `object_store` has no lifecycle \
+             API and the GCS equivalent is a different schema. Apply it with \
+             `gcloud storage buckets update --lifecycle-file` instead."
+        ),
         _ => anyhow::bail!(
             "lifecycle --apply requires an S3 storage backend \
              (set [storage] backend = \"s3\" in the config)"
