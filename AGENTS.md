@@ -50,6 +50,12 @@ green."
 If you add a check, add it to `scripts/verify.sh` **and** `.github/workflows/`
 together, or the two silently diverge.
 
+The one deliberate exception is the MinIO S3 lane: `crates/ingest/tests/minio_s3.rs`,
+run by `.github/workflows/minio-s3.yml`. It needs a MinIO service container, so it
+cannot run on a developer machine and is intentionally absent from `scripts/verify.sh`
+— `verify.sh --all` is not expected to cover it. CI runs it on every PR that touches
+`crates/**`, and on `main`.
+
 Per-path routing mirrors the workflows' `paths:` filters:
 
 | Edited | Runs | Time |

@@ -1,0 +1,83 @@
+# The S3 CAS lane (issue #9).
+#
+# Every other Rust lane runs against `LocalFileSystem` or `InMemory`, and neither
+# can answer a conditional PUT the way S3 does — so the manifest's optimistic
+# compare-and-swap has never been exercised against a backend capable of returning
+# 412 Precondition Failed. This job runs `crates/ingest/tests/minio_s3.rs` against
+# a pinned MinIO, which implements the same If-Match / If-None-Match contract.
+#
+# CI-only by design: the tests need a service container, so they are not part of
+# `scripts/verify.sh` and `verify.sh --all` is not expected to cover them. See
+# AGENTS.md §1.
+name: minio-s3
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/minio-s3.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/minio-s3.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  minio:
+    name: minio (S3 CAS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      minio:
+        # Pinned exactly as `bench/docker-compose.yml` pins it: a lane that tests
+        # a different MinIO every month is not a regression gate.
+        image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+          # Silence the update nag so it does not appear in captured logs.
+          MINIO_UPDATE: "off"
+        ports:
+          - 9000:9000
+        # The healthcheck the MinIO image is built for; the runner does not start
+        # the steps until this passes, so the bucket step needs no retry loop.
+        options: >-
+          --health-cmd "mc ready local"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: minio
+
+      # One-shot bucket creation. `--network host` because the service container
+      # publishes 9000 on the runner's loopback; that is the documented way to
+      # reach a service from a host-run job.
+      - name: create bucket
+        run: |
+          docker run --rm --network host \
+            -e MC_HOST_local="http://minioadmin:minioadmin@127.0.0.1:9000" \
+            minio/mc:RELEASE.2025-04-16T18-13-26Z \
+            mb --ignore-existing local/verdigris-test
+
+      # `--ignored` is the gate: the tests are `#[ignore]`d so the default
+      # `cargo test --workspace` stays offline, and they panic (rather than skip)
+      # if the endpoint env var is missing.
+      - name: test
+        env:
+          VERDIGRIS_MINIO_ENDPOINT: http://127.0.0.1:9000
+          VERDIGRIS_MINIO_BUCKET: verdigris-test
+        run: cargo test -p verdigris-ingest --test minio_s3 -- --ignored

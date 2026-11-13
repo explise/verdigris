@@ -58,6 +58,22 @@ fn content_hash(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
+/// Warn once per process that commits have fallen back to last-write-wins.
+///
+/// `Once` rather than a counter so a long-running writer does not fill its log
+/// with one line per commit, and rather than a per-call flag so the signal
+/// survives into whichever replica actually hit the path.
+fn warn_once_no_conditional_put() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "object store does not support conditional puts: manifest commits fall back to \
+             an unconditional write (last-write-wins). Correct only with a single writer — \
+             concurrent writers can lose rows."
+        );
+    });
+}
+
 /// Writes a single logical table's data + manifest to an object store.
 pub struct Ingestor {
     store: Arc<dyn ObjectStore>,
@@ -234,7 +250,15 @@ impl Ingestor {
             | Err(object_store::Error::AlreadyExists { .. }) => Ok(CommitOutcome::Conflict),
             // Backend can't do conditional puts (some local stores): fall back to a
             // plain put. Correct under the single-writer deployment model.
+            //
+            // Say it out loud, once. This is the one branch where the catalog
+            // silently stops being a compare-and-swap and becomes last-write-wins
+            // — the lost-update mode the whole optimistic-commit design exists to
+            // prevent. It is reachable in production: `object_store` reads
+            // `AWS_CONDITIONAL_PUT`, so an operator disabling it there (or a
+            // dependency default flipping) degrades CAS with no other signal.
             Err(object_store::Error::NotImplemented { .. }) => {
+                warn_once_no_conditional_put();
                 self.store
                     .put(&self.manifest_path(), bytes.into())
                     .await
