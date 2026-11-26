@@ -102,6 +102,14 @@ round-trip). Any other `Accept` yields the JSON envelope above. The web UI negot
 column, so the Arrow wire delivers it as epoch-ms; the client normalizes it to the same ISO
 string the JSON wire sends.
 
+**Admission.** Queries run under a node-wide admission limit. Heavy queries
+queue for up to `query.admission_wait_ms`; if no slot frees they return **429**
+with `Retry-After: 1` and `queueDepth` in the body. Cheap queries (`LIMIT` at or
+below `query.cheap_limit_rows`, or a plan below `query.cheap_scan_mib`) use a
+reserved lane. A plan larger than `query.max_scan_gib` is refused **before
+execution** with **413** and the scan estimate attached (`scanBytes`, `scanGB`,
+`costUsd`, `maxScanGB`).
+
 ### `POST /v1/query/activity`  *(read role)*
 Aggregation-only companion to `/v1/query`: returns the same severity histogram
 without running the row query. The Logs explorer loads rows first with

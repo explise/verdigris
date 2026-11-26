@@ -106,6 +106,11 @@ estimate.
 modeled_mibps_per_core = 250.0   # modeled per-core scan throughput (MiB/s)
 cores = 4                        # provisioned query cores
 metadata_cache_mib = 64          # shared Parquet footer/bloom/page-index cache
+max_concurrent = 4               # node query-admission slots
+admission_wait_ms = 250          # heavy-query wait before 429
+cheap_limit_rows = 1000          # LIMIT <= this uses the reserved cheap lane
+cheap_scan_mib = 8               # plan <= this also uses the cheap lane
+max_scan_gib = 100.0             # pre-execution scan budget (0 disables)
 ```
 
 Provisioned throughput used by the estimator is `cores × modeled_mibps_per_core`.
