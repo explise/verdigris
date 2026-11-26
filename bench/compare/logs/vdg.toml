@@ -1,0 +1,57 @@
+# Verdigris side of the equivalent-log-query comparison.
+#
+# S3 (MinIO) rather than local disk, because the object store is part of the
+# deployment being measured and its CPU/memory is charged to Verdigris's budget.
+# Background compaction is off during ingest so the corpus lands deterministically;
+# run.sh invokes `vdg compact` once before queries, matching ClickHouse OPTIMIZE
+# and VictoriaLogs's background merges.
+
+[storage]
+backend = "s3"
+bucket = "verdigris"
+region = "us-east-1"
+endpoint = "http://vdgbench-minio:9000"
+allow_http = true
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+prefix = ""
+
+[query]
+# The vdg container is limited to 4 CPUs in this comparison, so execution gets
+# the same 4 cores rather than silently inheriting the host's 16.
+cores = 4
+modeled_mibps_per_core = 100.0
+memory_pool_mib = 1024
+max_result_rows = 1000000
+max_result_mib = 256
+
+[routing]
+error = "hot"
+warn = "warm"
+info = "warm"
+debug = "cold"
+
+[lifecycle]
+hot_to_warm_days = 3
+warm_to_cold_days = 30
+expire_days = 400
+
+[auth]
+enabled = false
+
+[ingest]
+max_body_bytes = 16777216
+max_inflight = 32
+max_batch_rows = 100000
+max_batch_bytes = 134217728
+
+[compaction]
+# Enabled, with a short check cadence so the driver can wait until the ingest
+# backlog has actually drained before timing queries. ClickHouse gets an explicit
+# OPTIMIZE; this is the equivalent "let merges settle" step for Verdigris.
+enabled = true
+target_mib = 64
+trigger_pending_files = 2
+max_merge_files_per_pass = 128
+interval_secs = 5
+retired_grace_secs = 3600

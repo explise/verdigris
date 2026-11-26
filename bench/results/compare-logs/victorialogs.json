@@ -1,0 +1,53 @@
+{
+  "system": "victorialogs",
+  "corpus": {
+    "rows": 1000000,
+    "raw_bytes": 218051254,
+    "base_ts_ms": 1795712400000,
+    "window_ms": 3000000,
+    "trace_id": "000000000007a120"
+  },
+  "ingest": {
+    "elapsed_s": 1.0580040790009662,
+    "rows_per_s": 945175.9401005928,
+    "mib_per_s": 196.54922388988794,
+    "visibility_s": 2.0045580890000565
+  },
+  "equivalence": {
+    "recent_count": 5883,
+    "search_rows": 200,
+    "trace_rows": 1,
+    "buckets": 50,
+    "total": 1000000,
+    "errors": 58824
+  },
+  "queries": {
+    "recent_service_search": {
+      "samples": 10,
+      "min_ms": 3.781419000006281,
+      "p50_ms": 4.554516497591976,
+      "p95_ms": 4.9611729991738684,
+      "p99_ms": 4.9611729991738684,
+      "max_ms": 4.9611729991738684,
+      "result_rows": 200
+    },
+    "trace_lookup": {
+      "samples": 10,
+      "min_ms": 0.5657880028593354,
+      "p50_ms": 0.6733709997206461,
+      "p95_ms": 0.7371719984803349,
+      "p99_ms": 0.7371719984803349,
+      "max_ms": 0.7371719984803349,
+      "result_rows": 1
+    },
+    "minute_aggregation": {
+      "samples": 10,
+      "min_ms": 4.293908001272939,
+      "p50_ms": 6.20274600078119,
+      "p95_ms": 7.270640999195166,
+      "p99_ms": 7.270640999195166,
+      "max_ms": 7.270640999195166,
+      "result_rows": 50
+    }
+  }
+}

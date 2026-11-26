@@ -1,0 +1,8 @@
+{
+  "system": "clickhouse",
+  "image": "clickhouse/clickhouse-server@sha256:4f491abc44d9f4a1747c033c35ddd5bc385521305d85ca8251ba0824ff597035",
+  "cpu_limit": 8,
+  "memory_limit": "6g",
+  "retained_bytes": 99849061,
+  "container_memory": "chbench=230.5MiB / 6GiB"
+}
