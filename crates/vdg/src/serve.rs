@@ -23,7 +23,7 @@ use std::time::Duration;
 use anyhow::Context;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Query, Request, State};
-use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -102,10 +102,15 @@ struct AppState {
     alerts_lock: Arc<tokio::sync::Mutex<()>>,
     /// Monotonic suffix for generated alert ids within this process.
     alert_seq: Arc<AtomicU64>,
+    /// Replica-unique prefix for audit ids. Two containers must never mint the
+    /// same record id, or the writer's idempotent dedupe would drop one.
+    audit_replica: Arc<str>,
     /// Monotonic suffix for generated audit-record ids within this process.
     audit_seq: Arc<AtomicU64>,
     /// Durable audit writer state and counters.
     audit: Arc<AuditMetrics>,
+    /// Node-local query admission (issue #29).
+    admission: Arc<Admission>,
     /// Backpressure: caps concurrent in-flight ingest requests so a flood sheds
     /// (429) instead of piling parsed bodies up in memory.
     ingest_sem: Arc<tokio::sync::Semaphore>,
@@ -212,6 +217,125 @@ struct AuditJob {
     ack: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
+/// Counters for query admission (issue #29).
+#[derive(Default)]
+struct AdmissionMetrics {
+    admitted: AtomicU64,
+    cheap: AtomicU64,
+    queued: AtomicU64,
+    shed: AtomicU64,
+    /// Last wait for a heavy permit, microseconds.
+    last_wait_us: AtomicU64,
+}
+
+/// Node-local query admission. Heavy queries share `heavy`; one permit is
+/// reserved for cheap (small LIMIT / small scan) traffic so a dashboard query
+/// cannot starve behind full-scan aggregates.
+struct Admission {
+    heavy: Arc<tokio::sync::Semaphore>,
+    /// Empty when `max == 1`: the single permit is shared, not duplicated.
+    cheap: Arc<tokio::sync::Semaphore>,
+    cheap_lane: bool,
+    max: usize,
+    clock: Arc<dyn Clock>,
+    metrics: AdmissionMetrics,
+}
+
+#[derive(Debug)]
+struct AdmissionPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Admission {
+    fn new(max_concurrent: usize, clock: Arc<dyn Clock>) -> Self {
+        let max = max_concurrent.max(1);
+        // One slot is reserved for cheap traffic only when there is more than
+        // one slot. At max=1 there is exactly one permit in total; cheap and
+        // heavy share it rather than creating a second, over-budget permit.
+        let cheap_lane = max > 1;
+        let heavy = max.saturating_sub(1).max(1);
+        Self {
+            heavy: Arc::new(tokio::sync::Semaphore::new(heavy)),
+            cheap: Arc::new(tokio::sync::Semaphore::new(if cheap_lane { 1 } else { 0 })),
+            cheap_lane,
+            max,
+            clock,
+            metrics: AdmissionMetrics::default(),
+        }
+    }
+
+    fn depth(&self) -> usize {
+        self.max
+            .saturating_sub(self.heavy.available_permits() + self.cheap.available_permits())
+    }
+
+    async fn admit(&self, cheap: bool, wait: Duration) -> Result<AdmissionPermit, usize> {
+        let started = self.clock.monotonic_micros();
+        if cheap {
+            if self.cheap_lane {
+                if let Ok(permit) = self.cheap.clone().try_acquire_owned() {
+                    self.metrics.cheap.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
+                    return Ok(AdmissionPermit { _permit: permit });
+                }
+            }
+            if let Ok(permit) = self.heavy.clone().try_acquire_owned() {
+                self.metrics.cheap.fetch_add(1, Ordering::Relaxed);
+                self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
+                return Ok(AdmissionPermit { _permit: permit });
+            }
+        }
+
+        // Cheap traffic queues on its reserved lane when one exists; with
+        // max=1 it shares the heavy queue rather than inventing a permit.
+        let use_cheap_lane = cheap && self.cheap_lane;
+        let queue = if use_cheap_lane {
+            self.cheap.clone()
+        } else {
+            self.heavy.clone()
+        };
+        let queue_wait = if use_cheap_lane {
+            CHEAP_LANE_WAIT.max(wait)
+        } else {
+            wait
+        };
+        self.metrics.queued.fetch_add(1, Ordering::Relaxed);
+        let acquired = tokio::time::timeout(queue_wait, queue.acquire_owned()).await;
+        self.metrics.queued.fetch_sub(1, Ordering::Relaxed);
+        self.metrics.last_wait_us.store(
+            self.clock.monotonic_micros().saturating_sub(started),
+            Ordering::Relaxed,
+        );
+        match acquired {
+            Ok(Ok(permit)) => {
+                self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
+                if cheap {
+                    self.metrics.cheap.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(AdmissionPermit { _permit: permit })
+            }
+            _ => {
+                self.metrics.shed.fetch_add(1, Ordering::Relaxed);
+                Err(self.depth())
+            }
+        }
+    }
+}
+
+/// A `LIMIT n` with `n <= max` is cheap enough to bypass heavy queueing.
+fn has_small_limit(sql: &str, max: u64) -> bool {
+    if max == 0 {
+        return false;
+    }
+    let upper = sql.to_ascii_uppercase();
+    let Some(pos) = upper.rfind("LIMIT") else {
+        return false;
+    };
+    let tail = upper[pos + "LIMIT".len()..].trim_start();
+    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u64>().is_ok_and(|n| n <= max)
+}
+
 const QUERY_HISTORY_CAP: usize = 500;
 
 /// Bounded audit queue. A full queue triggers a short wait, then a direct
@@ -224,6 +348,9 @@ const AUDIT_BATCH_MAX: usize = 64;
 const AUDIT_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 /// Bounded wait for queue capacity before falling back to a direct append.
 const AUDIT_ENQUEUE_WAIT: Duration = Duration::from_millis(100);
+/// Cheap queries queue on their reserved lane for up to this long. Keeps a
+/// dashboard LIMIT query from being shed just because two arrived at once.
+const CHEAP_LANE_WAIT: Duration = Duration::from_secs(1);
 /// How long shutdown may spend draining queued audit records.
 const AUDIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -659,6 +786,8 @@ async fn h_prometheus(State(st): State<AppState>) -> Response {
 struct AppError {
     status: StatusCode,
     message: String,
+    retry_after_s: Option<u64>,
+    extra: Option<Value>,
 }
 
 impl AppError {
@@ -666,6 +795,8 @@ impl AppError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: e.to_string(),
+            retry_after_s: None,
+            extra: None,
         }
     }
 
@@ -673,6 +804,40 @@ impl AppError {
         Self {
             status,
             message: e.to_string(),
+            retry_after_s: None,
+            extra: None,
+        }
+    }
+
+    /// Admission shed: 429 with the current queue depth and a retry hint.
+    fn overloaded(depth: usize, retry_after_s: u64) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: format!(
+                "query admission queue is full (depth {depth}); retry in {retry_after_s}s"
+            ),
+            retry_after_s: Some(retry_after_s),
+            extra: Some(json!({ "queueDepth": depth })),
+        }
+    }
+
+    /// Cost/admission gate: the scan is larger than the configured budget.
+    fn scan_over_budget(estimate: &verdigris_core::estimate::QueryEstimate, max_gib: f64) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: format!(
+                "query would scan {:.2} GiB, over the {:.2} GiB admission budget",
+                estimate.scan_gib, max_gib
+            ),
+            retry_after_s: None,
+            extra: Some(json!({
+                "scanBytes": estimate.scan_bytes,
+                "scanGB": estimate.scan_gib,
+                "costUsd": estimate.cost_usd,
+                "filesTouched": estimate.files_touched,
+                "filesTotal": estimate.files_total,
+                "maxScanGB": max_gib
+            })),
         }
     }
 
@@ -692,7 +857,20 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        let mut body = json!({ "error": self.message });
+        if let (Some(extra), Some(obj)) = (self.extra, body.as_object_mut()) {
+            if let Some(extra) = extra.as_object() {
+                for (k, v) in extra {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let mut res = (self.status, Json(body)).into_response();
+        if let Some(secs) = self.retry_after_s {
+            res.headers_mut()
+                .insert(RETRY_AFTER, secs.to_string().parse().expect("header value"));
+        }
+        res
     }
 }
 
@@ -701,6 +879,8 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: e.into().to_string(),
+            retry_after_s: None,
+            extra: None,
         }
     }
 }
@@ -715,6 +895,35 @@ fn limits(st: &AppState) -> QueryLimits {
 
 fn store(st: &AppState) -> anyhow::Result<Store> {
     Ok(st.store.clone())
+}
+
+/// Apply the cost gate and acquire a node admission permit. The permit is held
+/// for the whole request (rows and any optional histogram), then released on
+/// drop. Cheap traffic gets the reserved lane.
+async fn admit_query(
+    st: &AppState,
+    plan: &verdigris_core::scan::ScanPlan<'_>,
+    sql: &str,
+) -> Result<AdmissionPermit, AppError> {
+    let scan_bytes = plan.scanned_bytes();
+    let max_scan_gib = st.cfg.query.max_scan_gib;
+    if max_scan_gib > 0.0 {
+        let max_bytes = (max_scan_gib * cost::GIB) as u64;
+        if scan_bytes > max_bytes {
+            let throughput =
+                st.cfg.query.modeled_mibps_per_core * st.cfg.query.cores as f64 * 1024.0 * 1024.0;
+            let est =
+                verdigris_core::estimate::estimate_plan(plan, throughput, RetrievalMode::Standard);
+            return Err(AppError::scan_over_budget(&est, max_scan_gib));
+        }
+    }
+    let cheap = has_small_limit(sql, st.cfg.query.cheap_limit_rows)
+        || (st.cfg.query.cheap_scan_mib > 0
+            && scan_bytes <= st.cfg.query.cheap_scan_mib * 1024 * 1024);
+    st.admission
+        .admit(cheap, Duration::from_millis(st.cfg.query.admission_wait_ms))
+        .await
+        .map_err(|depth| AppError::overloaded(depth, 1))
 }
 
 async fn manifest(st: &AppState) -> anyhow::Result<(Store, Manifest)> {
@@ -821,7 +1030,12 @@ async fn measure(
     files: &[IndexedFile],
     sql: &str,
     limits: &QueryLimits,
+    admission: &Admission,
 ) -> anyhow::Result<f64> {
+    let _permit = admission
+        .admit(true, Duration::from_millis(50))
+        .await
+        .map_err(|depth| anyhow::anyhow!("alert query admission queue full (depth {depth})"))?;
     let rows =
         verdigris_query::engine::query_table_json(s.clone(), table, files, sql, limits).await?;
     let Some(Value::Object(row)) = rows.into_iter().next() else {
@@ -849,6 +1063,7 @@ async fn evaluate_all(
     lock: &tokio::sync::Mutex<()>,
     limits: &QueryLimits,
     clock: &Arc<dyn Clock>,
+    admission: &Admission,
 ) -> anyhow::Result<()> {
     let _g = lock.lock().await;
     for _ in 0..ALERTS_CAS_RETRIES {
@@ -867,7 +1082,7 @@ async fn evaluate_all(
             if !a.rule.enabled {
                 continue;
             }
-            let value = match measure(s, table, &files, &a.rule.sql, limits).await {
+            let value = match measure(s, table, &files, &a.rule.sql, limits, admission).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(rule = %a.rule.name, error = %e, "alert eval failed");
@@ -1143,6 +1358,10 @@ pub async fn serve_with_clock(
     // footers that cannot have changed (files are immutable).
     let query_store = verdigris_storage::build(&cfg.storage).context("building object store")?;
     let query_cache = Arc::new(QueryCache::from_config(&cfg.query));
+    let admission = Arc::new(Admission::new(cfg.query.max_concurrent, clock.clone()));
+    // Replica-unique audit prefix from the same OS entropy used for API tokens.
+    // A local counter alone is not unique across containers.
+    let audit_replica: Arc<str> = Arc::from(gen_replica_id());
 
     // Durable audit writer: batch queued records into one conditional append,
     // acknowledge each waiter, and keep a cached doc/version so a healthy append
@@ -1182,8 +1401,10 @@ pub async fn serve_with_clock(
         ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
         alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
         alert_seq: Arc::new(AtomicU64::new(0)),
+        audit_replica,
         audit_seq: Arc::new(AtomicU64::new(0)),
         audit: audit_metrics,
+        admission,
         ingest_sem: Arc::new(tokio::sync::Semaphore::new(max_inflight)),
         tokens: Arc::new(tokio::sync::RwLock::new(tokens_doc)),
         metrics: Arc::new(HttpMetrics::new()),
@@ -1204,12 +1425,15 @@ pub async fn serve_with_clock(
             let lock = state.alerts_lock.clone();
             let lim = limits(&state);
             let clock = state.clock.clone();
+            let admission = state.admission.clone();
             let _ = seed_example_alerts(&s, table.as_str(), &lock, &clock).await;
-            let _ = evaluate_all(&s, table.as_str(), &lock, &lim, &clock).await;
+            let _ = evaluate_all(&s, table.as_str(), &lock, &lim, &clock, &state.admission).await;
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(15)).await;
-                    if let Err(e) = evaluate_all(&s, table.as_str(), &lock, &lim, &clock).await {
+                    if let Err(e) =
+                        evaluate_all(&s, table.as_str(), &lock, &lim, &clock, &admission).await
+                    {
                         tracing::warn!(error = %e, "alert scheduler tick failed");
                     }
                 }
@@ -1555,6 +1779,12 @@ fn gen_secret() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A replica-unique id. `gen_secret` draws 256 bits from OS entropy; two
+/// containers cannot practically collide, unlike pid+millisecond+counter.
+fn gen_replica_id() -> String {
+    gen_secret()
+}
+
 fn default_role() -> AuthRole {
     AuthRole::ReadOnly
 }
@@ -1770,6 +2000,7 @@ async fn h_query(
         let stats = json!({ "events": 0, "scannedBytes": 0, "elapsedMs": 0, "engine": "datafusion", "files": 0 });
         return Ok(query_response(arrow, Vec::new(), &stats, &Vec::new()));
     }
+    let _admission = admit_query(&st, &plan, &req.sql).await?;
     let scanned_bytes: u64 = plan.scanned_bytes();
     // Same predicates again, one level down: `select_files` decided which files to
     // open, this decides which row groups inside them to read. A file kept because
@@ -1887,9 +2118,8 @@ async fn h_query(
     });
     let rec = QueryRecord {
         id: format!(
-            "{}-{}-{}",
-            st.clock.now_millis(),
-            std::process::id(),
+            "{}-{}",
+            st.audit_replica,
             st.audit_seq.fetch_add(1, Ordering::Relaxed)
         ),
         ts_millis: st.clock.now_millis() as i64,
@@ -1962,6 +2192,11 @@ async fn h_activity(State(st): State<AppState>, Json(req): Json<ActivityReq>) ->
         .iter()
         .map(|f| IndexedFile::plan(f, &preds))
         .collect();
+    let _admission = if files.is_empty() {
+        None
+    } else {
+        Some(admit_query(&st, &plan, &req.sql).await?)
+    };
     let histogram = if files.is_empty() {
         Vec::new()
     } else {
@@ -2401,6 +2636,19 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
     let mut total_events = 0i64;
     let mut total_errors = 0i64;
 
+    // One permit covers both dashboard aggregations (service volume and the
+    // time histogram). Previously the service-volume query ran outside
+    // admission.
+    let _admission = if files.is_empty() {
+        None
+    } else {
+        Some(
+            st.admission
+                .admit(true, Duration::from_millis(st.cfg.query.admission_wait_ms))
+                .await
+                .map_err(|depth| AppError::overloaded(depth, 1))?,
+        )
+    };
     if !files.is_empty() {
         let sql =
             format!("SELECT service, count(*) AS n FROM {table} GROUP BY service ORDER BY n DESC");
@@ -2490,6 +2738,15 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
             "timedOutTotal": st.audit.timed_out.load(Ordering::Relaxed),
             "ackedTotal": st.audit.acked.load(Ordering::Relaxed),
             "lastWaitMs": st.audit.last_wait_us.load(Ordering::Relaxed) / 1_000,
+        },
+        "admission": {
+            "maxConcurrent": st.admission.max,
+            "queueDepth": st.admission.depth(),
+            "admittedTotal": st.admission.metrics.admitted.load(Ordering::Relaxed),
+            "cheapTotal": st.admission.metrics.cheap.load(Ordering::Relaxed),
+            "queuedTotal": st.admission.metrics.queued.load(Ordering::Relaxed),
+            "shedTotal": st.admission.metrics.shed.load(Ordering::Relaxed),
+            "lastWaitMs": st.admission.metrics.last_wait_us.load(Ordering::Relaxed) / 1_000,
         },
         "compaction": {
             "enabled": st.cfg.compaction.enabled,
@@ -2657,9 +2914,16 @@ async fn h_alert_create(
         .load_manifest()
         .await?;
     let files: Vec<IndexedFile> = m.files.iter().map(IndexedFile::whole).collect();
-    let value = measure(&s, st.table.as_str(), &files, &rule.sql, &limits(&st))
-        .await
-        .map_err(AppError::bad_request)?;
+    let value = measure(
+        &s,
+        st.table.as_str(),
+        &files,
+        &rule.sql,
+        &limits(&st),
+        &st.admission,
+    )
+    .await
+    .map_err(AppError::bad_request)?;
     let (status, _t) = alert::evaluate(&rule, &AlertStatus::initial(now), value, now);
     let id = rule.id.clone();
     for _ in 0..ALERTS_CAS_RETRIES {
@@ -3321,8 +3585,13 @@ mod tests {
             ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
             alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
             alert_seq: Arc::new(AtomicU64::new(0)),
+            audit_replica: Arc::from("test-replica"),
             audit_seq: Arc::new(AtomicU64::new(0)),
             audit: Arc::new(AuditMetrics::default()),
+            admission: Arc::new(Admission::new(
+                4,
+                Arc::new(verdigris_core::clock::SimClock::new(0)),
+            )),
             ingest_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             tokens: Arc::new(tokio::sync::RwLock::new(TokensDoc::default())),
             metrics: Arc::new(HttpMetrics::new()),
@@ -3385,19 +3654,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_batch_cas_conflict_keeps_both_writers() {
+    async fn audit_batch_cas_conflict_keeps_both_replicas() {
         let s: Store = Arc::new(object_store::memory::InMemory::new());
+        let rec_a = QueryRecord {
+            id: "replica-a-0".into(),
+            ..audit_rec(1)
+        };
+        let rec_b = QueryRecord {
+            id: "replica-b-0".into(),
+            ..audit_rec(2)
+        };
         let (mut a, mut b) = (None, None);
         let (ra, rb) = tokio::join!(
-            commit_audit_batch(&s, "t", &mut a, vec![audit_rec(1)]),
-            commit_audit_batch(&s, "t", &mut b, vec![audit_rec(2)]),
+            commit_audit_batch(&s, "t", &mut a, vec![rec_a]),
+            commit_audit_batch(&s, "t", &mut b, vec![rec_b]),
         );
         ra.unwrap();
         rb.unwrap();
         let (doc, _) = load_audit(&s, "t").await.unwrap();
         let mut ids: Vec<&str> = doc.queries.iter().map(|r| r.id.as_str()).collect();
         ids.sort();
-        assert_eq!(ids, vec!["audit-1", "audit-2"]);
+        assert_eq!(ids, vec!["replica-a-0", "replica-b-0"]);
     }
 
     #[tokio::test]
@@ -3444,5 +3721,90 @@ mod tests {
         )
         .await;
         assert_eq!(st.audit.failed.load(Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn small_limit_detection_is_conservative() {
+        assert!(has_small_limit("SELECT * FROM logs LIMIT 10", 1000));
+        assert!(has_small_limit("select * from logs limit 1000", 1000));
+        assert!(!has_small_limit("SELECT * FROM logs LIMIT 5000", 1000));
+        assert!(!has_small_limit("SELECT count(*) FROM logs", 1000));
+        assert!(!has_small_limit("SELECT * FROM logs LIMIT 10", 0));
+    }
+
+    #[tokio::test]
+    async fn admission_sheds_heavy_but_reserves_cheap_lane() {
+        let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
+        let admission = Admission::new(4, clock);
+        let _a = admission
+            .admit(false, Duration::from_millis(5))
+            .await
+            .expect("first heavy permit");
+        let _b = admission
+            .admit(false, Duration::from_millis(5))
+            .await
+            .expect("second heavy permit");
+        let _c = admission
+            .admit(false, Duration::from_millis(5))
+            .await
+            .expect("third heavy permit");
+        let err = admission
+            .admit(false, Duration::from_millis(5))
+            .await
+            .expect_err("fourth heavy must shed");
+        assert_eq!(err, 3);
+        // The reserved lane still admits a cheap query.
+        let _cheap = admission
+            .admit(true, Duration::from_millis(5))
+            .await
+            .expect("cheap lane must be reserved");
+        assert_eq!(admission.metrics.shed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn max_concurrent_one_has_exactly_one_permit() {
+        let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
+        let admission = Admission::new(1, clock);
+        // The first (cheap or heavy) request gets the one permit.
+        let _one = admission
+            .admit(true, Duration::from_millis(5))
+            .await
+            .expect("single permit");
+        // Nothing else can be admitted; the old code created a second permit.
+        assert!(admission
+            .admit(false, Duration::from_millis(5))
+            .await
+            .is_err());
+        assert!(admission
+            .admit(true, Duration::from_millis(5))
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn shed_response_carries_retry_after_and_depth() {
+        let res = AppError::overloaded(3, 1).into_response();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            res.headers().get(RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn scan_budget_error_attaches_the_estimate() {
+        let est = verdigris_core::estimate::QueryEstimate {
+            scan_bytes: 10 * 1024 * 1024,
+            scan_gib: 10.0 / 1024.0,
+            cost_usd: 0.01,
+            restore_ms: 0,
+            scan_ms: 10,
+            cold_restore: false,
+            files_touched: 2,
+            files_total: 4,
+            per_tier: Vec::new(),
+        };
+        let err = AppError::scan_over_budget(&est, 0.001);
+        let res = err.into_response();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

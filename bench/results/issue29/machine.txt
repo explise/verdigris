@@ -1,0 +1,7 @@
+date_utc=2026-11-26T20:44:21Z
+host_cpus=16
+host_mem_kb=15587280
+docker=29.9.0
+image=verdigris-bench:issue29b
+image_id=sha256:767ff9a3820136f5ce40db1894373400364acf5ea85705797c16ac229582a0d9
+limits=vdg 4cpu/2GiB, minio 2cpu/2GiB
