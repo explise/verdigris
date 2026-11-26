@@ -185,6 +185,24 @@ impl DataFile {
     }
 }
 
+/// A file compaction has stopped referencing but has not deleted yet.
+///
+/// A reader that loaded the previous manifest may still be scanning this path
+/// when the new manifest commits. Deleting it immediately would turn that
+/// in-flight read into a `NotFound`; keeping it in the manifest turns the old
+/// object into garbage that is only reclaimed after a grace period longer than
+/// any plausible query. The tombstone is deliberately not a [`DataFile`]: it is
+/// no longer part of the table, deserves no planner stats, and must never be
+/// selected by [`crate::estimate::select_files`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredFile {
+    /// Object-store key, relative to the store root.
+    pub path: String,
+    /// Clock time at which the manifest stopped referencing the file. Reclaim
+    /// waits `retired_grace_ms` from here.
+    pub retired_at_ms: u64,
+}
+
 /// The set of files making up a table. (A single flat snapshot for now; real
 /// Iceberg snapshots/partitions come with the Iceberg swap.)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -195,6 +213,12 @@ pub struct Manifest {
     /// files uniquely so a run never collides with prior output.
     #[serde(default)]
     pub compaction_gen: u64,
+    /// Files no longer referenced by `files`, awaiting safe reclamation.
+    ///
+    /// `#[serde(default)]` keeps manifests written before retirement existed
+    /// readable: they simply have nothing pending deletion.
+    #[serde(default)]
+    pub retired: Vec<RetiredFile>,
 }
 
 /// The trigram sidecar: `file path -> trigram set`, stored separately from the
@@ -290,7 +314,40 @@ impl Manifest {
             table: table.into(),
             files: Vec::new(),
             compaction_gen: 0,
+            retired: Vec::new(),
         }
+    }
+
+    /// Record `paths` as retired at `now_ms`, without duplicating an existing
+    /// tombstone. Called by compaction in the same manifest commit that drops
+    /// the files from `files`, so the object stays readable for old readers.
+    pub fn retire(&mut self, paths: impl IntoIterator<Item = String>, now_ms: u64) {
+        for path in paths {
+            // Never tombstone a path the same manifest still references: a
+            // reclaim must not be able to delete live data, even if a writer
+            // reuses a key it had previously retired.
+            if self.files.iter().any(|f| f.path == path)
+                || self.retired.iter().any(|r| r.path == path)
+            {
+                continue;
+            }
+            self.retired.push(RetiredFile {
+                path,
+                retired_at_ms: now_ms,
+            });
+        }
+    }
+
+    /// Tombstones whose grace period has fully elapsed at `now_ms`.
+    ///
+    /// `now_ms.saturating_sub(retired_at_ms) >= grace_ms` handles a wall clock
+    /// that stepped backwards (NTP) without ever making a fresh file eligible.
+    pub fn expired_retired(&self, now_ms: u64, grace_ms: u64) -> Vec<RetiredFile> {
+        self.retired
+            .iter()
+            .filter(|r| now_ms.saturating_sub(r.retired_at_ms) >= grace_ms)
+            .cloned()
+            .collect()
     }
 
     pub fn add(&mut self, file: DataFile) {
@@ -387,6 +444,37 @@ mod tests {
         };
         assert!(legacy.may_match(&[Predicate::service("anything")]));
         assert!(legacy.may_match(&[Predicate::level("DEBUG")]));
+    }
+
+    #[test]
+    fn retirement_is_pending_until_grace_elapses() {
+        let mut m = Manifest::new("logs");
+        m.retire(
+            vec![
+                "logs/hot/old-a.parquet".into(),
+                "logs/hot/old-b.parquet".into(),
+            ],
+            1_000,
+        );
+        // Re-retiring the same path does not reset its clock or duplicate it.
+        m.retire(vec!["logs/hot/old-a.parquet".into()], 9_000);
+        assert_eq!(m.retired.len(), 2);
+        assert_eq!(m.retired[0].retired_at_ms, 1_000);
+
+        assert!(m.expired_retired(1_000 + 999, 1_000).is_empty());
+        let expired = m.expired_retired(2_000, 1_000);
+        assert_eq!(expired.len(), 2);
+        assert_eq!(expired[0].path, "logs/hot/old-a.parquet");
+        // A backwards clock step cannot make a fresh tombstone eligible.
+        assert!(m.expired_retired(0, 1_000).is_empty());
+    }
+
+    #[test]
+    fn pre_retirement_manifest_still_deserializes() {
+        let old = r#"{"table":"logs","files":[],"compaction_gen":3}"#;
+        let m: Manifest = serde_json::from_str(old).unwrap();
+        assert_eq!(m.compaction_gen, 3);
+        assert!(m.retired.is_empty());
     }
 
     #[test]
