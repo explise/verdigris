@@ -117,14 +117,18 @@ SQL / search DSL ──▶ plan over manifest files ──▶ DataFusion ──�
 1. **Query language.** SQL (via DataFusion) is the portable interface. A concise **search
    DSL** (`service:auth status>=500 | last 1h`) compiles to SQL in `core::search`; raw SQL
    passes through. `status` is a first-class column.
-2. **Planning.** The query registers the exact files from the manifest and prunes by the
-   query's time window using per-file min/max stats.
+2. **Planning.** `core::scan::plan_scan` builds one value — compiled SQL, normalized tiers,
+   time window, prunable predicates, selected files — and both `/v1/query/estimate` and
+   `/v1/query` consume it. The quote therefore prices exactly the file set execution
+   registers.
 3. **Execution.** DataFusion reads Parquet **directly from object storage** — there is no
    rehydration step. On the hot tier this is interactive; on cold tiers it depends on
    Glacier retrieval (see the cost model).
 4. **Response.** `/v1/query` returns `{ rows, stats, histogram }` in one envelope:
    a page of rows, a `~60`-bucket time histogram (total vs errors) tied to the table's time
    range, and stats (total matched events, scanned bytes, elapsed ms, engine, files).
+   A rows-only caller sets `"histogram": false` and skips the second scan over the same
+   files; `stats.events` then reports the returned page size rather than a total.
 
 ## Tiering & lifecycle
 

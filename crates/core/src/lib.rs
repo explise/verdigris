@@ -18,6 +18,7 @@ pub mod lifecycle;
 pub mod manifest;
 pub mod model;
 pub mod rng;
+pub mod scan;
 pub mod search;
 pub mod text;
 
