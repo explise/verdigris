@@ -129,9 +129,11 @@ negotiates Arrow (config `wire: "arrow"`) and falls back to JSON transparently.
 `GET /v1/tail` (a read-role endpoint) is a live stream as Server-Sent Events
 (`Content-Type: text/event-stream`). Each event is `data: {json}` for one row
 (`{ts, level, service, message, trace_id?, status?, attrs_json?}`), with keepalive comments
-in between. A fresh connection streams only newly-arriving rows, not the backlog: it starts
-from the current manifest max and polls the newest file each second, bounded per poll so a
-bursty table can't flood the stream. The web UI consumes it via `EventSource`.
+in between. A fresh connection seeds a baseline from the current manifest and then polls
+for newly published ingest files, delivering each one once and in full. That makes a burst
+spanning several files safe, and rows sharing one timestamp are ordinary data rather than a
+page boundary that silently drops them. Compaction outputs are skipped because they
+republish rows the stream has already delivered. The web UI consumes it via `EventSource`.
 
 !!! warning "Auth + SSE"
     `EventSource` cannot send an `Authorization` header. If bearer auth (`[auth]`) is on,

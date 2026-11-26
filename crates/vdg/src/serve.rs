@@ -14,7 +14,7 @@
 //! `[auth]`) gates the `/v1/*` surface; the static frontend and `/config.json`
 //! stay open so the UI can boot pre-auth.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -2251,53 +2251,206 @@ async fn h_pipelines(State(st): State<AppState>) -> ApiResult {
 
 /// Interval between manifest polls for the live tail.
 const TAIL_POLL: Duration = Duration::from_secs(1);
-/// Max rows emitted per poll, so a bursty table can't flood the stream.
-const TAIL_MAX_ROWS: usize = 100;
 
-/// State carried across `unfold` steps of the tail stream.
-struct TailState {
-    st: AppState,
-    /// Newest ts (epoch millis) already emitted; only strictly-newer rows follow.
-    last_ts: i64,
+/// One newly published file awaiting emission.
+#[derive(Debug, Clone)]
+struct TailFile {
+    path: String,
+    bytes: u64,
+    min_ts: i64,
+}
+
+/// Cursor over append-only ingest files, carried across `unfold` steps.
+///
+/// A timestamp watermark (`ts > last_ts`) is not a cursor: it drops every row
+/// that shares the last emitted millisecond, and it cannot represent "the first
+/// 100 of this file's 1,000 same-timestamp rows". Since ingest files are
+/// immutable and every file is published once, the file path *is* a stable
+/// cursor. This tracks which paths have been delivered and queues newly
+/// published ones, so a burst across several files is drained completely and
+/// equal timestamps are ordinary data.
+struct TailCursor {
+    /// `None` only when the configured store could not be built; the stream then
+    /// stays alive with keepalives instead of failing the connection.
+    store: Option<Store>,
+    table: String,
+    limits: QueryLimits,
+    /// Every path already delivered *or* already present when the cursor was
+    /// seeded. Compaction outputs are added here without being emitted.
+    known: HashSet<String>,
+    /// New ingest files, oldest first, each emitted exactly once.
+    pending: VecDeque<TailFile>,
     /// Rows fetched but not yet emitted (one SSE event each).
     queue: VecDeque<Value>,
+    /// False until a manifest snapshot has seeded `known`. Until then, existing
+    /// rows are backlog, not new events.
+    initialized: bool,
+}
+
+impl TailCursor {
+    async fn new(st: &AppState) -> Self {
+        match store(st) {
+            Ok(s) => Self::with_store(s, st.table.as_str().to_string(), limits(st)).await,
+            Err(e) => {
+                tracing::warn!(error = %e, "live tail cannot build store");
+                Self {
+                    store: None,
+                    table: st.table.as_str().to_string(),
+                    limits: limits(st),
+                    known: HashSet::new(),
+                    pending: VecDeque::new(),
+                    queue: VecDeque::new(),
+                    initialized: false,
+                }
+            }
+        }
+    }
+
+    async fn with_store(store: Store, table: String, limits: QueryLimits) -> Self {
+        let mut c = Self {
+            store: Some(store),
+            table,
+            limits,
+            known: HashSet::new(),
+            pending: VecDeque::new(),
+            queue: VecDeque::new(),
+            initialized: false,
+        };
+        // Baseline failure is not fatal: retry on the first poll.
+        let _ = c.seed_baseline().await;
+        c
+    }
+
+    /// Snapshot the manifest and treat everything in it as already seen, so a
+    /// fresh connection streams only logs that arrive after it connected.
+    async fn seed_baseline(&mut self) -> anyhow::Result<()> {
+        let Some(store) = self.store.clone() else {
+            anyhow::bail!("tail store unavailable");
+        };
+        let m = verdigris_ingest::Ingestor::new(store, self.table.clone())
+            .load_manifest()
+            .await?;
+        self.known = m.files.iter().map(|f| f.path.clone()).collect();
+        self.initialized = true;
+        Ok(())
+    }
+
+    /// Discover files published since the last poll. Only ingest `part-` files
+    /// carry new events; a compaction output republishes rows that have already
+    /// been streamed and would otherwise appear twice.
+    async fn discover(&mut self) -> anyhow::Result<()> {
+        let Some(store) = self.store.clone() else {
+            anyhow::bail!("tail store unavailable");
+        };
+        let m = verdigris_ingest::Ingestor::new(store, self.table.clone())
+            .load_manifest()
+            .await?;
+
+        let mut new: Vec<TailFile> = m
+            .files
+            .iter()
+            .filter(|f| f.is_ingest_part() && f.rows > 0 && !self.known.contains(&f.path))
+            .map(|f| TailFile {
+                path: f.path.clone(),
+                bytes: f.bytes,
+                min_ts: f.min_ts,
+            })
+            .collect();
+        // Mark every current path known — including compaction outputs — so the
+        // manifest is not re-walked for the same retired/rewritten names forever.
+        self.known.extend(m.files.iter().map(|f| f.path.clone()));
+        // Deterministic delivery order for a burst spanning several files.
+        new.sort_by(|a, b| a.min_ts.cmp(&b.min_ts).then_with(|| a.path.cmp(&b.path)));
+        self.pending.extend(new);
+        Ok(())
+    }
+
+    /// Read one whole file. Files are immutable and bounded by the ingest batch
+    /// policy, and fetching the file as one result set means pagination can never
+    /// skip a row that shares a timestamp with the page boundary.
+    async fn fetch(&self, file: &TailFile) -> anyhow::Result<Vec<Value>> {
+        let Some(store) = self.store.clone() else {
+            anyhow::bail!("tail store unavailable");
+        };
+        let files = vec![IndexedFile {
+            path: file.path.clone(),
+            bytes: file.bytes,
+            row_groups: None,
+        }];
+        // `arrow_cast(ts, 'Int64')` keeps the internal epoch-millis helper out of
+        // the public row contract while still letting `ORDER BY ts` use the
+        // timestamp column.
+        let sql = format!(
+            "SELECT arrow_cast(ts, 'Int64') AS ts_millis, \
+                    ts, level, service, status, message, trace_id, attrs_json \
+             FROM {} ORDER BY ts ASC",
+            self.table
+        );
+        let mut rows = verdigris_query::engine::query_table_json(
+            store,
+            &self.table,
+            &files,
+            &sql,
+            &self.limits,
+        )
+        .await?;
+        for r in &mut rows {
+            // Drop the internal helper column so the emitted contract is clean.
+            if let Some(obj) = r.as_object_mut() {
+                obj.remove("ts_millis");
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Advance the cursor: emit queued rows, fetch the next pending file, or
+    /// sleep and poll for newly published files.
+    async fn fill(&mut self) -> anyhow::Result<()> {
+        if !self.queue.is_empty() {
+            return Ok(());
+        }
+        if let Some(file) = self.pending.front().cloned() {
+            let rows = self.fetch(&file).await?;
+            drop(file);
+            self.pending.pop_front();
+            self.queue.extend(rows);
+            return Ok(());
+        }
+
+        tokio::time::sleep(TAIL_POLL).await;
+        if !self.initialized {
+            self.seed_baseline().await?;
+        } else {
+            self.discover().await?;
+        }
+        Ok(())
+    }
 }
 
 /// `GET /v1/tail` — a live tail as `text/event-stream`. Each `data:` line is one
 /// JSON log row (`{ts, level, service, message, trace_id, status, attrs_json}`).
-/// It polls the newest manifest file every second and emits rows newer than the
-/// last one seen; only the newest file is scanned, so it can't run away.
+/// It polls the manifest every second for newly published ingest files; each
+/// file is delivered once, in full, so bursts and rows sharing a timestamp are
+/// never dropped.
 async fn h_tail(State(st): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    // Start from "now" (the current manifest max) so a fresh connection streams
-    // only newly-arriving rows, not the whole backlog.
-    let last_ts = match manifest(&st).await {
-        Ok((_s, m)) => m.files.iter().map(|f| f.max_ts).max().unwrap_or(0),
-        Err(_) => st.clock.now_millis() as i64,
-    };
-
-    let init = TailState {
-        st,
-        last_ts,
-        queue: VecDeque::new(),
-    };
+    let init = TailCursor::new(&st).await;
 
     let stream = futures::stream::unfold(init, |mut s| async move {
         loop {
-            // Drain any already-fetched rows one event at a time.
+            // Drain already-fetched rows one event at a time.
             if let Some(row) = s.queue.pop_front() {
                 let ev = Event::default().data(row.to_string());
                 return Some((Ok::<Event, Infallible>(ev), s));
             }
-            // Otherwise wait, then poll the newest file for fresh rows.
-            tokio::time::sleep(TAIL_POLL).await;
-            match tail_poll(&s.st, s.last_ts).await {
-                Ok((rows, new_last)) => {
-                    s.last_ts = new_last.max(s.last_ts);
-                    s.queue.extend(rows);
-                }
-                Err(_) => { /* transient (e.g. manifest mid-write): retry next tick */ }
+            // Otherwise advance the cursor (this may sleep for the poll interval).
+            if let Err(e) = s.fill().await {
+                // Transient (e.g. manifest mid-write): retry next tick. Sleep
+                // explicitly — a failing fetch leaves its file pending, and
+                // looping immediately would hammer the store once per event.
+                tracing::debug!(error = %e, "live tail poll failed");
+                tokio::time::sleep(TAIL_POLL).await;
             }
-            if s.queue.is_empty() {
+            if s.queue.is_empty() && s.pending.is_empty() {
                 // Nothing new: emit a comment so the connection stays warm and the
                 // loop yields back to the client.
                 let ev = Event::default().comment("keepalive");
@@ -2309,45 +2462,23 @@ async fn h_tail(State(st): State<AppState>) -> Sse<impl Stream<Item = Result<Eve
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// Fetch rows newer than `since_ts` from the table's newest file. Returns the
-/// rows (as query-shaped JSON) and the max ts seen (epoch millis).
-async fn tail_poll(st: &AppState, since_ts: i64) -> anyhow::Result<(Vec<Value>, i64)> {
-    let (s, m) = manifest(st).await?;
-    let Some(newest) = m.files.iter().max_by_key(|f| f.max_ts) else {
-        return Ok((Vec::new(), since_ts));
-    };
-    let files = vec![IndexedFile::whole(newest)];
-    let table = st.table.as_str();
-
-    // `arrow_cast(ts, 'Int64')` surfaces the underlying epoch-millis so we can
-    // both filter (`ts > since`) and advance `last_ts` deterministically.
-    let sql = format!(
-        "SELECT arrow_cast(ts, 'Int64') AS ts_millis, \
-                ts, level, service, status, message, trace_id, attrs_json \
-         FROM {table} WHERE ts > to_timestamp_millis({since_ts}) \
-         ORDER BY ts ASC LIMIT {TAIL_MAX_ROWS}"
-    );
-    let mut rows =
-        verdigris_query::engine::query_table_json(s, table, &files, &sql, &limits(st)).await?;
-
-    let mut max_ts = since_ts;
-    for r in &mut rows {
-        if let Some(v) = r.get("ts_millis").and_then(Value::as_i64) {
-            max_ts = max_ts.max(v);
-        }
-        // Drop the internal helper column so the emitted contract is clean.
-        if let Some(obj) = r.as_object_mut() {
-            obj.remove("ts_millis");
-        }
-    }
-    Ok((rows, max_ts))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use verdigris_core::batch::BatchPolicy;
     use verdigris_core::model::Level;
+
+    #[test]
+    fn query_request_defaults_to_histogram_and_allows_opt_out() {
+        let req: QueryReq = serde_json::from_str(r#"{"sql":"service:auth"}"#).unwrap();
+        assert!(
+            req.histogram,
+            "the UI's existing body must keep the histogram"
+        );
+        let req: QueryReq =
+            serde_json::from_str(r#"{"sql":"service:auth","histogram":false}"#).unwrap();
+        assert!(!req.histogram);
+    }
 
     #[test]
     fn ndjson_parses_and_skips_bad_lines() {
@@ -2385,6 +2516,98 @@ mod tests {
     fn empty_body_yields_no_records() {
         let (recs, _, _) = parse_ingest_body("   \n  \n");
         assert!(recs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_tail_delivers_bursts_and_equal_timestamps_without_dropping() {
+        let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let ing = verdigris_ingest::Ingestor::new(store.clone(), "logs");
+        let routing = verdigris_core::config::RoutingConfig::default();
+        let policy = BatchPolicy {
+            max_rows: 100,
+            max_bytes: usize::MAX,
+        };
+
+        // Baseline before any data: a fresh connection streams only what arrives
+        // after it connects.
+        let mut tail =
+            TailCursor::with_store(store.clone(), "logs".into(), QueryLimits::default()).await;
+
+        // 250 rows that all share one millisecond, rolled into three files. The
+        // old `ts > last_ts` watermark returned at most the first 100 and then
+        // stalled forever; file-cursor delivery must return all 250 exactly once.
+        let ts = 1_700_000_000_000i64;
+        let recs: Vec<LogRecord> = (0..250)
+            .map(|i| LogRecord {
+                ts_millis: ts,
+                level: Level::Info,
+                service: "burst".into(),
+                status: Some(200),
+                message: format!("burst-{i}"),
+                trace_id: Some(format!("trace-{i}")),
+                attrs: Default::default(),
+            })
+            .collect();
+        ing.ingest(recs, &routing, policy).await.unwrap();
+
+        tail.discover().await.unwrap();
+        assert_eq!(tail.pending.len(), 3, "three rolled files in the burst");
+        let mut got = Vec::new();
+        loop {
+            if tail.queue.is_empty() {
+                if tail.pending.is_empty() {
+                    break;
+                }
+                tail.fill().await.unwrap();
+            }
+            while let Some(v) = tail.queue.pop_front() {
+                got.push(v);
+            }
+        }
+
+        let mut messages: Vec<String> = got
+            .iter()
+            .map(|v| v["message"].as_str().unwrap().to_string())
+            .collect();
+        messages.sort();
+        let mut expected: Vec<String> = (0..250).map(|i| format!("burst-{i}")).collect();
+        expected.sort();
+        assert_eq!(messages.len(), 250, "no burst row may be dropped");
+        assert_eq!(messages, expected, "every row exactly once");
+        // Discovery marked all three files, so another poll emits nothing.
+        tail.discover().await.unwrap();
+        assert!(tail.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_tail_skips_compaction_rewrites() {
+        let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let ing = verdigris_ingest::Ingestor::new(store.clone(), "logs");
+        let routing = verdigris_core::config::RoutingConfig::default();
+        let policy = BatchPolicy {
+            max_rows: 100,
+            max_bytes: usize::MAX,
+        };
+        for i in 0u64..4 {
+            ing.ingest(
+                verdigris_ingest::generate::generate(100, i, (i as i64) * 1_000),
+                &routing,
+                policy,
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut tail = TailCursor::with_store(store, "logs".into(), QueryLimits::default()).await;
+        ing.compact(u64::MAX).await.unwrap();
+
+        // Compaction publishes new paths, but they contain rows the stream has
+        // already seen (or baseline backlog). Nothing should be re-emitted.
+        tail.discover().await.unwrap();
+        assert!(
+            tail.pending.is_empty(),
+            "compaction output is not new traffic"
+        );
     }
 
     #[tokio::test]
