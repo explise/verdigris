@@ -307,6 +307,10 @@ pub struct QueryConfig {
     pub max_result_rows: u64,
     /// ...or this much Arrow data, whichever trips first. In MiB.
     pub max_result_mib: u64,
+    /// Bound on the shared Parquet file-metadata cache (footer, row groups,
+    /// bloom filters, page index), in MiB. Shared across requests; execution
+    /// memory stays per query. Set to 0 to disable cross-request reuse.
+    pub metadata_cache_mib: u64,
 }
 
 impl Default for QueryConfig {
@@ -319,6 +323,7 @@ impl Default for QueryConfig {
             memory_pool_mib: 512,
             max_result_rows: 1_000_000,
             max_result_mib: 256,
+            metadata_cache_mib: 64,
         }
     }
 }

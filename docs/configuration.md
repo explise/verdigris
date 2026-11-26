@@ -105,9 +105,16 @@ estimate.
 [query]
 modeled_mibps_per_core = 250.0   # modeled per-core scan throughput (MiB/s)
 cores = 4                        # provisioned query cores
+metadata_cache_mib = 64          # shared Parquet footer/bloom/page-index cache
 ```
 
 Provisioned throughput used by the estimator is `cores × modeled_mibps_per_core`.
+
+`metadata_cache_mib` bounds the process-wide cache of immutable Parquet metadata
+(footer, row groups, bloom filters, page index). It is shared across requests while
+each query keeps its own execution memory pool; set it to `0` to disable
+cross-request reuse. The object-store client is also built once per process rather
+than per request.
 
 ## Routing (`[routing]`)
 

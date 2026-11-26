@@ -37,10 +37,14 @@ COPY crates/vdg/Cargo.toml     crates/vdg/Cargo.toml
 # Same feature set as the real build — `serve` pulls in datafusion, the big one.
 RUN mkdir -p crates/core/src crates/storage/src crates/query/src \
              crates/ingest/src crates/vdg/src \
+             crates/query/tests crates/query/examples \
     && : > crates/core/src/lib.rs \
     && : > crates/storage/src/lib.rs \
     && : > crates/query/src/lib.rs \
     && : > crates/ingest/src/lib.rs \
+    && : > crates/query/tests/engine.rs \
+    && : > crates/query/tests/row_group_pruning.rs \
+    && : > crates/query/examples/explain_pruning.rs \
     && echo 'fn main() {}' > crates/vdg/src/main.rs \
     && cargo build --release --features "serve apply" -p vdg
 

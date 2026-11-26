@@ -81,6 +81,7 @@ Response:
       "status": 503, "message": "…", "trace_id": "abc123", "attrs_json": "{…}" }
   ],
   "stats": { "events": 60000, "scannedBytes": 787601, "elapsedMs": 6,
+             "manifestMs": 0, "planMs": 0,
              "engine": "datafusion", "files": 3 },
   "histogram": [ { "total": 807, "errors": 331 }, … ]   // ~60 buckets over the table's time range
 }
@@ -88,6 +89,8 @@ Response:
 `stats.events` is the **total matched count** (histogram sum), not the returned row page,
 and `stats.eventsExact` says so. With `"histogram": false` no second scan runs, `histogram`
 is empty, and `events` is the returned row count instead (`eventsExact: false`).
+`elapsedMs` is engine time only; `manifestMs` and `planMs` are the manifest load and
+planning inputs before it.
 Rows carry attributes as the `attrs_json` string (schema-evolution escape hatch); the UI
 parses it into an `attrs` object.
 

@@ -59,7 +59,9 @@ for s in systems:
 lines.append("\n## Query latency (ms, after merges/compaction settle)\n")
 names = [
     ("recent_service_search", "Recent service search (`checkout` + `ERROR`, newest 200)"),
-    ("trace_lookup", "Trace lookup (exact `trace_id`)"),
+    ("trace_lookup", "Trace lookup (rotating exact `trace_id` hits)"),
+    ("trace_lookup_miss", "Trace lookup (missing `trace_id`)"),
+    ("trace_lookup_cross_tier", "Trace lookup (one id in all three tiers)"),
     ("minute_aggregation", "1-minute aggregation (total + errors)"),
 ]
 for key, label in names:
@@ -75,13 +77,14 @@ for key, label in names:
     lines.append("")
 
 lines.append("## Equivalence gate\n")
-lines.append("| System | Recent count | Search rows | Trace rows | Buckets | Total | Errors |")
-lines.append("|---|---:|---:|---:|---:|---:|---:|")
+lines.append("| System | Recent count | Search rows | Trace rows | Cross-tier | Missing | Buckets | Total | Errors |")
+lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
 for s in systems:
     e = s["equivalence"]
     lines.append(
         f"| {labels.get(s['system'], s['system'])} | {e['recent_count']:,} | "
-        f"{e['search_rows']} | {e['trace_rows']} | {e['buckets']} | "
+        f"{e['search_rows']} | {e['trace_rows']} | {e.get('cross_trace_rows', 0)} | "
+        f"{e.get('missing_trace_rows', 0)} | {e['buckets']} | "
         f"{e['total']:,} | {e['errors']:,} |"
     )
 

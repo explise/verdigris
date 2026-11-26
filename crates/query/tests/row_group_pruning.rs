@@ -304,3 +304,100 @@ async fn an_unindexed_file_returns_the_same_rows() {
     assert_eq!(indexed, unindexed, "the index must be invisible in results");
     assert!(!indexed.is_empty());
 }
+
+/// A trace lookup must be able to prune by bloom filter when every row group's
+/// `trace_id` min/max brackets the target. This is the case Parquet statistics
+/// cannot solve: the fixture deliberately puts `aaaa` and `zzzz` in every group
+/// and the target in exactly one, so min/max overlaps everywhere and only the
+/// bloom filter can prove absence. The plan's own metrics are the evidence.
+#[tokio::test]
+async fn trace_lookup_prunes_by_bloom_when_statistics_overlap() {
+    const TARGET: &str = "trace-target";
+    let mut recs = Vec::new();
+    for i in 0..(30 * RG) {
+        let trace_id = if i == 13 * RG {
+            TARGET
+        } else if i % 2 == 0 {
+            "aaaa"
+        } else {
+            "zzzz"
+        };
+        recs.push(LogRecord {
+            ts_millis: BASE_TS + i as i64 * 10,
+            level: Level::Info,
+            service: "api".into(),
+            status: Some(200),
+            message: format!("event {i}"),
+            trace_id: Some(trace_id.into()),
+            attrs: BTreeMap::new(),
+        });
+    }
+
+    let batch = encode::records_to_batch(&recs).expect("batch");
+    let mut w = MergeWriter::with_row_group_rows(log_schema(), RG).expect("writer");
+    w.write(&batch).expect("write");
+    let (bytes, stats) = w.finish().expect("finish");
+    assert!(stats.row_groups > 20, "need many row groups");
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let len = bytes.len() as u64;
+    store
+        .put(&ObjPath::from(PATH), bytes.into())
+        .await
+        .expect("put");
+    let file = DataFile {
+        path: PATH.into(),
+        bytes: len,
+        rows: stats.rows,
+        min_ts: stats.min_ts,
+        max_ts: stats.max_ts,
+        tier: Tier::Hot,
+        services: stats.services,
+        levels: stats.levels,
+        row_groups: stats.row_groups,
+        message_trigrams: Some(stats.message_trigrams),
+        row_group_trigrams: Some(stats.row_group_trigrams),
+    };
+
+    let rows = engine::query_table_json(
+        store.clone(),
+        "logs",
+        &[IndexedFile::whole(&file)],
+        &format!("SELECT message FROM logs WHERE trace_id = '{TARGET}'"),
+        &limits(),
+    )
+    .await
+    .expect("trace query");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["message"].as_str(), Some("event 6656"));
+
+    let explain = engine::query_table_json(
+        store,
+        "logs",
+        &[IndexedFile::whole(&file)],
+        &format!("EXPLAIN ANALYZE SELECT message FROM logs WHERE trace_id = '{TARGET}'"),
+        &limits(),
+    )
+    .await
+    .expect("explain");
+    let plan = explain[0]["plan"].as_str().expect("plan text");
+    let bloom = plan
+        .split("row_groups_pruned_bloom_filter=")
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .expect("bloom metric");
+    let pruned: u64 = bloom.parse().expect("pruned count");
+    assert!(
+        pruned > 0,
+        "bloom filter pruned no row groups: {bloom}\n{plan}"
+    );
+    assert!(
+        pruned + 1 >= stats.row_groups,
+        "only {pruned} of {} row groups were bloom-pruned: {bloom}",
+        stats.row_groups
+    );
+    assert!(
+        plan.contains("bytes_scanned="),
+        "EXPLAIN did not report bytes scanned"
+    );
+}
