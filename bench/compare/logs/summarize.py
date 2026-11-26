@@ -9,7 +9,7 @@ out_dir = sys.argv[1] if len(sys.argv) > 1 else "bench/results/compare-logs"
 order = {"vdg": 0, "clickhouse": 1, "victorialogs": 2}
 systems = []
 for path in sorted(glob.glob(os.path.join(out_dir, "*.json"))):
-    if path.endswith(".meta.json"):
+    if path.endswith(".meta.json") or path.endswith("-restart.json"):
         continue
     with open(path) as f:
         systems.append(json.load(f))

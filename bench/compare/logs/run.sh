@@ -130,10 +130,31 @@ run_vdg() {
   local bytes mem
   bytes=$(docker exec vdgbench-minio du -sb /data 2>/dev/null | awk '{print $1}' || echo 0)
   mem=$(container_mem vdgbench-vdg vdgbench-minio)
+  if [[ "${RESTART:-1}" == "1" ]]; then
+    docker restart "$vdg" >/dev/null
+    wait_ready vdg http://127.0.0.1:8080/healthz
+    python3 bench/compare/logs/first_query.py --system vdg --port 8080       --rows "$ROWS" --out "$OUT/vdg-restart.json"
+  fi
+
   write_meta vdg "$VDG_IMAGE" 8 "vdg 3g + minio 3g" "$bytes"
-  python3 - "$OUT/vdg.meta.json" "$mem" <<'PY'
+  storage=$(curl -fsS --max-time 5 http://127.0.0.1:8080/v1/storage/tiers 2>/dev/null || echo '{}')
+  bucket_bytes=$(docker exec vdgbench-minio du -sb /data/verdigris 2>/dev/null | awk '{print $1}' || echo 0)
+  internal_bytes=$(docker exec vdgbench-minio du -sb /data/.minio.sys 2>/dev/null | awk '{print $1}' || echo 0)
+  python3 - "$OUT/vdg.meta.json" "$mem" "$storage" "$bucket_bytes" "$internal_bytes" <<'PY'
 import json, sys
-p = sys.argv[1]; d = json.load(open(p)); d["container_memory"] = sys.argv[2]
+p, mem, raw, bucket, internal = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+d = json.load(open(p))
+d["container_memory"] = mem
+d["minio_bucket_bytes"] = int(bucket) if bucket.isdigit() else None
+d["minio_internal_bytes"] = int(internal) if internal.isdigit() else None
+try:
+    s = json.loads(raw)
+    c = s.get("compaction") or {}
+    d["active_files"] = int(c.get("smallFiles", 0)) + int(c.get("compacted", 0))
+    d["retired_files"] = int(c.get("retiredFiles", 0))
+    d["total_gb"] = s.get("totalGB")
+except Exception:
+    pass
 json.dump(d, open(p, "w"), indent=2)
 PY
   docker rm -f "$vdg" "$minio" >/dev/null 2>&1 || true
@@ -159,6 +180,13 @@ run_clickhouse() {
   local bytes mem
   bytes=$(docker exec chbench du -sb /var/lib/clickhouse 2>/dev/null | awk '{print $1}' || echo 0)
   mem=$(container_mem chbench)
+  if [[ "${RESTART:-1}" == "1" ]]; then
+    docker restart "$ch" >/dev/null
+    wait_ready ClickHouse http://127.0.0.1:8123/ping
+    python3 bench/compare/logs/first_query.py --system clickhouse --port 8123 \
+      --rows "$ROWS" --out "$OUT/clickhouse-restart.json"
+  fi
+
   write_meta clickhouse "$CH" 8 "6g" "$bytes"
   python3 - "$OUT/clickhouse.meta.json" "$mem" <<'PY'
 import json, sys
@@ -193,6 +221,13 @@ run_victorialogs() {
   sleep 10
   bytes=$(du -sb "$data_dir" 2>/dev/null | awk '{print $1}' || echo 0)
   mem=$(container_mem vlbench)
+  if [[ "${RESTART:-1}" == "1" ]]; then
+    docker restart "$vl" >/dev/null
+    wait_ready VictoriaLogs http://127.0.0.1:9428/health
+    python3 bench/compare/logs/first_query.py --system victorialogs --port 9428 \
+      --rows "$ROWS" --out "$OUT/victorialogs-restart.json"
+  fi
+
   write_meta victorialogs "$VL" 8 "6g" "$bytes"
   python3 - "$OUT/victorialogs.meta.json" "$mem" <<'PY'
 import json, sys

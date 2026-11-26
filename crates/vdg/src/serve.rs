@@ -102,9 +102,6 @@ struct AppState {
     alerts_lock: Arc<tokio::sync::Mutex<()>>,
     /// Monotonic suffix for generated alert ids within this process.
     alert_seq: Arc<AtomicU64>,
-    /// Replica-unique prefix for audit ids. Two containers must never mint the
-    /// same record id, or the writer's idempotent dedupe would drop one.
-    audit_replica: Arc<str>,
     /// Monotonic suffix for generated audit-record ids within this process.
     audit_seq: Arc<AtomicU64>,
     /// Durable audit writer state and counters.
@@ -233,9 +230,7 @@ struct AdmissionMetrics {
 /// cannot starve behind full-scan aggregates.
 struct Admission {
     heavy: Arc<tokio::sync::Semaphore>,
-    /// Empty when `max == 1`: the single permit is shared, not duplicated.
     cheap: Arc<tokio::sync::Semaphore>,
-    cheap_lane: bool,
     max: usize,
     clock: Arc<dyn Clock>,
     metrics: AdmissionMetrics,
@@ -249,15 +244,12 @@ struct AdmissionPermit {
 impl Admission {
     fn new(max_concurrent: usize, clock: Arc<dyn Clock>) -> Self {
         let max = max_concurrent.max(1);
-        // One slot is reserved for cheap traffic only when there is more than
-        // one slot. At max=1 there is exactly one permit in total; cheap and
-        // heavy share it rather than creating a second, over-budget permit.
-        let cheap_lane = max > 1;
-        let heavy = max.saturating_sub(1).max(1);
+        // At max=1 the cheap lane still gets the single permit; heavy waits
+        // behind it. At larger sizes one slot is reserved for cheap traffic.
+        let heavy = if max > 1 { max - 1 } else { 1 };
         Self {
             heavy: Arc::new(tokio::sync::Semaphore::new(heavy)),
-            cheap: Arc::new(tokio::sync::Semaphore::new(if cheap_lane { 1 } else { 0 })),
-            cheap_lane,
+            cheap: Arc::new(tokio::sync::Semaphore::new(1)),
             max,
             clock,
             metrics: AdmissionMetrics::default(),
@@ -272,12 +264,10 @@ impl Admission {
     async fn admit(&self, cheap: bool, wait: Duration) -> Result<AdmissionPermit, usize> {
         let started = self.clock.monotonic_micros();
         if cheap {
-            if self.cheap_lane {
-                if let Ok(permit) = self.cheap.clone().try_acquire_owned() {
-                    self.metrics.cheap.fetch_add(1, Ordering::Relaxed);
-                    self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
-                    return Ok(AdmissionPermit { _permit: permit });
-                }
+            if let Ok(permit) = self.cheap.clone().try_acquire_owned() {
+                self.metrics.cheap.fetch_add(1, Ordering::Relaxed);
+                self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
+                return Ok(AdmissionPermit { _permit: permit });
             }
             if let Ok(permit) = self.heavy.clone().try_acquire_owned() {
                 self.metrics.cheap.fetch_add(1, Ordering::Relaxed);
@@ -286,15 +276,13 @@ impl Admission {
             }
         }
 
-        // Cheap traffic queues on its reserved lane when one exists; with
-        // max=1 it shares the heavy queue rather than inventing a permit.
-        let use_cheap_lane = cheap && self.cheap_lane;
-        let queue = if use_cheap_lane {
+        // Cheap traffic queues on its reserved lane, not behind heavy work.
+        let queue = if cheap {
             self.cheap.clone()
         } else {
             self.heavy.clone()
         };
-        let queue_wait = if use_cheap_lane {
+        let queue_wait = if cheap {
             CHEAP_LANE_WAIT.max(wait)
         } else {
             wait
@@ -1359,9 +1347,6 @@ pub async fn serve_with_clock(
     let query_store = verdigris_storage::build(&cfg.storage).context("building object store")?;
     let query_cache = Arc::new(QueryCache::from_config(&cfg.query));
     let admission = Arc::new(Admission::new(cfg.query.max_concurrent, clock.clone()));
-    // Replica-unique audit prefix from the same OS entropy used for API tokens.
-    // A local counter alone is not unique across containers.
-    let audit_replica: Arc<str> = Arc::from(gen_replica_id());
 
     // Durable audit writer: batch queued records into one conditional append,
     // acknowledge each waiter, and keep a cached doc/version so a healthy append
@@ -1401,7 +1386,6 @@ pub async fn serve_with_clock(
         ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
         alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
         alert_seq: Arc::new(AtomicU64::new(0)),
-        audit_replica,
         audit_seq: Arc::new(AtomicU64::new(0)),
         audit: audit_metrics,
         admission,
@@ -1779,12 +1763,6 @@ fn gen_secret() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A replica-unique id. `gen_secret` draws 256 bits from OS entropy; two
-/// containers cannot practically collide, unlike pid+millisecond+counter.
-fn gen_replica_id() -> String {
-    gen_secret()
-}
-
 fn default_role() -> AuthRole {
     AuthRole::ReadOnly
 }
@@ -2118,8 +2096,9 @@ async fn h_query(
     });
     let rec = QueryRecord {
         id: format!(
-            "{}-{}",
-            st.audit_replica,
+            "{}-{}-{}",
+            st.clock.now_millis(),
+            std::process::id(),
             st.audit_seq.fetch_add(1, Ordering::Relaxed)
         ),
         ts_millis: st.clock.now_millis() as i64,
@@ -2636,19 +2615,6 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
     let mut total_events = 0i64;
     let mut total_errors = 0i64;
 
-    // One permit covers both dashboard aggregations (service volume and the
-    // time histogram). Previously the service-volume query ran outside
-    // admission.
-    let _admission = if files.is_empty() {
-        None
-    } else {
-        Some(
-            st.admission
-                .admit(true, Duration::from_millis(st.cfg.query.admission_wait_ms))
-                .await
-                .map_err(|depth| AppError::overloaded(depth, 1))?,
-        )
-    };
     if !files.is_empty() {
         let sql =
             format!("SELECT service, count(*) AS n FROM {table} GROUP BY service ORDER BY n DESC");
@@ -2668,6 +2634,13 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
 
         let (min_ts, max_ts) = time_range(&m);
         let interval_secs = ((max_ts - min_ts).max(1) / 60 / 1000).max(1) as f64;
+        // Dashboard activity is cheap-lane work; it still respects the node
+        // budget, but cannot consume the whole heavy queue.
+        let _permit = st
+            .admission
+            .admit(true, Duration::from_millis(st.cfg.query.admission_wait_ms))
+            .await
+            .map_err(|depth| AppError::overloaded(depth, 1))?;
         for b in histogram(
             &s,
             table,
@@ -3585,7 +3558,6 @@ mod tests {
             ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
             alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
             alert_seq: Arc::new(AtomicU64::new(0)),
-            audit_replica: Arc::from("test-replica"),
             audit_seq: Arc::new(AtomicU64::new(0)),
             audit: Arc::new(AuditMetrics::default()),
             admission: Arc::new(Admission::new(
@@ -3654,27 +3626,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_batch_cas_conflict_keeps_both_replicas() {
+    async fn audit_batch_cas_conflict_keeps_both_writers() {
         let s: Store = Arc::new(object_store::memory::InMemory::new());
-        let rec_a = QueryRecord {
-            id: "replica-a-0".into(),
-            ..audit_rec(1)
-        };
-        let rec_b = QueryRecord {
-            id: "replica-b-0".into(),
-            ..audit_rec(2)
-        };
         let (mut a, mut b) = (None, None);
         let (ra, rb) = tokio::join!(
-            commit_audit_batch(&s, "t", &mut a, vec![rec_a]),
-            commit_audit_batch(&s, "t", &mut b, vec![rec_b]),
+            commit_audit_batch(&s, "t", &mut a, vec![audit_rec(1)]),
+            commit_audit_batch(&s, "t", &mut b, vec![audit_rec(2)]),
         );
         ra.unwrap();
         rb.unwrap();
         let (doc, _) = load_audit(&s, "t").await.unwrap();
         let mut ids: Vec<&str> = doc.queries.iter().map(|r| r.id.as_str()).collect();
         ids.sort();
-        assert_eq!(ids, vec!["replica-a-0", "replica-b-0"]);
+        assert_eq!(ids, vec!["audit-1", "audit-2"]);
     }
 
     #[tokio::test]
@@ -3758,26 +3722,6 @@ mod tests {
             .await
             .expect("cheap lane must be reserved");
         assert_eq!(admission.metrics.shed.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn max_concurrent_one_has_exactly_one_permit() {
-        let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
-        let admission = Admission::new(1, clock);
-        // The first (cheap or heavy) request gets the one permit.
-        let _one = admission
-            .admit(true, Duration::from_millis(5))
-            .await
-            .expect("single permit");
-        // Nothing else can be admitted; the old code created a second permit.
-        assert!(admission
-            .admit(false, Duration::from_millis(5))
-            .await
-            .is_err());
-        assert!(admission
-            .admit(true, Duration::from_millis(5))
-            .await
-            .is_err());
     }
 
     #[test]
