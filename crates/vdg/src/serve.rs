@@ -102,6 +102,13 @@ struct AppState {
     alerts_lock: Arc<tokio::sync::Mutex<()>>,
     /// Monotonic suffix for generated alert ids within this process.
     alert_seq: Arc<AtomicU64>,
+    /// Replica-unique prefix for audit ids. Two containers must never mint the
+    /// same record id, or the writer's idempotent dedupe would drop one.
+    audit_replica: Arc<str>,
+    /// Monotonic suffix for generated audit-record ids within this process.
+    audit_seq: Arc<AtomicU64>,
+    /// Durable audit writer state and counters.
+    audit: Arc<AuditMetrics>,
     /// Backpressure: caps concurrent in-flight ingest requests so a flood sheds
     /// (429) instead of piling parsed bodies up in memory.
     ingest_sem: Arc<tokio::sync::Semaphore>,
@@ -132,10 +139,11 @@ struct AppState {
     /// Shared, bounded Parquet metadata + schema cache. Scoped to this store and
     /// table; per-query execution memory remains isolated in the engine.
     query_cache: Arc<QueryCache>,
-    /// Audit records are persisted by one background worker. A query must not
-    /// wait on a read-modify-write of the audit doc before returning rows; the
-    /// in-memory history is updated synchronously and this queue is best-effort.
-    audit_tx: tokio::sync::mpsc::Sender<QueryRecord>,
+    /// Audit records are persisted by one background writer. Handlers enqueue a
+    /// job and wait (bounded) for its acknowledgement, so a healthy store makes
+    /// the record durable before the response is released. The queue bounds
+    /// memory; a full queue falls back to a direct append.
+    audit_tx: tokio::sync::mpsc::Sender<AuditJob>,
 }
 
 /// Counters for background auto-compaction. The live "pending files" figure is
@@ -169,6 +177,11 @@ struct Identity(String);
 /// One recorded query kept in the audit ring and the persisted audit doc.
 #[derive(Clone, Serialize, Deserialize)]
 struct QueryRecord {
+    /// Unique record id. Used to make retried/batched audit appends idempotent
+    /// across CAS conflicts and replica handoffs. Empty on records written before
+    /// ids existed; those are never deduplicated (and are never rewritten).
+    #[serde(default)]
+    id: String,
     ts_millis: i64,
     user: String,
     sql: String,
@@ -178,13 +191,49 @@ struct QueryRecord {
     tier: String,
 }
 
+/// Observability for the durable audit writer.
+#[derive(Default)]
+struct AuditMetrics {
+    /// Records waiting for the worker (approximate under concurrency).
+    queued: AtomicU64,
+    /// Enqueues that found the bounded queue full.
+    saturated: AtomicU64,
+    /// Batches that could not be persisted after retries.
+    failed: AtomicU64,
+    /// Handler waits that exceeded the acknowledgement deadline (the record may
+    /// still land later; the response was already released fail-open).
+    timed_out: AtomicU64,
+    /// Records persisted and acknowledged.
+    acked: AtomicU64,
+    /// Last handler wait, microseconds.
+    last_wait_us: AtomicU64,
+}
+
+/// One queued record plus the channel used to tell the handler when it is durable.
+struct AuditJob {
+    rec: QueryRecord,
+    ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
 const QUERY_HISTORY_CAP: usize = 500;
+
+/// Bounded audit queue. A full queue triggers a short wait, then a direct
+/// append fallback rather than dropping the record.
+const AUDIT_QUEUE_CAPACITY: usize = 1024;
+/// Max records coalesced into one conditional append.
+const AUDIT_BATCH_MAX: usize = 64;
+/// One end-to-end fail-open deadline for enqueue, acknowledgement, and the
+/// direct-append fallback. Generous relative to a healthy local PUT, short
+/// enough that a sick store cannot hold a query.
+const AUDIT_DEADLINE: Duration = Duration::from_millis(250);
+/// How long shutdown may spend draining queued audit records.
+const AUDIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The persisted audit trail: `{table}/_audit/query-history.json`, oldest first,
 /// trimmed to [`QUERY_HISTORY_CAP`]. Appended under optimistic CAS (same
 /// discipline as the manifest) so concurrent reader replicas don't clobber each
 /// other's records.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct AuditDoc {
     queries: Vec<QueryRecord>,
 }
@@ -219,7 +268,9 @@ async fn load_audit(s: &Store, table: &str) -> anyhow::Result<(AuditDoc, Option<
 async fn append_audit(s: &Store, table: &str, rec: QueryRecord) -> anyhow::Result<()> {
     for _ in 0..4 {
         let (mut doc, version) = load_audit(s, table).await?;
-        doc.queries.push(rec.clone());
+        if rec.id.is_empty() || !doc.queries.iter().any(|r| r.id == rec.id) {
+            doc.queries.push(rec.clone());
+        }
         if doc.queries.len() > QUERY_HISTORY_CAP {
             let excess = doc.queries.len() - QUERY_HISTORY_CAP;
             doc.queries.drain(..excess);
@@ -253,6 +304,260 @@ async fn append_audit(s: &Store, table: &str, rec: QueryRecord) -> anyhow::Resul
         }
     }
     anyhow::bail!("audit append failed after retries under contention")
+}
+
+/// In-process view of the audit doc, so a healthy append is one conditional PUT
+/// instead of a GET + PUT. A CAS conflict discards it and reloads.
+struct AuditCache {
+    doc: AuditDoc,
+    version: Option<UpdateVersion>,
+    /// Store does not implement conditional puts; use last-write-wins.
+    no_cas: bool,
+}
+
+/// Append records, de-duplicating by record id. Ids are unique per process and
+/// monotonic; empty ids are legacy records and are never matched against.
+fn append_records_to_doc(doc: &mut AuditDoc, records: Vec<QueryRecord>) {
+    let known: std::collections::HashSet<String> = doc
+        .queries
+        .iter()
+        .filter(|r| !r.id.is_empty())
+        .map(|r| r.id.clone())
+        .collect();
+    for rec in records {
+        if rec.id.is_empty() || !known.contains(&rec.id) {
+            doc.queries.push(rec);
+        }
+    }
+    if doc.queries.len() > QUERY_HISTORY_CAP {
+        let excess = doc.queries.len() - QUERY_HISTORY_CAP;
+        doc.queries.drain(..excess);
+    }
+}
+
+async fn commit_audit_batch(
+    s: &Store,
+    table: &str,
+    cache: &mut Option<AuditCache>,
+    records: Vec<QueryRecord>,
+) -> anyhow::Result<()> {
+    for attempt in 0..8 {
+        if cache.is_none() {
+            let (doc, version) = load_audit(s, table).await?;
+            *cache = Some(AuditCache {
+                doc,
+                version,
+                no_cas: false,
+            });
+        }
+        let entry = cache.as_mut().expect("just loaded");
+        let mut doc = entry.doc.clone();
+        append_records_to_doc(&mut doc, records.clone());
+        let bytes = serde_json::to_vec(&doc).context("serializing audit doc")?;
+        if entry.no_cas {
+            s.put(&audit_path(table), bytes.into())
+                .await
+                .context("writing audit doc (no-CAS fallback)")?;
+            entry.doc = doc;
+            return Ok(());
+        }
+        let mode = match &entry.version {
+            Some(v) => PutMode::Update(v.clone()),
+            None => PutMode::Create,
+        };
+        match s
+            .put_opts(
+                &audit_path(table),
+                bytes.clone().into(),
+                PutOptions {
+                    mode,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(res) => {
+                entry.doc = doc;
+                entry.version = match (res.e_tag, res.version) {
+                    (None, None) => {
+                        // No usable version token: degrade this cache entry to a
+                        // plain put rather than looping on Create.
+                        entry.no_cas = true;
+                        None
+                    }
+                    (e_tag, version) => Some(UpdateVersion { e_tag, version }),
+                };
+                return Ok(());
+            }
+            Err(object_store::Error::Precondition { .. })
+            | Err(object_store::Error::AlreadyExists { .. }) => {
+                *cache = None; // stale; reload and retry
+            }
+            Err(object_store::Error::NotImplemented { .. }) => {
+                entry.no_cas = true;
+                s.put(&audit_path(table), bytes.into())
+                    .await
+                    .context("writing audit doc (no-CAS fallback)")?;
+                entry.doc = doc;
+                entry.version = None;
+                return Ok(());
+            }
+            Err(e) => {
+                // A transient store error is not a conflict: retry the same
+                // cached doc a few times before releasing the handler fail-open.
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+                    continue;
+                }
+                return Err(e).context("committing audit doc");
+            }
+        }
+    }
+    anyhow::bail!("audit append failed after retries under contention")
+}
+
+/// One durable-audit worker. It coalesces whatever is already queued into one
+/// conditional append, then acknowledges every record in that batch. A failed
+/// batch is reported to its waiters and counted; the query itself stays
+/// fail-open.
+async fn audit_worker(
+    s: Store,
+    table: String,
+    mut rx: tokio::sync::mpsc::Receiver<AuditJob>,
+    metrics: Arc<AuditMetrics>,
+) {
+    let mut cache: Option<AuditCache> = None;
+    while let Some(first) = rx.recv().await {
+        let mut batch = vec![first];
+        while batch.len() < AUDIT_BATCH_MAX {
+            match rx.try_recv() {
+                Ok(job) => batch.push(job),
+                Err(_) => break,
+            }
+        }
+        let records: Vec<QueryRecord> = batch.iter().map(|j| j.rec.clone()).collect();
+        let result = commit_audit_batch(&s, &table, &mut cache, records)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        match &result {
+            Ok(()) => {
+                metrics
+                    .acked
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+            }
+            Err(_) => {
+                metrics.failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        for job in batch {
+            let _ = metrics
+                .queued
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(1))
+                });
+            let _ = job.ack.send(result.clone());
+        }
+    }
+}
+
+/// Enqueue one audit record and wait for durability under one end-to-end
+/// deadline. A full queue gets whatever budget remains, then a direct append.
+/// Any failure/timeout is counted and the query proceeds fail-open.
+async fn persist_audit(st: &AppState, rec: QueryRecord) {
+    persist_audit_with(st, rec, AUDIT_DEADLINE).await
+}
+
+/// Remaining time against an absolute monotonic deadline.
+fn remaining_us(deadline_us: u64, now_us: u64) -> Option<Duration> {
+    (deadline_us > now_us).then(|| Duration::from_micros(deadline_us - now_us))
+}
+
+async fn persist_audit_with(st: &AppState, rec: QueryRecord, deadline: Duration) {
+    let started = st.clock.monotonic_micros();
+    let deadline_us = started.saturating_add(deadline.as_micros() as u64);
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    let job = AuditJob {
+        rec: rec.clone(),
+        ack: ack_tx,
+    };
+    st.audit.queued.fetch_add(1, Ordering::Relaxed);
+
+    let queued = match st.audit_tx.try_send(job) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
+            st.audit.saturated.fetch_add(1, Ordering::Relaxed);
+            match remaining_us(deadline_us, st.clock.monotonic_micros()) {
+                Some(left) => matches!(
+                    tokio::time::timeout(left, st.audit_tx.send(job)).await,
+                    Ok(Ok(()))
+                ),
+                None => false,
+            }
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+    };
+
+    if queued {
+        match remaining_us(deadline_us, st.clock.monotonic_micros()) {
+            Some(left) => match tokio::time::timeout(left, ack_rx).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => {
+                    tracing::warn!(error = %e, "audit persistence failed; query remains fail-open");
+                }
+                Ok(Err(_)) => {
+                    st.audit.failed.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!("audit worker dropped an acknowledgement");
+                }
+                Err(_) => {
+                    st.audit.timed_out.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!("audit acknowledgement timed out; query remains fail-open");
+                }
+            },
+            None => {
+                st.audit.timed_out.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    } else {
+        st.audit.queued.fetch_sub(1, Ordering::Relaxed);
+        // Saturated or worker gone: do the CAS append ourselves, still inside
+        // the same request deadline. A stalled append cannot outlive it.
+        match remaining_us(deadline_us, st.clock.monotonic_micros()) {
+            Some(left) => {
+                match tokio::time::timeout(left, append_audit(&st.store, st.table.as_str(), rec))
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        st.audit.failed.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(error = %e, "direct audit append failed; query remains fail-open");
+                    }
+                    Err(_) => {
+                        st.audit.timed_out.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            "direct audit append deadline exceeded; query remains fail-open"
+                        );
+                    }
+                }
+            }
+            None => {
+                st.audit.timed_out.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    st.audit.last_wait_us.store(
+        st.clock.monotonic_micros().saturating_sub(started),
+        Ordering::Relaxed,
+    );
+}
+
+/// The replica prefix makes ids unique even when two replicas observe the same
+/// clock reading and both local counters start at zero.
+fn next_audit_id(st: &AppState) -> String {
+    format!(
+        "{}-{}",
+        st.audit_replica,
+        st.audit_seq.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Minimal, dependency-free Prometheus metrics for the service: request counts by
@@ -879,24 +1184,25 @@ pub async fn serve_with_clock(
     // footers that cannot have changed (files are immutable).
     let query_store = verdigris_storage::build(&cfg.storage).context("building object store")?;
     let query_cache = Arc::new(QueryCache::from_config(&cfg.query));
+    // Replica-unique audit prefix from the same OS entropy used for API tokens.
+    // A local counter alone is not unique across containers.
+    let audit_replica: Arc<str> = Arc::from(gen_replica_id());
 
-    // Persist audit records off the request path. The audit doc is a CAS
-    // read-modify-write against the object store; doing it inline added a
-    // metadata round-trip to every query. The bounded queue makes backpressure
-    // explicit: under a flood, audit records are dropped rather than delaying
-    // query responses (the in-memory history still has the record).
-    let (audit_tx, mut audit_rx) = tokio::sync::mpsc::channel::<QueryRecord>(1024);
-    {
+    // Durable audit writer: batch queued records into one conditional append,
+    // acknowledge each waiter, and keep a cached doc/version so a healthy append
+    // is one PUT. The queue bounds memory; saturation falls back to a direct CAS
+    // append rather than dropping a completed query.
+    let audit_metrics = Arc::new(AuditMetrics::default());
+    let (audit_tx, audit_rx) = tokio::sync::mpsc::channel::<AuditJob>(AUDIT_QUEUE_CAPACITY);
+    let audit_shutdown_tx = audit_tx.clone();
+    let audit_handle = {
         let audit_store = query_store.clone();
         let audit_table = table.clone();
+        let audit_metrics = audit_metrics.clone();
         tokio::spawn(async move {
-            while let Some(rec) = audit_rx.recv().await {
-                if let Err(e) = append_audit(&audit_store, &audit_table, rec).await {
-                    tracing::warn!(error = %e, "audit write-through failed");
-                }
-            }
-        });
-    }
+            audit_worker(audit_store, audit_table, audit_rx, audit_metrics).await;
+        })
+    };
 
     // Load the persisted token catalog into the in-memory cache.
     let boot_store = Some(query_store.clone());
@@ -920,6 +1226,9 @@ pub async fn serve_with_clock(
         ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
         alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
         alert_seq: Arc::new(AtomicU64::new(0)),
+        audit_replica,
+        audit_seq: Arc::new(AtomicU64::new(0)),
+        audit: audit_metrics,
         ingest_sem: Arc::new(tokio::sync::Semaphore::new(max_inflight)),
         tokens: Arc::new(tokio::sync::RwLock::new(tokens_doc)),
         metrics: Arc::new(HttpMetrics::new()),
@@ -1110,8 +1419,43 @@ pub async fn serve_with_clock(
         println!("  auth:     bearer-token required on /v1/*");
     }
     println!("  remember to set USE_MOCKS = false in frontend/api.js");
-    axum::serve(listener, app).await.context("http server")?;
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+    server.await.context("http server")?;
+
+    // Every handler has returned; drop the last sender so the audit worker sees
+    // the channel close, then give it a bounded deadline to flush what is queued.
+    drop(audit_shutdown_tx);
+    match tokio::time::timeout(AUDIT_DRAIN_TIMEOUT, audit_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "audit worker join failed during shutdown"),
+        Err(_) => tracing::warn!(
+            timeout_s = AUDIT_DRAIN_TIMEOUT.as_secs(),
+            "audit drain deadline exceeded at shutdown"
+        ),
+    }
     Ok(())
+}
+
+/// Resolve on SIGINT or SIGTERM so the HTTP server stops accepting requests and
+/// the audit writer can drain before the process exits.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 fn role_name(role: Role) -> &'static str {
@@ -1253,6 +1597,12 @@ fn gen_secret() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A replica-unique id. `gen_secret` draws 256 bits from OS entropy; two
+/// containers cannot practically collide, unlike pid+millisecond+counter.
+fn gen_replica_id() -> String {
+    gen_secret()
 }
 
 fn default_role() -> AuthRole {
@@ -1552,7 +1902,7 @@ async fn h_query(
         .iter()
         .filter_map(|f| f.scanned_row_groups())
         .fold((0usize, 0usize), |(s, t), (fs, ft)| (s + fs, t + ft));
-    let stats = json!({
+    let mut stats = json!({
         "events": events,
         // False when the caller opted out of the histogram: `events` is then the
         // returned row count, not the total match count.
@@ -1586,6 +1936,7 @@ async fn h_query(
         )
     });
     let rec = QueryRecord {
+        id: next_audit_id(&st),
         ts_millis: st.clock.now_millis() as i64,
         user,
         sql: req.sql.clone(),
@@ -1600,12 +1951,17 @@ async fn h_query(
         }
         hist.push_back(rec.clone());
     }
-    // Queue the persisted audit record off the request path. A full queue means
-    // the audit writer is behind; drop rather than delay the response that the
-    // caller already earned. The in-memory history above is authoritative for
-    // the current process.
-    if st.audit_tx.try_send(rec).is_err() {
-        tracing::debug!("audit queue full; dropping persisted record");
+    // Persist before releasing the response. The writer batches concurrent
+    // records into one conditional append and acknowledges each waiter, so a
+    // healthy store makes the record immediately visible to other replicas.
+    // Persistence errors are counted and remain fail-open.
+    let audit_start = st.clock.monotonic_micros();
+    persist_audit(&st, rec).await;
+    let audit_us = st.clock.monotonic_micros().saturating_sub(audit_start);
+    let total_us = st.clock.monotonic_micros().saturating_sub(t_request);
+    if let Some(obj) = stats.as_object_mut() {
+        obj.insert("auditMs".into(), json!(audit_us / 1_000));
+        obj.insert("totalMs".into(), json!(total_us / 1_000));
     }
 
     if arrow {
@@ -2106,6 +2462,14 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
             "metadataEntries": cache_entries,
             "metadataBytes": cache_bytes,
             "metadataHits": cache_hits,
+        },
+        "audit": {
+            "queued": st.audit.queued.load(Ordering::Relaxed),
+            "saturatedTotal": st.audit.saturated.load(Ordering::Relaxed),
+            "failedTotal": st.audit.failed.load(Ordering::Relaxed),
+            "timedOutTotal": st.audit.timed_out.load(Ordering::Relaxed),
+            "ackedTotal": st.audit.acked.load(Ordering::Relaxed),
+            "lastWaitMs": st.audit.last_wait_us.load(Ordering::Relaxed) / 1_000,
         },
         "compaction": {
             "enabled": st.cfg.compaction.enabled,
@@ -2773,6 +3137,7 @@ mod tests {
 
     fn audit_rec(i: i64) -> QueryRecord {
         QueryRecord {
+            id: format!("audit-{i}"),
             ts_millis: i,
             user: "u".into(),
             sql: "select 1".into(),
@@ -2839,5 +3204,332 @@ mod tests {
         append_audit(&s, "t", audit_rec(1)).await.unwrap();
         let (doc, _) = load_audit(&s, "t").await.unwrap();
         assert_eq!(doc.queries.len(), 1);
+    }
+
+    #[derive(Debug)]
+    struct FlakyStore {
+        inner: Store,
+        failures: std::sync::atomic::AtomicUsize,
+    }
+
+    impl std::fmt::Display for FlakyStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FlakyStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for FlakyStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: object_store::PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if self
+                .failures
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok_and(|n| n > 0)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "flaky",
+                    source: "transient audit store failure".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A store whose writes never complete. Used to prove the direct-append
+    /// fallback is bounded by the same deadline as the queue/ack path.
+    #[derive(Debug)]
+    struct HangingPutStore {
+        inner: Store,
+    }
+
+    impl std::fmt::Display for HangingPutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "HangingPutStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for HangingPutStore {
+        async fn put_opts(
+            &self,
+            _location: &ObjPath,
+            _payload: object_store::PutPayload,
+            _options: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            std::future::pending::<()>().await;
+            unreachable!("pending never returns")
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn audit_test_state(store: Store, tx: tokio::sync::mpsc::Sender<AuditJob>) -> AppState {
+        AppState {
+            cfg: Arc::new(Config::default()),
+            table: Arc::new("t".into()),
+            ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
+            alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
+            alert_seq: Arc::new(AtomicU64::new(0)),
+            audit_replica: Arc::from("test-replica"),
+            audit_seq: Arc::new(AtomicU64::new(0)),
+            audit: Arc::new(AuditMetrics::default()),
+            ingest_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            tokens: Arc::new(tokio::sync::RwLock::new(TokensDoc::default())),
+            metrics: Arc::new(HttpMetrics::new()),
+            query_history: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            compaction: Arc::new(CompactionMetrics::new()),
+            clock: Arc::new(verdigris_core::clock::SimClock::new(1_700_000_000_000)),
+            store,
+            query_cache: Arc::new(QueryCache::new(1024 * 1024)),
+            audit_tx: tx,
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_worker_batches_acknowledges_and_drains_on_shutdown() {
+        let s: Store = Arc::new(object_store::memory::InMemory::new());
+        let metrics = Arc::new(AuditMetrics::default());
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let handle = tokio::spawn(audit_worker(s.clone(), "t".into(), rx, metrics.clone()));
+
+        let mut acks = Vec::new();
+        for i in 0..20 {
+            let (ack, ack_rx) = tokio::sync::oneshot::channel();
+            tx.send(AuditJob {
+                rec: audit_rec(i),
+                ack,
+            })
+            .await
+            .unwrap();
+            acks.push(ack_rx);
+        }
+        drop(tx); // orderly shutdown: channel closes, worker drains, then exits.
+        handle.await.unwrap();
+
+        for ack in acks {
+            assert!(ack.await.unwrap().is_ok(), "every record must be acked");
+        }
+        let (doc, _) = load_audit(&s, "t").await.unwrap();
+        assert_eq!(doc.queries.len(), 20);
+        let unique: std::collections::HashSet<&str> =
+            doc.queries.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(unique.len(), 20, "retries must not duplicate records");
+        assert_eq!(metrics.acked.load(Ordering::Relaxed), 20);
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn audit_batch_retries_transient_errors() {
+        let inner: Store = Arc::new(object_store::memory::InMemory::new());
+        let store: Store = Arc::new(FlakyStore {
+            inner: inner.clone(),
+            failures: std::sync::atomic::AtomicUsize::new(1),
+        });
+        let mut cache = None;
+        commit_audit_batch(&store, "t", &mut cache, vec![audit_rec(1)])
+            .await
+            .unwrap();
+        let (doc, _) = load_audit(&inner, "t").await.unwrap();
+        assert_eq!(doc.queries.len(), 1);
+        assert_eq!(doc.queries[0].id, "audit-1");
+    }
+
+    #[tokio::test]
+    async fn same_clock_and_counter_replicas_keep_both_records() {
+        let s: Store = Arc::new(object_store::memory::InMemory::new());
+        let clock: Arc<dyn Clock> =
+            Arc::new(verdigris_core::clock::SimClock::new(1_700_000_000_000));
+        // Both replicas start with counter 0 and read the same clock. Only the
+        // replica prefix can keep their record ids distinct.
+        let (tx_a, _rx_a) = tokio::sync::mpsc::channel(1);
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel(1);
+        let mut a = audit_test_state(s.clone(), tx_a);
+        let mut b = audit_test_state(s.clone(), tx_b);
+        a.clock = clock.clone();
+        b.clock = clock.clone();
+        a.audit_replica = Arc::from("replica-a");
+        b.audit_replica = Arc::from("replica-b");
+        let rec_a = QueryRecord {
+            id: next_audit_id(&a),
+            ts_millis: clock.now_millis() as i64,
+            ..audit_rec(1)
+        };
+        let rec_b = QueryRecord {
+            id: next_audit_id(&b),
+            ts_millis: clock.now_millis() as i64,
+            ..audit_rec(2)
+        };
+        assert_eq!(rec_a.ts_millis, rec_b.ts_millis);
+        assert!(rec_a.id.ends_with("-0") && rec_b.id.ends_with("-0"));
+        assert_ne!(rec_a.id, rec_b.id);
+        let (mut ca, mut cb) = (None, None);
+        let (ra, rb) = tokio::join!(
+            commit_audit_batch(&s, "t", &mut ca, vec![rec_a.clone()]),
+            commit_audit_batch(&s, "t", &mut cb, vec![rec_b.clone()]),
+        );
+        ra.unwrap();
+        rb.unwrap();
+        let (doc, _) = load_audit(&s, "t").await.unwrap();
+        let mut ids: Vec<&str> = doc.queries.iter().map(|r| r.id.as_str()).collect();
+        ids.sort();
+        let mut want = vec![rec_a.id.as_str(), rec_b.id.as_str()];
+        want.sort();
+        assert_eq!(ids, want);
+    }
+
+    #[tokio::test]
+    async fn audit_saturation_falls_back_and_increments_metric() {
+        let s: Store = Arc::new(object_store::memory::InMemory::new());
+        // Capacity one, receiver kept alive but no worker: the second record
+        // must fall back to a direct append rather than being dropped.
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let st = audit_test_state(s.clone(), tx.clone());
+        let (ack, _) = tokio::sync::oneshot::channel();
+        tx.try_send(AuditJob {
+            rec: audit_rec(99),
+            ack,
+        })
+        .unwrap();
+        persist_audit_with(&st, audit_rec(1), Duration::from_millis(20)).await;
+        let (doc, _) = load_audit(&s, "t").await.unwrap();
+        assert!(doc.queries.iter().any(|r| r.id == "audit-1"));
+        assert_eq!(st.audit.saturated.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn audit_persistence_failure_increments_metric_and_remains_fail_open() {
+        let inner: Store = Arc::new(object_store::memory::InMemory::new());
+        let store: Store = Arc::new(FlakyStore {
+            inner,
+            failures: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        });
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx); // worker gone: force the direct fallback
+        let st = audit_test_state(store, tx);
+        // Must return normally (fail-open) despite the store failure.
+        persist_audit_with(&st, audit_rec(1), Duration::from_millis(20)).await;
+        assert_eq!(st.audit.failed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_direct_append_is_bounded_by_end_to_end_deadline() {
+        let inner: Store = Arc::new(object_store::memory::InMemory::new());
+        let store: Store = Arc::new(HangingPutStore { inner });
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx); // force the direct fallback
+        let st = audit_test_state(store, tx);
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            persist_audit_with(&st, audit_rec(1), Duration::from_millis(30)),
+        )
+        .await
+        .expect("audit fallback must honour its deadline");
+        assert_eq!(st.audit.timed_out.load(Ordering::Relaxed), 1);
+        assert_eq!(st.audit.queued.load(Ordering::Relaxed), 0);
     }
 }
