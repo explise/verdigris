@@ -15,23 +15,36 @@ site_dir: site
 
 repo_url: https://github.com/explise/verdigris
 repo_name: explise/verdigris
+copyright: Verdigris · Apache-2.0
+
+exclude_docs: |
+  /overrides/
 
 theme:
   name: material
+  custom_dir: docs/overrides
   language: en
   logo: assets/logo.svg
   favicon: assets/favicon.svg
   palette:
-    # Light "warm paper" scheme; exact brand hues come from CSS overriding
-    # --md-primary-fg-color / --md-accent-fg-color in stylesheets/extra.css.
-    scheme: default
-    primary: teal
-    accent: teal
-  font:
-    text: IBM Plex Sans
-    code: IBM Plex Mono
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  font: false # All three typefaces share one request in extra.css.
   features:
-    - navigation.sections
+    - navigation.tabs
+    - navigation.tabs.sticky
     - navigation.top
     - navigation.tracking
     - navigation.footer
@@ -42,6 +55,9 @@ theme:
     - content.code.annotate
   icon:
     repo: material/github
+
+extra:
+  generator: false
 
 extra_css:
   - stylesheets/extra.css
@@ -71,6 +87,16 @@ validation:
 
 nav:
   - Home: index.md
+  - Guides:
+      - Quickstart: getting-started.md
+      - Install on EKS: install.md
+      - Sending logs: sending-logs.md
+      - Querying: querying.md
+      - Cost & tiering: cost.md
+      - FAQ: faq.md
+  - Reference:
+      - HTTP API: API.md
+      - Configuration: configuration.md
   - Internals:
       - Architecture: ARCHITECTURE.md
       - Testing (DST): dst-architecture.md
@@ -80,14 +106,4 @@ nav:
           - "ADR-0002 · Manifest as Iceberg stand-in": adr/0002-manifest-as-iceberg-standin.md
           - "ADR-0003 · Ingest / query role split": adr/0003-ingest-query-role-split.md
       - Deployment (chart internals): deployment.md
-  - Reference:
-      - HTTP API: API.md
-      - Configuration: configuration.md
-  - Running it:
-      - Quickstart: getting-started.md
-      - Install on EKS: install.md
-      - Sending logs: sending-logs.md
-      - Querying: querying.md
-      - Cost & tiering: cost.md
-  - FAQ: faq.md
   - Contributing: contributing.md

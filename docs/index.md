@@ -1,22 +1,77 @@
-<div class="vdg-hero" markdown>
+---
+description: Store logs as Parquet in your own S3 bucket, query them with SQL, and estimate scan costs before you run a query.
+hide:
+  - navigation
+  - toc
+  - footer
+---
 
-# Verdigris
+<div class="vdg-home" markdown>
 
-<p class="tagline">The layer your infrastructure leaves behind.</p>
+<header class="vdg-intro" markdown>
+
+# Verdigris documentation { #verdigris }
+
+Store logs as Parquet in your own S3 bucket and query them in place with SQL.
+Estimate what a scan will cost before you run it.
+
+<div class="vdg-intro__actions" markdown>
+
+[Quickstart :material-arrow-right:](getting-started.md){ .md-button .md-button--primary }
+[How Verdigris works](ARCHITECTURE.md){ .vdg-text-link }
+
+</div>
+</header>
+
+<div class="vdg-start" markdown>
+
+<section class="vdg-start__guide" aria-labelledby="where-to-next" markdown>
+
+## Get started { #where-to-next }
+
+- :material-console: [Try it locally](getting-started.md#evaluate-locally)
+  Run the demo without an AWS account.
+- :material-kubernetes: [Install on EKS](install.md)
+  Connect your S3 bucket and configure IAM.
+- :material-upload-network: [Send logs](sending-logs.md)
+  Set up Vector, Fluent Bit, or OpenTelemetry.
+
+</section>
+
+<section class="vdg-start__example" aria-labelledby="query-example" markdown>
+
+## Query example
+
+Find the ten services that logged the most errors.
+
+```sql
+SELECT service,
+       count(*) AS errors
+FROM logs
+WHERE level = 'ERROR'
+GROUP BY service
+ORDER BY errors DESC
+LIMIT 10;
+```
+
+[Read the query guide :material-arrow-right:](querying.md){ .vdg-text-link }
+
+</section>
 
 </div>
 
-**Verdigris** is an S3-native log storage and query engine written in Rust. Logs
-are written as compacted Parquet to an S3 bucket the operator owns and queried
-**in place** with Apache DataFusion — there is no separate index to build, and no
-step that copies cold data back into a hot store before it can be searched. One
-binary (`vdg`) does ingest, compaction, tiering, query, and serving.
+<nav class="vdg-reference" aria-labelledby="reference" markdown>
 
-!!! quote "Why the name"
-    *Verdigris* is the green patina that forms on copper as it sits exposed over
-    time — the layer a metal accumulates simply by existing in the world. That's
-    what logs are: the layer your infrastructure accumulates as it runs. (It's
-    also a quiet Rust pun — verdigris is what oxidation matures into.)
+## Reference
+
+- [HTTP API](API.md)
+- [Configuration](configuration.md)
+- [Cost & tiering](cost.md)
+
+</nav>
+</div>
+
+<div class="vdg-home__notes" markdown>
 
 ## Design constraints
 
@@ -41,6 +96,9 @@ behind a seam, so large-scale behavior can be tested in simulation. See
 seams are finished and which are not.
 
 ## Architecture at a glance
+
+Verdigris is written in Rust. A single `vdg` binary handles ingestion,
+compaction, tiering, and serving SQL queries through Apache DataFusion.
 
 ![Verdigris architecture: pods on EKS send logs through Vector, Fluent Bit or an OpenTelemetry Collector into Verdigris ingest, which writes tiered Parquet to your own S3 bucket; the DataFusion query engine reads it in place and serves the API, web UI and Grafana.](assets/architecture.svg)
 
@@ -98,25 +156,8 @@ gaps are tracked as issues with their acceptance criteria written as tests. The
 long-range map: what "credible at scale" means, capability by capability, each
 defined by the tests that would prove it.
 
-## Where to next
-
-<div class="grid cards" markdown>
-
-- :material-source-branch: **[Architecture](ARCHITECTURE.md)** — crates, seams,
-  write/read paths, compaction, and the split-role topology.
-- :material-test-tube: **[Testing (DST)](dst-architecture.md)** — the
-  deterministic-simulation design, and its honest status.
-- :material-file-document-outline: **[Decision records](adr/README.md)** — why
-  DataFusion, why a JSON manifest, why split roles.
-- :material-rocket-launch-outline: **[Quickstart](getting-started.md)** — run it
-  locally or deploy to EKS and query in place.
-- :material-database-search: **[Querying](querying.md)** — SQL, the search DSL,
-  Arrow vs JSON, live tail.
-- :material-cash-multiple: **[Cost & tiering](cost.md)** — the tier model, the
-  pricing reference, and the pre-query estimator.
+!!! quote "Why the name"
+    Verdigris is the green patina that forms on copper over time. Logs are the
+    layer your infrastructure accumulates as it runs.
 
 </div>
-
----
-
-Apache-2.0. Source: [github.com/explise/verdigris](https://github.com/explise/verdigris).
