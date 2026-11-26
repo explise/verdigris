@@ -102,9 +102,6 @@ struct AppState {
     alerts_lock: Arc<tokio::sync::Mutex<()>>,
     /// Monotonic suffix for generated alert ids within this process.
     alert_seq: Arc<AtomicU64>,
-    /// Replica-unique prefix for audit ids. Two containers must never mint the
-    /// same record id, or the writer's idempotent dedupe would drop one.
-    audit_replica: Arc<str>,
     /// Monotonic suffix for generated audit-record ids within this process.
     audit_seq: Arc<AtomicU64>,
     /// Durable audit writer state and counters.
@@ -1146,9 +1143,6 @@ pub async fn serve_with_clock(
     // footers that cannot have changed (files are immutable).
     let query_store = verdigris_storage::build(&cfg.storage).context("building object store")?;
     let query_cache = Arc::new(QueryCache::from_config(&cfg.query));
-    // Replica-unique audit prefix from the same OS entropy used for API tokens.
-    // A local counter alone is not unique across containers.
-    let audit_replica: Arc<str> = Arc::from(gen_replica_id());
 
     // Durable audit writer: batch queued records into one conditional append,
     // acknowledge each waiter, and keep a cached doc/version so a healthy append
@@ -1188,7 +1182,6 @@ pub async fn serve_with_clock(
         ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
         alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
         alert_seq: Arc::new(AtomicU64::new(0)),
-        audit_replica,
         audit_seq: Arc::new(AtomicU64::new(0)),
         audit: audit_metrics,
         ingest_sem: Arc::new(tokio::sync::Semaphore::new(max_inflight)),
@@ -1561,12 +1554,6 @@ fn gen_secret() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A replica-unique id. `gen_secret` draws 256 bits from OS entropy; two
-/// containers cannot practically collide, unlike pid+millisecond+counter.
-fn gen_replica_id() -> String {
-    gen_secret()
-}
-
 fn default_role() -> AuthRole {
     AuthRole::ReadOnly
 }
@@ -1899,8 +1886,9 @@ async fn h_query(
     });
     let rec = QueryRecord {
         id: format!(
-            "{}-{}",
-            st.audit_replica,
+            "{}-{}-{}",
+            st.clock.now_millis(),
+            std::process::id(),
             st.audit_seq.fetch_add(1, Ordering::Relaxed)
         ),
         ts_millis: st.clock.now_millis() as i64,
@@ -2671,6 +2659,7 @@ struct TailFile {
     path: String,
     bytes: u64,
     min_ts: i64,
+    immutable: bool,
 }
 
 /// Cursor over append-only ingest files, carried across `unfold` steps.
@@ -2767,6 +2756,7 @@ impl TailCursor {
                 path: f.path.clone(),
                 bytes: f.bytes,
                 min_ts: f.min_ts,
+                immutable: f.is_immutable_key(),
             })
             .collect();
         // Mark every current path known — including compaction outputs — so the
@@ -2789,6 +2779,7 @@ impl TailCursor {
             path: file.path.clone(),
             bytes: file.bytes,
             row_groups: None,
+            immutable: file.immutable,
         }];
         // `arrow_cast(ts, 'Int64')` keeps the internal epoch-millis helper out of
         // the public row contract while still letting `ORDER BY ts` use the
@@ -3264,7 +3255,6 @@ mod tests {
             ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
             alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
             alert_seq: Arc::new(AtomicU64::new(0)),
-            audit_replica: Arc::from("test-replica"),
             audit_seq: Arc::new(AtomicU64::new(0)),
             audit: Arc::new(AuditMetrics::default()),
             ingest_sem: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -3329,27 +3319,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_batch_cas_conflict_keeps_both_replicas() {
+    async fn audit_batch_cas_conflict_keeps_both_writers() {
         let s: Store = Arc::new(object_store::memory::InMemory::new());
-        let rec_a = QueryRecord {
-            id: "replica-a-0".into(),
-            ..audit_rec(1)
-        };
-        let rec_b = QueryRecord {
-            id: "replica-b-0".into(),
-            ..audit_rec(2)
-        };
         let (mut a, mut b) = (None, None);
         let (ra, rb) = tokio::join!(
-            commit_audit_batch(&s, "t", &mut a, vec![rec_a]),
-            commit_audit_batch(&s, "t", &mut b, vec![rec_b]),
+            commit_audit_batch(&s, "t", &mut a, vec![audit_rec(1)]),
+            commit_audit_batch(&s, "t", &mut b, vec![audit_rec(2)]),
         );
         ra.unwrap();
         rb.unwrap();
         let (doc, _) = load_audit(&s, "t").await.unwrap();
         let mut ids: Vec<&str> = doc.queries.iter().map(|r| r.id.as_str()).collect();
         ids.sort();
-        assert_eq!(ids, vec!["replica-a-0", "replica-b-0"]);
+        assert_eq!(ids, vec!["audit-1", "audit-2"]);
     }
 
     #[tokio::test]

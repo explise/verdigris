@@ -444,3 +444,162 @@ async fn limits_are_derived_from_the_config_knobs() {
     assert_eq!(l.max_result_bytes, 2 * 1024 * 1024);
     assert_eq!(l.target_partitions, 3);
 }
+
+/// Cache safety for legacy keys. A legacy object can be replaced in place with
+/// different bytes of the same length; its key proves nothing about identity, so
+/// the shared schema/footer cache must be bypassed. A content-addressed key in
+/// the same crate keeps using the warm path (covered above).
+#[tokio::test]
+async fn legacy_key_replacement_bypasses_shared_caches() {
+    use object_store::path::Path as ObjPath;
+    use object_store::ObjectStoreExt;
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+    use verdigris_ingest::encode;
+
+    fn encode_uncompressed(records: &[LogRecord]) -> Vec<u8> {
+        let batch = encode::records_to_batch(records).unwrap();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .build();
+        let mut buf = Vec::new();
+        {
+            let mut w = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        buf
+    }
+
+    fn rows(trace: &str, marker: &str) -> Vec<LogRecord> {
+        (0..200)
+            .map(|i| LogRecord {
+                ts_millis: BASE_TS + i,
+                level: Level::Info,
+                service: "api".into(),
+                status: Some(200),
+                message: format!("{marker} event {i}"),
+                trace_id: Some(trace.into()),
+                attrs: BTreeMap::new(),
+            })
+            .collect()
+    }
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let legacy = "logs/hot/part-00001.parquet";
+    let current = "logs/hot/part-0123456789abcdef.parquet";
+    let first = encode_uncompressed(&rows("trace-aaaa", "same"));
+    let replacement = encode_uncompressed(&rows("trace-bbbb", "same"));
+    assert_eq!(
+        first.len(),
+        replacement.len(),
+        "fixture requires a same-length replacement"
+    );
+    let other = encode_uncompressed(&rows("trace-cccc", "same"));
+
+    store
+        .put(&ObjPath::from(legacy), first.clone().into())
+        .await
+        .unwrap();
+    store
+        .put(&ObjPath::from(current), other.clone().into())
+        .await
+        .unwrap();
+
+    let legacy_file = IndexedFile {
+        path: legacy.into(),
+        bytes: first.len() as u64,
+        row_groups: None,
+        immutable: false,
+    };
+    let current_file = IndexedFile {
+        path: current.into(),
+        bytes: other.len() as u64,
+        row_groups: None,
+        immutable: true,
+    };
+    let cache = QueryCache::new(8 * 1024 * 1024);
+
+    let cold = engine::query_table_json_cached(
+        store.clone(),
+        "logs",
+        std::slice::from_ref(&legacy_file),
+        "SELECT trace_id FROM logs WHERE trace_id = 'trace-aaaa'",
+        &limits(),
+        Some(&cache),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cold.len(), 200);
+
+    // Replace in place, same path and length.
+    store
+        .put(&ObjPath::from(legacy), replacement.into())
+        .await
+        .unwrap();
+
+    let old = engine::query_table_json_cached(
+        store.clone(),
+        "logs",
+        std::slice::from_ref(&legacy_file),
+        "SELECT trace_id FROM logs WHERE trace_id = 'trace-aaaa'",
+        &limits(),
+        Some(&cache),
+    )
+    .await
+    .unwrap();
+    assert!(
+        old.is_empty(),
+        "the replaced object must not return old rows"
+    );
+    let new = engine::query_table_json_cached(
+        store.clone(),
+        "logs",
+        std::slice::from_ref(&legacy_file),
+        "SELECT trace_id FROM logs WHERE trace_id = 'trace-bbbb'",
+        &limits(),
+        Some(&cache),
+    )
+    .await
+    .unwrap();
+    assert_eq!(new.len(), 200);
+    assert!(new.iter().all(|r| r["trace_id"] == "trace-bbbb"));
+
+    // Mixed legacy + current objects must equal the uncached scan.
+    let mixed = vec![legacy_file, current_file.clone()];
+    let cached = engine::query_table_json_cached(
+        store.clone(),
+        "logs",
+        &mixed,
+        "SELECT trace_id FROM logs ORDER BY trace_id",
+        &limits(),
+        Some(&cache),
+    )
+    .await
+    .unwrap();
+    let uncached = engine::query_table_json(
+        store,
+        "logs",
+        &mixed,
+        "SELECT trace_id FROM logs ORDER BY trace_id",
+        &limits(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cached, uncached);
+    assert_eq!(
+        cached
+            .iter()
+            .filter(|r| r["trace_id"] == "trace-bbbb")
+            .count(),
+        200
+    );
+    assert_eq!(
+        cached
+            .iter()
+            .filter(|r| r["trace_id"] == "trace-cccc")
+            .count(),
+        200
+    );
+}

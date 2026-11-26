@@ -231,6 +231,17 @@ async fn collect_batches(
 ) -> anyhow::Result<Vec<RecordBatch>> {
     anyhow::ensure!(!files.is_empty(), "table '{table}' has no files to query");
 
+    // Only content-addressed keys prove immutability. A legacy key can be
+    // replaced in place at the same path and length, which the schema key and
+    // DataFusion's path-keyed metadata cache cannot distinguish. Fall back to
+    // the uncached path for the whole query when any file is unverified; mixed
+    // tables stay correct at the cost of one extra schema/footer read.
+    let cache = if files.iter().all(|f| f.immutable) {
+        cache
+    } else {
+        None
+    };
+
     // Turn on bloom-filter row-group pruning and predicate pushdown so an
     // equality lookup (`trace_id = '…'`, `service = 'auth'`) reads only the row
     // groups whose bloom filter admits the value, instead of every row.
