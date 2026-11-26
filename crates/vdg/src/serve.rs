@@ -660,9 +660,18 @@ async fn maybe_compact(
     target_bytes: u64,
     trigger: usize,
     max_merge_files: usize,
+    retired_grace_ms: u64,
     metrics: &CompactionMetrics,
 ) -> anyhow::Result<()> {
-    let ingestor = verdigris_ingest::Ingestor::new(s.clone(), table);
+    let ingestor = verdigris_ingest::Ingestor::new(s.clone(), table)
+        .with_clock(clock.clone())
+        .with_retired_grace_ms(retired_grace_ms);
+    // Reclaim expired tombstones even when there is no merge work this tick:
+    // otherwise the last compaction's old files would stay forever once the
+    // backlog falls below the trigger.
+    if let Err(e) = ingestor.reclaim_retired(retired_grace_ms).await {
+        tracing::warn!(error = %e, "retired-file reclamation failed");
+    }
     let manifest = ingestor.load_manifest().await?;
     let max_tier_pending = verdigris_ingest::pending_compaction(&manifest, target_bytes)
         .iter()
@@ -929,6 +938,7 @@ pub async fn serve_with_clock(
                         target,
                         ccfg.trigger_pending_files,
                         ccfg.max_merge_files_per_pass,
+                        ccfg.retired_grace_ms(),
                         &cm,
                     )
                     .await
@@ -1843,6 +1853,10 @@ async fn h_storage(State(st): State<AppState>) -> ApiResult {
             "compacted": m.files.iter().filter(|f| f.path.rsplit('/').next().is_some_and(|n| n.starts_with('c'))).count(),
             "generation": m.compaction_gen,
             "targetSize": "256 MB",
+            // Merged-away files still inside the retirement grace window: no
+            // longer queryable through this manifest, still readable by a query
+            // that loaded the previous one.
+            "retiredFiles": m.retired.len(),
             "status": if m.compaction_gen > 0 { "compacted" } else { "idle" },
         },
         "totalGB": m.total_bytes() as f64 / cost::GIB,
@@ -2004,6 +2018,7 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
             "targetMib": st.cfg.compaction.target_mib,
             "totalFiles": m.files.len(),
             "pendingFiles": pending_files,
+            "retiredFiles": m.retired.len(),
             "filesMergedTotal": st.compaction.files_merged_total.load(Ordering::Relaxed),
             "runsTotal": st.compaction.runs_total.load(Ordering::Relaxed),
             "lastRunMs": if last_run == 0 { Value::Null } else { json!(last_run) },
@@ -2388,9 +2403,19 @@ mod tests {
             Arc::new(verdigris_core::clock::SimClock::new(1_700_000_000_000));
 
         // Trigger far above pending -> no-op; files and counters untouched.
-        maybe_compact(&s, "logs", &lock, &clock, target, 10_000, 128, &metrics)
-            .await
-            .unwrap();
+        maybe_compact(
+            &s,
+            "logs",
+            &lock,
+            &clock,
+            target,
+            10_000,
+            128,
+            verdigris_ingest::DEFAULT_RETIRED_GRACE_MS,
+            &metrics,
+        )
+        .await
+        .unwrap();
         assert_eq!(metrics.runs_total.load(Ordering::Relaxed), 0);
         assert_eq!(
             ing.load_manifest().await.unwrap().files.len(),
@@ -2400,9 +2425,19 @@ mod tests {
 
         // Low trigger + tiny per-pass budget -> multiple bounded passes drain the
         // backlog fully; files shrink and metrics record one run.
-        maybe_compact(&s, "logs", &lock, &clock, target, 2, 2, &metrics)
-            .await
-            .unwrap();
+        maybe_compact(
+            &s,
+            "logs",
+            &lock,
+            &clock,
+            target,
+            2,
+            2,
+            verdigris_ingest::DEFAULT_RETIRED_GRACE_MS,
+            &metrics,
+        )
+        .await
+        .unwrap();
         let after = ing.load_manifest().await.unwrap().files.len();
         assert!(
             after < before,

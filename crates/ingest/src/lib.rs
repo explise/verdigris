@@ -18,6 +18,7 @@ use object_store::path::Path as ObjPath;
 // 0.13 moved put/get/delete into the ObjectStoreExt convenience trait.
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 use verdigris_core::batch::{BatchPolicy, Batcher, LogRecord};
+use verdigris_core::clock::{Clock, SimClock};
 use verdigris_core::config::RoutingConfig;
 use verdigris_core::manifest::{DataFile, Manifest, Predicate, TrigramIndex};
 use verdigris_core::model::Tier;
@@ -27,6 +28,15 @@ pub use encode::FileStats;
 /// Bounded retries for an optimistic manifest commit before giving up under
 /// sustained contention. Generous: real contention resolves in 1–2 rounds.
 const MAX_COMMIT_RETRIES: usize = 16;
+
+/// How long a file retired by compaction stays readable before it is deleted.
+///
+/// This is the safety window for a reader that already loaded the old manifest
+/// and is still scanning the old Parquet file when the new manifest commits.
+/// An hour is deliberately generous: the storage cost of a few compacted files
+/// for one extra hour is negligible next to turning an in-flight query into a
+/// mid-scan `NotFound`. Callers can override it through [`Ingestor::with_retired_grace_ms`].
+pub const DEFAULT_RETIRED_GRACE_MS: u64 = 60 * 60 * 1_000;
 
 /// Outcome of an optimistic (compare-and-swap) manifest commit.
 #[derive(Debug, PartialEq, Eq)]
@@ -62,6 +72,12 @@ fn content_hash(bytes: &[u8]) -> String {
 pub struct Ingestor {
     store: Arc<dyn ObjectStore>,
     table: String,
+    /// Time seam for retirement/reclamation stamps. Production wires `RealClock`;
+    /// tests and simulation keep the default `SimClock`, so a compaction never
+    /// reads wall time directly from this crate.
+    clock: Arc<dyn Clock>,
+    /// Grace period between retiring a compacted-away file and deleting it.
+    retired_grace_ms: u64,
 }
 
 impl Ingestor {
@@ -69,7 +85,21 @@ impl Ingestor {
         Self {
             store,
             table: table.into(),
+            clock: Arc::new(SimClock::default()),
+            retired_grace_ms: DEFAULT_RETIRED_GRACE_MS,
         }
+    }
+
+    /// Supply the `Clock` seam used to stamp and expire retired files.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Override how long retired files remain readable before reclamation.
+    pub fn with_retired_grace_ms(mut self, grace_ms: u64) -> Self {
+        self.retired_grace_ms = grace_ms;
+        self
     }
 
     fn data_path(&self, tier: Tier, hash: &str) -> String {
@@ -398,15 +428,70 @@ impl Ingestor {
     }
 
     /// Compaction: merge each tier's many small Parquet files into fewer files of
-    /// ~`target_bytes`, then update the manifest and delete the old objects.
+    /// ~`target_bytes`, then update the manifest and retire the old objects.
     ///
     /// This is the difference between a toy and a usable system: streaming ingest
     /// produces millions of tiny files that wreck scan speed and waste the Glacier
     /// per-object tax. Bins are formed in manifest order and tiers iterated in a
     /// fixed order, so the operation is deterministic. The manifest is rewritten
-    /// to point at the new files *before* old objects are deleted (crash-safer).
+    /// to point at the new files *before* old objects become reclaimable
+    /// (crash-safer).
     pub async fn compact(&self, target_bytes: u64) -> anyhow::Result<Vec<CompactionReport>> {
         Ok(self.compact_bounded(target_bytes, usize::MAX).await?.0)
+    }
+
+    /// Delete files whose retirement grace period has elapsed. Returns how many
+    /// objects were removed.
+    ///
+    /// Called automatically at the start of each compaction pass and after a
+    /// successful commit, so the background scheduler reclaims space without a
+    /// separate operator job. It is public because a node that is not compacting
+    /// right now still needs to drain expired tombstones.
+    ///
+    /// Reclamation never touches `manifest.files`. It only removes entries from
+    /// `manifest.retired`, i.e. paths compaction already stopped referencing, so
+    /// a stale/racing caller cannot delete live data.
+    pub async fn reclaim_retired(&self, grace_ms: u64) -> anyhow::Result<usize> {
+        let now = self.clock.now_millis();
+        for _ in 0..MAX_COMMIT_RETRIES {
+            let (mut manifest, base) = self.load_manifest_versioned().await?;
+            let expired = manifest.expired_retired(now, grace_ms);
+            if expired.is_empty() {
+                return Ok(0);
+            }
+
+            // Delete first, then commit the smaller tombstone list. If the commit
+            // loses a CAS race, the next round re-reads and retries; a delete is
+            // idempotent and `NotFound` is success for our purpose. Keeping a
+            // tombstone when its delete failed is deliberate: a later run retries
+            // rather than leaking the object with no record of it.
+            let mut deleted: HashSet<String> = HashSet::new();
+            for r in &expired {
+                match self.store.delete(&ObjPath::from(r.path.clone())).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                        deleted.insert(r.path.clone());
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %r.path, error = %e, "retired-file delete failed; will retry");
+                    }
+                }
+            }
+            if deleted.is_empty() {
+                return Ok(0);
+            }
+            manifest.retired.retain(|r| !deleted.contains(&r.path));
+            if self.commit_manifest(&manifest, base).await? == CommitOutcome::Committed {
+                // Retired tombstones are gone from the manifest; drop their
+                // sidecar entries now so the text index shrinks with the files.
+                let _ = self.prune_trigrams(&manifest).await;
+                return Ok(deleted.len());
+            }
+            // Conflict: another writer changed the manifest. Reload and retry; the
+            // objects deleted above are already unreferenced by any live file.
+        }
+        anyhow::bail!(
+            "retired-file reclamation failed after {MAX_COMMIT_RETRIES} retries under contention"
+        )
     }
 
     /// One bounded compaction pass: merges at most ~`max_merge_files` source files
@@ -421,6 +506,12 @@ impl Ingestor {
         target_bytes: u64,
         max_merge_files: usize,
     ) -> anyhow::Result<(Vec<CompactionReport>, bool)> {
+        // Drain tombstones whose grace period has elapsed. Best-effort: a failed
+        // reclaim must not block the merge work that this pass exists to do.
+        if let Err(e) = self.reclaim_retired(self.retired_grace_ms).await {
+            tracing::warn!(error = %e, "retired-file reclamation before compaction failed");
+        }
+
         // Whole-operation optimistic retry: snapshot the manifest, rewrite the
         // layout, and commit under compare-and-swap. If a concurrent writer
         // committed in between, our freshly written compacted files become harmless
@@ -431,7 +522,7 @@ impl Ingestor {
             let generation = manifest.compaction_gen;
 
             let mut new_files: Vec<DataFile> = Vec::new();
-            let mut to_delete: Vec<String> = Vec::new();
+            let mut to_retire: Vec<String> = Vec::new();
             let mut reports: Vec<CompactionReport> = Vec::new();
             // Per-pass merge budget: once reached, remaining mergeable bins are
             // deferred (kept as-is) and `more` signals the scheduler to run again.
@@ -536,7 +627,7 @@ impl Ingestor {
                         row_group_trigrams: Some(stats.row_group_trigrams),
                     });
                     for f in &bin {
-                        to_delete.push(f.path.clone());
+                        to_retire.push(f.path.clone());
                     }
                     after += 1;
                     merged += bin.len();
@@ -565,22 +656,29 @@ impl Ingestor {
             }
             self.merge_trigrams(&incoming).await?;
 
-            // Point the manifest at the new layout and commit under CAS.
+            // Point the manifest at the new layout and commit under CAS. Retired
+            // paths are recorded in the same commit so a reader holding the old
+            // manifest still finds its files on disk; they become reclaimable only
+            // after the grace period.
             manifest.files = new_files;
             manifest.compaction_gen = generation + 1;
+            manifest.retire(to_retire, self.clock.now_millis());
             if self.commit_manifest(&manifest, base).await? == CommitOutcome::Committed {
-                // Committed: now clean up the old objects (orphans are harmless).
-                for path in to_delete {
-                    let _ = self.store.delete(&ObjPath::from(path)).await;
-                }
                 // Drop sidecar entries for the paths just retired, so it does not
                 // grow without bound as compaction rewrites files.
                 //
                 // Strictly AFTER the commit: pruning first could delete an entry
                 // the still-live manifest references, and a lost entry means a
                 // text query stops pruning that file. Best-effort — a failure
-                // leaves orphans, which are never consulted.
+                // leaves orphans, which are never consulted. An old reader that
+                // loads this sidecar after the prune simply loses text pruning
+                // for its retired files, never a real match.
                 let _ = self.prune_trigrams(&manifest).await;
+                // Opportunistically drain tombstones that were already expired;
+                // the ones just added are far inside the grace window.
+                if let Err(e) = self.reclaim_retired(self.retired_grace_ms).await {
+                    tracing::warn!(error = %e, "post-compaction reclamation failed");
+                }
                 return Ok((reports, more));
             }
             // Conflict: reload and redo against the fresh manifest.
@@ -755,6 +853,77 @@ mod tests {
         );
         // Compacted files use the new naming scheme.
         assert!(after.files.iter().any(|f| f.path.contains("/c0-")));
+    }
+
+    #[tokio::test]
+    async fn compaction_retires_old_files_until_the_grace_period_ends() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let clock = Arc::new(verdigris_core::clock::SimClock::new(1_000_000));
+        let ing = Ingestor::new(store.clone(), "logs")
+            .with_clock(clock.clone())
+            .with_retired_grace_ms(60_000);
+        let routing = RoutingConfig::default();
+        let policy = BatchPolicy {
+            max_rows: 100,
+            max_bytes: usize::MAX,
+        };
+        for i in 0u64..10 {
+            let recs = generate::generate(100, i, (i as i64) * 1_000_000);
+            ing.ingest(recs, &routing, policy).await.unwrap();
+        }
+
+        // A reader snapshot taken before compaction — the exact files an
+        // in-flight query would hold.
+        let old = ing.load_manifest().await.unwrap();
+        let old_paths: Vec<String> = old.files.iter().map(|f| f.path.clone()).collect();
+        assert!(old_paths.len() > 3);
+
+        let reports = ing.compact(10 * 1024 * 1024).await.unwrap();
+        assert!(!reports.is_empty());
+
+        let after = ing.load_manifest().await.unwrap();
+        assert!(
+            after.files.len() < old_paths.len(),
+            "compaction should reduce the live file count"
+        );
+        // Every source path is a tombstone, and every object is still readable:
+        // the query that loaded `old` can finish instead of hitting NotFound.
+        assert_eq!(after.retired.len(), old_paths.len());
+        for p in &old_paths {
+            assert!(
+                store.get(&ObjPath::from(p.clone())).await.is_ok(),
+                "retired object {p} must survive the commit"
+            );
+        }
+        // Compaction output keys carry a content digest, so two attempts that
+        // observed the same generation can never share a writable key.
+        for f in &after.files {
+            let name = f.path.rsplit('/').next().unwrap();
+            assert!(name.starts_with("c0-"), "generation in key: {name}");
+            let parts: Vec<&str> = name.trim_end_matches(".parquet").split('-').collect();
+            assert_eq!(parts.len(), 3, "c<gen>-<seq>-<digest>: {name}");
+            assert_eq!(parts[2].len(), 16, "16-hex content digest: {name}");
+        }
+        // Nothing is reclaimed inside the grace window.
+        assert_eq!(ing.reclaim_retired(60_000).await.unwrap(), 0);
+        assert!(!ing.load_manifest().await.unwrap().retired.is_empty());
+
+        // After the grace period it is safe to delete them.
+        clock.advance(60_000);
+        let deleted = ing.reclaim_retired(60_000).await.unwrap();
+        assert_eq!(deleted, old_paths.len());
+        let reclaimed = ing.load_manifest().await.unwrap();
+        assert!(reclaimed.retired.is_empty(), "tombstones drained");
+        for p in &old_paths {
+            assert!(
+                store.get(&ObjPath::from(p.clone())).await.is_err(),
+                "reclaimed object {p} should be gone"
+            );
+        }
+        // Live compacted files are untouched.
+        for f in &reclaimed.files {
+            assert!(store.get(&ObjPath::from(f.path.clone())).await.is_ok());
+        }
     }
 
     #[test]

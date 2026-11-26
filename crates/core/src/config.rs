@@ -95,6 +95,12 @@ pub struct CompactionConfig {
     pub max_merge_files_per_pass: usize,
     /// How often the scheduler checks for pending compaction (seconds).
     pub interval_secs: u64,
+    /// How long a file merged away by compaction stays readable before its
+    /// object is deleted (seconds). A reader that loaded the previous manifest
+    /// may still be scanning it; this is the safety window that keeps an
+    /// in-flight query from failing mid-scan. Must comfortably exceed the
+    /// longest expected query, not the compaction interval.
+    pub retired_grace_secs: u64,
 }
 
 impl Default for CompactionConfig {
@@ -104,7 +110,8 @@ impl Default for CompactionConfig {
             target_mib: 256,
             trigger_pending_files: 16,
             max_merge_files_per_pass: 128,
-            interval_secs: 300, // 5 min
+            interval_secs: 300,        // 5 min
+            retired_grace_secs: 3_600, // 1 h
         }
     }
 }
@@ -113,6 +120,11 @@ impl CompactionConfig {
     /// Target compacted-file size in bytes.
     pub fn target_bytes(&self) -> u64 {
         self.target_mib * 1024 * 1024
+    }
+
+    /// Retired-file grace period in milliseconds.
+    pub fn retired_grace_ms(&self) -> u64 {
+        self.retired_grace_secs.saturating_mul(1_000)
     }
 }
 
@@ -438,6 +450,8 @@ mod tests {
         assert_eq!(c.compaction.target_bytes(), 256 * 1024 * 1024);
         assert_eq!(c.compaction.trigger_pending_files, 16);
         assert_eq!(c.compaction.max_merge_files_per_pass, 128);
+        assert_eq!(c.compaction.retired_grace_secs, 3_600);
+        assert_eq!(c.compaction.retired_grace_ms(), 3_600_000);
 
         let toml = r#"
             [compaction]

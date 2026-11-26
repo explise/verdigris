@@ -385,7 +385,9 @@ async fn run_manifest(cfg: &Config, table: &str) -> anyhow::Result<()> {
 
 async fn run_compact(cfg: &Config, table: &str, target_mb: u64) -> anyhow::Result<()> {
     let store = verdigris_storage::build(&cfg.storage)?;
-    let ingestor = verdigris_ingest::Ingestor::new(store, table);
+    let ingestor = verdigris_ingest::Ingestor::new(store, table)
+        .with_clock(std::sync::Arc::new(crate::realclock::RealClock::new()))
+        .with_retired_grace_ms(cfg.compaction.retired_grace_ms());
     let before = ingestor.load_manifest().await?.files.len();
 
     let reports = ingestor.compact(target_mb * 1024 * 1024).await?;
@@ -395,8 +397,25 @@ async fn run_compact(cfg: &Config, table: &str, target_mb: u64) -> anyhow::Resul
             r.tier, r.files_before, r.files_after, r.files_merged
         );
     }
-    let after = ingestor.load_manifest().await?.files.len();
-    println!("compaction: '{table}' {before} -> {after} files (target {target_mb} MiB)");
+    let manifest = ingestor.load_manifest().await?;
+    let after = manifest.files.len();
+    println!(
+        "compaction: '{table}' {before} -> {after} files (target {target_mb} MiB); \
+         {} retired file(s) pending reclamation",
+        manifest.retired.len()
+    );
+    // Reclaim anything that was already past its grace window; a second `compact`
+    // run after the window is the normal way to finish the cleanup.
+    if !manifest.retired.is_empty() {
+        match ingestor
+            .reclaim_retired(cfg.compaction.retired_grace_ms())
+            .await
+        {
+            Ok(n) if n > 0 => println!("reclaimed {n} retired file(s)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: retired-file reclamation failed: {e}"),
+        }
+    }
     Ok(())
 }
 

@@ -142,8 +142,12 @@ Two mechanisms, working together:
 Streaming logs produce millions of tiny Parquet files, which destroy scan speed and waste
 money on Glacier's per-object metadata tax. Compaction is **core, not optional**:
 `Ingestor::compact(target_bytes)` merges each tier's small files into ~target-sized files
-(100 MB–1 GB), rewrites the manifest, and deletes the old objects **manifest-first** (so a
-crash can't orphan the catalog). It is deterministic and idempotent.
+(100 MB–1 GB) and rewrites the manifest. Output keys are content-addressed
+(`c<gen>-<seq>-<digest>.parquet`), so concurrent attempts that observed the same generation
+cannot overwrite the file the winning manifest references. Old files move to the manifest's
+`retired` list and stay readable for `compaction.retired_grace_secs` (default 1 h) before
+reclamation, so a query that loaded the previous manifest can finish instead of hitting
+`NotFound` mid-scan. It is deterministic and idempotent.
 
 ## The cost model & estimator
 

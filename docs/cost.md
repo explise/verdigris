@@ -97,9 +97,13 @@ Request:
 
 Streaming ingest produces millions of tiny Parquet files. That's a problem twice over: tiny
 files wreck scan speed, and millions of small objects waste money against Glacier's
-per-object metadata tax. Compaction merges each tier's small files into larger ones, rewrites
-the manifest, and deletes the old objects (manifest-first, so it's crash-safer). It's
-deterministic and idempotent.
+per-object metadata tax. Compaction merges each tier's small files into larger ones and
+rewrites the manifest. Output keys are content-addressed, so two concurrent attempts that
+observed the same generation cannot overwrite each other's data. The old objects are not
+deleted at commit time: they become **retired** entries and stay readable for
+`compaction.retired_grace_secs` (default 1 h), so a query already scanning one can finish.
+After the grace window the next compaction tick deletes them. It's deterministic and
+idempotent.
 
 Run it on demand:
 
