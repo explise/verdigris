@@ -162,7 +162,7 @@ computed from the manifest + cost model; a few series that require subsystems no
 
 | Endpoint | Returns |
 |---|---|
-| `GET /v1/metrics` | `{ ingestRate[], errorRate[], p99[], volumeByService[], tiles{} }` — series time-bucketed from the data; `p99` is **modeled** (no latency field yet). |
+| `GET /v1/metrics` | `{ ingestRate[], errorRate[], p99[], volumeByService[], tiles{}, queryCache{}, audit{}, compaction{} }` — series time-bucketed from the data; `p99` is **modeled** (no latency field yet). `audit` exposes queue depth, saturation/failure/timeout counters and last wait. |
 | `GET /v1/storage/tiers` | `{ tiers[], lifecycle[], compaction{}, totalGB, totalPerMonth }` — real per-tier bytes/objects/cost + compaction generation. |
 | `GET /v1/cost?days=N` | `{ rangeDays, monthToDate, projected, lastMonth, breakdown[], spendSeries[], vsHosted{}, expensiveQueries[] }` — `days` (default 30, clamped to 1–3650) sets the projection horizon; `expensiveQueries` comes from the query-history audit doc; `spendSeries` is empty until [#33](https://github.com/explise/verdigris/issues/33). |
 | `GET /v1/pipelines` | `{ sources[], transforms[], throughput[], dropRate, ingestLag, parquetRolls }` — lag/rolls derived from the manifest. |
