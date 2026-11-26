@@ -120,7 +120,9 @@ cold ≈ `$0.01/GB` Glacier Flexible standard).
 ### `GET /v1/tail`  *(read role, SSE)*
 Server-Sent Events stream of recent log rows. `Content-Type: text/event-stream`; each event
 is `data: {json}` where json is one row `{ ts, level, service, message, trace_id?, status?,
-attrs_json? }`, plus keepalive comments. Polls the newest file; bounded per poll.
+attrs_json? }`, plus keepalive comments. Each newly published ingest file is delivered
+once, in full, so bursts spanning several files and rows that share a millisecond are not
+dropped; compaction rewrites of already-streamed rows are skipped.
 The web UI consumes this via `EventSource` (note: `EventSource` cannot send an
 `Authorization` header — front a token via query param or ingress auth if `[auth]` is on).
 

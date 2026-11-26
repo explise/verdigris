@@ -113,6 +113,17 @@ pub struct DataFile {
 }
 
 impl DataFile {
+    /// True for a file written by the streaming ingest path (`part-<hash>.parquet`),
+    /// as opposed to a compaction output (`c<gen>-…`). Live tail uses this to
+    /// follow only files that carry *new* events: a compacted file republishes
+    /// rows that have already been streamed.
+    pub fn is_ingest_part(&self) -> bool {
+        self.path
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.starts_with("part-"))
+    }
+
     fn stat_values(&self, column: StatColumn) -> &[String] {
         match column {
             StatColumn::Service => &self.services,
