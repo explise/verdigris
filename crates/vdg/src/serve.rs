@@ -52,7 +52,7 @@ use verdigris_core::cost::{self, RetrievalMode};
 use verdigris_core::manifest::Manifest;
 use verdigris_core::model::Tier;
 use verdigris_ingest::wire::JsonLog;
-use verdigris_query::engine::{QueryLimits, ResultTooLarge};
+use verdigris_query::engine::{QueryCache, QueryLimits, ResultTooLarge};
 use verdigris_query::index::IndexedFile;
 use verdigris_storage::Store;
 
@@ -125,6 +125,17 @@ struct AppState {
     /// here — never `SystemTime::now()` directly — so a test can substitute
     /// `SimClock` and drive the service in logical time. `RealClock` in prod.
     clock: Arc<dyn Clock>,
+    /// One object-store client for the process. Building an S3 client per
+    /// request pays TLS/config setup on every query; the client is stateless
+    /// apart from that configuration, so it is shared.
+    store: Store,
+    /// Shared, bounded Parquet metadata + schema cache. Scoped to this store and
+    /// table; per-query execution memory remains isolated in the engine.
+    query_cache: Arc<QueryCache>,
+    /// Audit records are persisted by one background worker. A query must not
+    /// wait on a read-modify-write of the audit doc before returning rows; the
+    /// in-memory history is updated synchronously and this queue is best-effort.
+    audit_tx: tokio::sync::mpsc::Sender<QueryRecord>,
 }
 
 /// Counters for background auto-compaction. The live "pending files" figure is
@@ -439,7 +450,7 @@ fn limits(st: &AppState) -> QueryLimits {
 }
 
 fn store(st: &AppState) -> anyhow::Result<Store> {
-    verdigris_storage::build(&st.cfg.storage)
+    Ok(st.store.clone())
 }
 
 async fn manifest(st: &AppState) -> anyhow::Result<(Store, Manifest)> {
@@ -863,8 +874,32 @@ pub async fn serve_with_clock(
     let max_body = cfg.ingest.max_body_bytes;
     let max_inflight = cfg.ingest.max_inflight.max(1);
 
+    // One object-store client and one bounded query cache for the process.
+    // Building either per request pays TLS/client setup and re-reads Parquet
+    // footers that cannot have changed (files are immutable).
+    let query_store = verdigris_storage::build(&cfg.storage).context("building object store")?;
+    let query_cache = Arc::new(QueryCache::from_config(&cfg.query));
+
+    // Persist audit records off the request path. The audit doc is a CAS
+    // read-modify-write against the object store; doing it inline added a
+    // metadata round-trip to every query. The bounded queue makes backpressure
+    // explicit: under a flood, audit records are dropped rather than delaying
+    // query responses (the in-memory history still has the record).
+    let (audit_tx, mut audit_rx) = tokio::sync::mpsc::channel::<QueryRecord>(1024);
+    {
+        let audit_store = query_store.clone();
+        let audit_table = table.clone();
+        tokio::spawn(async move {
+            while let Some(rec) = audit_rx.recv().await {
+                if let Err(e) = append_audit(&audit_store, &audit_table, rec).await {
+                    tracing::warn!(error = %e, "audit write-through failed");
+                }
+            }
+        });
+    }
+
     // Load the persisted token catalog into the in-memory cache.
-    let boot_store = verdigris_storage::build(&cfg.storage).ok();
+    let boot_store = Some(query_store.clone());
     let tokens_doc = match &boot_store {
         Some(s) => load_tokens(s).await.unwrap_or_default(),
         None => TokensDoc::default(),
@@ -891,6 +926,9 @@ pub async fn serve_with_clock(
         query_history: Arc::new(tokio::sync::Mutex::new(boot_history)),
         compaction: Arc::new(CompactionMetrics::new()),
         clock,
+        store: query_store,
+        query_cache,
+        audit_tx,
     };
 
     // Alert evaluator. On a writer role (the single manifest writer owns alert
@@ -1401,10 +1439,12 @@ async fn h_query(
 ) -> Result<Response, AppError> {
     let arrow = wants_arrow(&headers);
     st.metrics.queries.fetch_add(1, Ordering::Relaxed);
+    let t_request = st.clock.monotonic_micros();
     // Predicates first: they decide whether the trigram sidecar is worth
     // fetching, so the manifest load can skip it for non-text queries.
     let preds = verdigris_core::search::stat_predicates(&req.sql);
     let (s, m) = manifest_for(&st, &preds).await?;
+    let manifest_us = st.clock.monotonic_micros().saturating_sub(t_request);
 
     // Build ONE scan plan, the same call `POST /v1/query/estimate` makes. It
     // compiles the DSL (or passes SQL through), normalizes the tier selection
@@ -1420,6 +1460,11 @@ async fn h_query(
         verdigris_core::scan::DEFAULT_QUERY_LIMIT,
     )
     .map_err(AppError::bad_request)?;
+    let plan_us = st
+        .clock
+        .monotonic_micros()
+        .saturating_sub(t_request)
+        .saturating_sub(manifest_us);
     let selected = &plan.files;
     if selected.is_empty() {
         let stats = json!({ "events": 0, "scannedBytes": 0, "elapsedMs": 0, "engine": "datafusion", "files": 0 });
@@ -1441,23 +1486,25 @@ async fn h_query(
     // Run the query once, in the negotiated wire (never both).
     let t0 = st.clock.monotonic_micros();
     let (arrow_body, json_rows, rows_returned) = if arrow {
-        let out = verdigris_query::engine::query_table_arrow_with_rows(
+        let out = verdigris_query::engine::query_table_arrow_with_rows_cached(
             s.clone(),
             st.table.as_str(),
             &files,
             &sql,
             &limits(&st),
+            Some(&st.query_cache),
         )
         .await
         .map_err(AppError::from_query)?;
         (out.bytes, Value::Null, out.rows)
     } else {
-        let rows = verdigris_query::engine::query_table_json(
+        let rows = verdigris_query::engine::query_table_json_cached(
             s.clone(),
             st.table.as_str(),
             &files,
             &sql,
             &limits(&st),
+            Some(&st.query_cache),
         )
         .await
         .map_err(AppError::from_query)?;
@@ -1471,9 +1518,17 @@ async fn h_query(
     // a row count from the scan it already ran.
     let histogram = if req.histogram {
         let (min_ts, max_ts) = time_range(&m);
-        histogram(&s, st.table.as_str(), &files, min_ts, max_ts, &limits(&st))
-            .await
-            .unwrap_or_default()
+        histogram(
+            &s,
+            st.table.as_str(),
+            &files,
+            min_ts,
+            max_ts,
+            &limits(&st),
+            &st.query_cache,
+        )
+        .await
+        .unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -1504,6 +1559,10 @@ async fn h_query(
         "eventsExact": req.histogram,
         "scannedBytes": scanned_bytes,
         "elapsedMs": elapsed,
+        // Phase split for diagnosing warm latency. `elapsedMs` is engine time
+        // only; these are the inputs before it and are not double-counted.
+        "manifestMs": manifest_us / 1_000,
+        "planMs": plan_us / 1_000,
         "engine": "datafusion",
         "files": files.len(),
         "rowGroupsScanned": rg_scanned,
@@ -1541,10 +1600,12 @@ async fn h_query(
         }
         hist.push_back(rec.clone());
     }
-    // Write through to the persisted audit trail. A store hiccup must not fail
-    // the query the user already got results for — log and move on.
-    if let Err(e) = append_audit(&s, st.table.as_str(), rec).await {
-        tracing::warn!(error = %e, "audit write-through failed");
+    // Queue the persisted audit record off the request path. A full queue means
+    // the audit writer is behind; drop rather than delay the response that the
+    // caller already earned. The in-memory history above is authoritative for
+    // the current process.
+    if st.audit_tx.try_send(rec).is_err() {
+        tracing::debug!("audit queue full; dropping persisted record");
     }
 
     if arrow {
@@ -1595,6 +1656,7 @@ async fn histogram(
     min_ts: i64,
     max_ts: i64,
     limits: &QueryLimits,
+    cache: &QueryCache,
 ) -> anyhow::Result<Vec<Value>> {
     let range_ms = (max_ts - min_ts).max(1);
     let interval_secs = (range_ms / 60 / 1000).max(1);
@@ -1606,8 +1668,15 @@ async fn histogram(
                 count(*) FILTER (WHERE level = 'ERROR') AS errors \
          FROM {table} GROUP BY {bin} ORDER BY {bin}"
     );
-    let rows =
-        verdigris_query::engine::query_table_json(s.clone(), table, files, &sql, limits).await?;
+    let rows = verdigris_query::engine::query_table_json_cached(
+        s.clone(),
+        table,
+        files,
+        &sql,
+        limits,
+        Some(cache),
+    )
+    .await?;
     Ok(rows
         .into_iter()
         .map(|r| {
@@ -1975,9 +2044,17 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
 
         let (min_ts, max_ts) = time_range(&m);
         let interval_secs = ((max_ts - min_ts).max(1) / 60 / 1000).max(1) as f64;
-        for b in histogram(&s, table, &files, min_ts, max_ts, &limits(&st))
-            .await
-            .unwrap_or_default()
+        for b in histogram(
+            &s,
+            table,
+            &files,
+            min_ts,
+            max_ts,
+            &limits(&st),
+            &st.query_cache,
+        )
+        .await
+        .unwrap_or_default()
         {
             let total = b.get("total").and_then(Value::as_i64).unwrap_or(0);
             let errors = b.get("errors").and_then(Value::as_i64).unwrap_or(0);
@@ -2012,6 +2089,7 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
     let target_bytes = st.cfg.compaction.target_bytes();
     let pending_files = verdigris_ingest::pending_compaction_total(&m, target_bytes);
     let last_run = st.compaction.last_run_ms.load(Ordering::Relaxed);
+    let (cache_entries, cache_bytes, cache_hits) = st.query_cache.metadata_stats();
 
     Ok(Json(json!({
         "ingestRate": ingest_rate,
@@ -2023,6 +2101,11 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
             "ingest": { "value": format!("{:.0}", avg(&ingest_rate)), "unit": "ev/s", "delta": 0.0 },
             "errors": { "value": format!("{overall_err:.1}"), "unit": "%", "delta": 0.0 },
             "p99":    { "value": format!("{:.2}", avg(&p99) / 1000.0), "unit": "s", "delta": 0.0 },
+        },
+        "queryCache": {
+            "metadataEntries": cache_entries,
+            "metadataBytes": cache_bytes,
+            "metadataHits": cache_hits,
         },
         "compaction": {
             "enabled": st.cfg.compaction.enabled,

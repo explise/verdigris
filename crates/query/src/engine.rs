@@ -10,13 +10,14 @@
 //! single partition for deterministic in-sim execution (the ADR-001 question) is
 //! a later experiment; this module just proves real in-place reads work.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::json::ArrayWriter;
 use datafusion::arrow::util::pretty::pretty_format_batches;
@@ -25,6 +26,8 @@ use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
+use datafusion::execution::cache::cache_manager::{CacheManagerConfig, FileMetadataCache};
+use datafusion::execution::cache::DefaultFilesMetadataCache;
 use datafusion::execution::memory_pool::{FairSpillPool, TrackConsumersPool};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -34,6 +37,93 @@ use object_store::ObjectStore;
 use verdigris_core::config::QueryConfig;
 
 use crate::index::{IndexedFile, IndexedParquetTable};
+
+/// Bound on cached schemas. A table normally has one, but compaction changes
+/// the first selected path; keep a small window so a long-lived process cannot
+/// grow this map without limit.
+const SCHEMA_CACHE_ENTRIES: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SchemaKey {
+    table: String,
+    path: String,
+    bytes: u64,
+}
+
+/// Process-wide query reuse, scoped to one store and table.
+///
+/// Each query still gets its own DataFusion runtime and execution memory pool;
+/// sharing these would couple one request's memory accounting and cancellation
+/// to another. What is amortized is input discovery:
+///
+/// - **Schema**: a previously inferred Arrow schema is reused instead of listing
+///   the object store and reading a Parquet footer on every request. Keyed by
+///   the first selected file's path + size, so a new file re-infers; files are
+///   immutable, so a key cannot go stale in place.
+/// - **Parquet metadata**: DataFusion's bounded `FileMetadataCache` (footer, row
+///   groups, bloom filters, page index) is shared across runtimes. The engine
+///   constructs `PartitionedFile`s with the manifest's size and a stable sentinel
+///   modification time, so an entry written by one request validates for the
+///   next instead of being rejected by a fresh listing's `last_modified`.
+///
+/// Create one per `(object store, table)`. Sharing across stores would key
+/// metadata by path alone and could return another store's file metadata.
+#[derive(Clone)]
+pub struct QueryCache {
+    metadata: Arc<DefaultFilesMetadataCache>,
+    metadata_limit: usize,
+    schemas: Arc<Mutex<HashMap<SchemaKey, SchemaRef>>>,
+}
+
+impl QueryCache {
+    pub fn new(metadata_cache_bytes: usize) -> Self {
+        Self {
+            metadata: Arc::new(DefaultFilesMetadataCache::new(metadata_cache_bytes)),
+            metadata_limit: metadata_cache_bytes,
+            schemas: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn from_config(query: &QueryConfig) -> Self {
+        Self::new((query.metadata_cache_mib as usize).saturating_mul(1024 * 1024))
+    }
+
+    fn schema(&self, table: &str, file: &IndexedFile) -> Option<SchemaRef> {
+        let key = SchemaKey {
+            table: table.to_string(),
+            path: file.path.clone(),
+            bytes: file.bytes,
+        };
+        self.schemas
+            .lock()
+            .expect("schema cache poisoned")
+            .get(&key)
+            .cloned()
+    }
+
+    fn put_schema(&self, table: &str, file: &IndexedFile, schema: SchemaRef) {
+        let key = SchemaKey {
+            table: table.to_string(),
+            path: file.path.clone(),
+            bytes: file.bytes,
+        };
+        let mut schemas = self.schemas.lock().expect("schema cache poisoned");
+        if schemas.len() >= SCHEMA_CACHE_ENTRIES {
+            schemas.clear();
+        }
+        schemas.insert(key, schema);
+    }
+
+    /// `(entries, bytes, hits)` in the shared Parquet metadata cache. Used by
+    /// tests and diagnostics to prove a warm request reused metadata instead of
+    /// re-reading footers.
+    pub fn metadata_stats(&self) -> (usize, usize, usize) {
+        let entries = self.metadata.list_entries();
+        let bytes = entries.values().map(|e| e.size_bytes).sum();
+        let hits = entries.values().map(|e| e.hits).sum();
+        (entries.len(), bytes, hits)
+    }
+}
 
 /// The result of a SQL query (CLI/pretty path).
 pub struct QueryOutput {
@@ -137,6 +227,7 @@ async fn collect_batches(
     files: &[IndexedFile],
     sql: &str,
     limits: &QueryLimits,
+    cache: Option<&QueryCache>,
 ) -> anyhow::Result<Vec<RecordBatch>> {
     anyhow::ensure!(!files.is_empty(), "table '{table}' has no files to query");
 
@@ -166,8 +257,18 @@ async fn collect_batches(
         FairSpillPool::new(limits.memory_pool_bytes),
         NonZeroUsize::new(TRACKED_CONSUMERS).expect("nonzero"),
     );
-    let rt = RuntimeEnvBuilder::new()
-        .with_memory_pool(Arc::new(pool))
+    let mut runtime = RuntimeEnvBuilder::new().with_memory_pool(Arc::new(pool));
+    if let Some(cache) = cache {
+        // Share only file-embedded metadata (footer, row groups, bloom filters,
+        // page index). The memory pool above stays per query, so one request's
+        // execution budget and spill state remain isolated.
+        runtime = runtime.with_cache_manager(
+            CacheManagerConfig::default()
+                .with_file_metadata_cache(Some(cache.metadata.clone()))
+                .with_metadata_cache_limit(cache.metadata_limit),
+        );
+    }
+    let rt = runtime
         .build_arc()
         .context("building bounded runtime env")?;
     let ctx = SessionContext::new_with_config_rt(cfg, rt);
@@ -178,24 +279,35 @@ async fn collect_batches(
 
     // Register the exact files from the manifest as the table's paths.
     //
-    // The schema still comes from `ListingTable`'s inference over those paths —
-    // one read of one footer, and it keeps schema handling identical to before —
-    // but the table that gets registered is [`IndexedParquetTable`], so each file
-    // can carry the row-group access plan its trigram index implies.
-    let urls = files
-        .iter()
-        .map(|f| ListingTableUrl::parse(format!("verdigris://store/{}", f.path)))
-        .collect::<Result<Vec<_>, _>>()
-        .context("parsing file urls")?;
-    let options = ListingOptions::new(Arc::new(ParquetFormat::default()));
-    let config = ListingTableConfig::new_with_multi_paths(urls)
-        .with_listing_options(options)
-        .infer_schema(&ctx.state())
-        .await
-        .context("inferring schema from parquet")?;
-    let schema = ListingTable::try_new(config)
-        .context("creating listing table")?
-        .schema();
+    // The schema comes from `ListingTable`'s inference over those paths on the
+    // cold request — one read of one footer, identical to the previous path —
+    // but a warm request reuses the schema keyed by the first file's immutable
+    // identity. That removes the listing/HEAD/footer round-trip from every query.
+    // The table that gets registered is [`IndexedParquetTable`], so each file can
+    // carry the row-group access plan its trigram index implies.
+    let schema = match cache.and_then(|c| c.schema(table, &files[0])) {
+        Some(schema) => schema,
+        None => {
+            let urls = files
+                .iter()
+                .map(|f| ListingTableUrl::parse(format!("verdigris://store/{}", f.path)))
+                .collect::<Result<Vec<_>, _>>()
+                .context("parsing file urls")?;
+            let options = ListingOptions::new(Arc::new(ParquetFormat::default()));
+            let config = ListingTableConfig::new_with_multi_paths(urls)
+                .with_listing_options(options)
+                .infer_schema(&ctx.state())
+                .await
+                .context("inferring schema from parquet")?;
+            let schema = ListingTable::try_new(config)
+                .context("creating listing table")?
+                .schema();
+            if let Some(cache) = cache {
+                cache.put_schema(table, &files[0], schema.clone());
+            }
+            schema
+        }
+    };
     let provider = IndexedParquetTable::new(schema, base, files.to_vec());
     ctx.register_table(table, Arc::new(provider))
         .context("registering table")?;
@@ -249,7 +361,7 @@ pub async fn query_table(
     sql: &str,
     limits: &QueryLimits,
 ) -> anyhow::Result<QueryOutput> {
-    let batches = collect_batches(store, table, files, sql, limits).await?;
+    let batches = collect_batches(store, table, files, sql, limits, None).await?;
     let rows = batches.iter().map(|b| b.num_rows()).sum();
     let pretty = pretty_format_batches(&batches)
         .context("formatting results")?
@@ -265,7 +377,23 @@ pub async fn query_table_json(
     sql: &str,
     limits: &QueryLimits,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    let batches = collect_batches(store, table, files, sql, limits).await?;
+    query_table_json_cached(store, table, files, sql, limits, None).await
+}
+
+/// [`query_table_json`] with an optional process-wide [`QueryCache`].
+///
+/// `None` preserves the old per-request behavior (fresh metadata cache). The
+/// HTTP server passes a shared cache so repeated queries over immutable files do
+/// not re-read footers.
+pub async fn query_table_json_cached(
+    store: Arc<dyn ObjectStore>,
+    table: &str,
+    files: &[IndexedFile],
+    sql: &str,
+    limits: &QueryLimits,
+    cache: Option<&QueryCache>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let batches = collect_batches(store, table, files, sql, limits, cache).await?;
     let mut buf = Vec::new();
     {
         let mut writer = ArrayWriter::new(&mut buf);
@@ -301,7 +429,19 @@ pub async fn query_table_arrow_with_rows(
     sql: &str,
     limits: &QueryLimits,
 ) -> anyhow::Result<ArrowOutput> {
-    let batches = collect_batches(store, table, files, sql, limits).await?;
+    query_table_arrow_with_rows_cached(store, table, files, sql, limits, None).await
+}
+
+/// [`query_table_arrow_with_rows`] with an optional shared [`QueryCache`].
+pub async fn query_table_arrow_with_rows_cached(
+    store: Arc<dyn ObjectStore>,
+    table: &str,
+    files: &[IndexedFile],
+    sql: &str,
+    limits: &QueryLimits,
+    cache: Option<&QueryCache>,
+) -> anyhow::Result<ArrowOutput> {
+    let batches = collect_batches(store, table, files, sql, limits, cache).await?;
     let rows = batches.iter().map(|b| b.num_rows()).sum();
     if batches.is_empty() {
         return Ok(ArrowOutput {

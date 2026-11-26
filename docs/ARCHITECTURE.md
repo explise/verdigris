@@ -123,7 +123,11 @@ SQL / search DSL ──▶ plan over manifest files ──▶ DataFusion ──�
    registers.
 3. **Execution.** DataFusion reads Parquet **directly from object storage** — there is no
    rehydration step. On the hot tier this is interactive; on cold tiers it depends on
-   Glacier retrieval (see the cost model).
+   Glacier retrieval (see the cost model). The object-store client, inferred schema and a
+   bounded Parquet metadata cache (footer, row groups, bloom filters, page index) are
+   reused across requests; execution memory stays per query. Query audit records are
+   queued to a background writer so the response does not wait on an object-store
+   read-modify-write.
 4. **Response.** `/v1/query` returns `{ rows, stats, histogram }` in one envelope:
    a page of rows, a `~60`-bucket time histogram (total vs errors) tied to the table's time
    range, and stats (total matched events, scanned bytes, elapsed ms, engine, files).

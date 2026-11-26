@@ -59,6 +59,12 @@ path the Logs explorer uses (and the path that applies file-level
 `service`/`level` pruning). The aggregation is SQL on all three because the DSL
 does not express it.
 
+The trace workload rotates through a fixed set of real IDs spread across the
+corpus, and also checks a missing ID and one ID deliberately written to a row in
+each tier. Verdigris additionally checks each tier independently. Raw per-request
+timings and the shared metadata-cache hit delta are recorded in the JSON for
+issue #70; see [`bench/results/issue70/`](../../results/issue70/README.md).
+
 ## Measured 2026-11-26
 
 Host: 16 vCPU / 14 GiB, Docker 29.9; one system at a time. 1,000,000 events,

@@ -41,6 +41,11 @@ path = "./data"
 modeled_mibps_per_core = 100.0
 cores = 4
 
+# Shared cache of immutable Parquet metadata (footer, row groups, bloom filters,
+# page index). Bounded in MiB; execution memory stays per query. 0 disables
+# cross-request reuse. The object-store client is built once per process either way.
+metadata_cache_mib = 64
+
 # Severity-based write-time routing: which tier each level lands in.
 # Severity decides placement (prefix / storage class), never price.
 [routing]

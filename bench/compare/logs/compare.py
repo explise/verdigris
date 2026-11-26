@@ -44,6 +44,11 @@ DEFAULT_THREADS = 4
 DEFAULT_ITERATIONS = 10
 DEFAULT_WARMUP = 3
 
+# One trace id is deliberately written to one row in each tier. A full lookup
+# must return all three; a tier-scoped Verdigris query must return exactly one.
+CROSS_TRACE = "cross-tier-trace"
+CROSS_TRACE_ROWS = (0, 1, 3)  # ERROR/hot, INFO/warm, DEBUG/cold
+
 # The corpus sits wholly inside "the last hour" so a `| last 1h` DSL query is
 # equivalent to an absolute [start, end) filter on the other two systems.
 NOW_MS = int(time.time() * 1_000)
@@ -92,6 +97,7 @@ def record(i: int, rows: int, system: str) -> dict:
     service = service_for(i)
     msg = message_for(i, level, service)
     ts = ts_for(i, rows)
+    trace_id = CROSS_TRACE if i in CROSS_TRACE_ROWS else f"{i:016x}"
     if system == "vdg":
         return {
             "ts_millis": ts,
@@ -99,7 +105,7 @@ def record(i: int, rows: int, system: str) -> dict:
             "service": service,
             "status": status_for(level),
             "message": msg,
-            "trace_id": f"{i:016x}",
+            "trace_id": trace_id,
             "attrs": {
                 "region": REGIONS[i % len(REGIONS)],
                 "host": f"node-{i % 50:02d}",
@@ -112,7 +118,7 @@ def record(i: int, rows: int, system: str) -> dict:
             "service": service,
             "status": status_for(level),
             "message": msg,
-            "trace_id": f"{i:016x}",
+            "trace_id": trace_id,
         }
     return {
         "_time": iso_ms(ts),
@@ -120,7 +126,7 @@ def record(i: int, rows: int, system: str) -> dict:
         "level": level,
         "service": service,
         "status": status_for(level),
-        "trace_id": f"{i:016x}",
+        "trace_id": trace_id,
     }
 
 
@@ -190,6 +196,7 @@ class Backend:
     def __init__(self, args):
         self.args = args
         self.client = HttpClient(args.host, args.port)
+        self.last_stats = {}
 
     def ingest_one(self, body: bytes) -> int:
         raise NotImplementedError
@@ -235,7 +242,9 @@ class Vdg(Backend):
         )
         if status != 200:
             raise RuntimeError(f"vdg query {status}: {data[:300]!r}")
-        return json.loads(data)["rows"]
+        payload = json.loads(data)
+        self.last_stats = payload.get("stats") or {}
+        return payload["rows"]
 
     def settle(self):
         # Background compaction runs on a 5s cadence in vdg.toml. Wait until the
@@ -275,18 +284,29 @@ class Vdg(Backend):
         )
         if status != 200:
             raise RuntimeError(f"vdg search {status}: {data[:300]!r}")
-        return json.loads(data)["rows"]
+        payload = json.loads(data)
+        self.last_stats = payload.get("stats") or {}
+        return payload["rows"]
 
-    def trace_lookup(self):
+    def trace_lookup(self, trace_id=None):
+        trace_id = trace_id or self.args.trace_id
+        return self._trace_query(trace_id, [])
+
+    def trace_lookup_tiered(self, trace_id: str, tiers):
+        return self._trace_query(trace_id, tiers)
+
+    def _trace_query(self, trace_id: str, tiers):
         body = json.dumps(
-            {"sql": f"trace_id:{self.args.trace_id}", "tiers": [], "histogram": False}
+            {"sql": f"trace_id:{trace_id}", "tiers": tiers, "histogram": False}
         ).encode()
         status, _, data = self.client.request(
             "POST", "/v1/query", body, {"content-type": "application/json"},
         )
         if status != 200:
             raise RuntimeError(f"vdg trace {status}: {data[:300]!r}")
-        return json.loads(data)["rows"]
+        payload = json.loads(data)
+        self.last_stats = payload.get("stats") or {}
+        return payload["rows"]
 
     def aggregate_minute(self):
         return self._query(
@@ -296,6 +316,12 @@ class Vdg(Backend):
             "count(*) FILTER (WHERE level = 'ERROR') AS errors "
             "FROM bench GROUP BY bucket ORDER BY bucket"
         )
+
+    def cache_stats(self):
+        status, _, data = self.client.request("GET", "/v1/metrics")
+        if status != 200:
+            return {}
+        return json.loads(data).get("queryCache") or {}
 
 
 class ClickHouse(Backend):
@@ -367,10 +393,11 @@ class ClickHouse(Backend):
             "ORDER BY ts DESC LIMIT 200"
         )
 
-    def trace_lookup(self):
+    def trace_lookup(self, trace_id=None):
+        trace_id = trace_id or self.args.trace_id
         return self._sql_json(
             "SELECT ts, level, service, status, message, trace_id FROM bench "
-            f"WHERE trace_id = '{self.args.trace_id}' LIMIT 10"
+            f"WHERE trace_id = '{trace_id}' LIMIT 10"
         )
 
     def aggregate_minute(self):
@@ -426,9 +453,10 @@ class VictoriaLogs(Backend):
             "| sort by (_time) desc | limit 200"
         )
 
-    def trace_lookup(self):
+    def trace_lookup(self, trace_id=None):
+        trace_id = trace_id or self.args.trace_id
         return self._query_rows(
-            f'trace_id:="{self.args.trace_id}" '
+            f'trace_id:="{trace_id}" '
             "| fields _time, level, service, status, message, trace_id | limit 10"
         )
 
@@ -466,6 +494,7 @@ def timed(fn, iterations: int, warmup: int):
         "p99_ms": percentile(samples, 0.99),
         "max_ms": samples[-1],
         "result_rows": len(last) if hasattr(last, "__len__") else None,
+        "raw_ms": samples,
     }
 
 
@@ -483,7 +512,12 @@ def main():
     args = ap.parse_args()
 
     rows = args.rows
-    args.trace_id = f"{rows // 2:016x}"
+    # Spread hit lookups across the corpus instead of timing one convenient id.
+    # Every id is a real row; keep away from the cross-tier sentinel rows.
+    indices = sorted({max(4, (k * rows) // 16) for k in range(16)})
+    args.trace_ids = [f"{i:016x}" for i in indices]
+    args.trace_id = args.trace_ids[len(args.trace_ids) // 2]
+    args.missing_trace_id = "ffffffffffffffff"
     expected_errors = sum(1 for i in range(rows) if level_for(i) == "ERROR")
     expected_recent = sum(
         1 for i in range(rows) if service_for(i) == "checkout" and level_for(i) == "ERROR"
@@ -557,9 +591,30 @@ def main():
         raise SystemExit(
             f"{args.system}: search returned {len(search_rows)}, expected {min(200, expected_recent)}"
         )
-    trace_rows = backend.trace_lookup()
+    trace_rows = backend.trace_lookup(args.trace_id)
     if len(trace_rows) != 1:
         raise SystemExit(f"{args.system}: trace lookup returned {len(trace_rows)}, expected 1")
+    cross_rows = backend.trace_lookup(CROSS_TRACE)
+    if len(cross_rows) != len(CROSS_TRACE_ROWS):
+        raise SystemExit(
+            f"{args.system}: cross-tier trace returned {len(cross_rows)}, "
+            f"expected {len(CROSS_TRACE_ROWS)}"
+        )
+    missing_rows = backend.trace_lookup(args.missing_trace_id)
+    if missing_rows:
+        raise SystemExit(
+            f"{args.system}: missing trace returned {len(missing_rows)} rows, expected 0"
+        )
+    tier_rows = {}
+    if args.system == "vdg":
+        for tier in ("hot", "warm", "cold"):
+            tier_rows[tier] = len(backend.trace_lookup_tiered(CROSS_TRACE, [tier]))
+            if tier_rows[tier] != 1:
+                raise SystemExit(
+                    f"vdg: tier-scoped cross trace {tier} returned {tier_rows[tier]}, expected 1"
+                )
+        if len(backend.trace_lookup_tiered(CROSS_TRACE, [])) != len(CROSS_TRACE_ROWS):
+            raise SystemExit("vdg: all-tier cross trace lost a row")
 
     buckets = backend.aggregate_minute()
     total = sum(int(r["total"]) for r in buckets)
@@ -575,6 +630,33 @@ def main():
         flush=True,
     )
 
+    trace_cursor = [0]
+    trace_engine_ms = []
+    trace_manifest_ms = []
+    trace_plan_ms = []
+
+    def next_trace():
+        tid = args.trace_ids[trace_cursor[0] % len(args.trace_ids)]
+        trace_cursor[0] += 1
+        rows = backend.trace_lookup(tid)
+        if args.system == "vdg":
+            trace_engine_ms.append(backend.last_stats.get("elapsedMs"))
+            trace_manifest_ms.append(backend.last_stats.get("manifestMs"))
+            trace_plan_ms.append(backend.last_stats.get("planMs"))
+        return rows
+
+    cache_before = backend.cache_stats() if args.system == "vdg" else {}
+    q_search = timed(backend.search_recent, args.iterations, args.warmup)
+    q_trace = timed(next_trace, args.iterations, args.warmup)
+    q_trace_miss = timed(
+        lambda: backend.trace_lookup(args.missing_trace_id), args.iterations, args.warmup
+    )
+    q_trace_cross = timed(
+        lambda: backend.trace_lookup(CROSS_TRACE), args.iterations, args.warmup
+    )
+    q_aggregate = timed(backend.aggregate_minute, args.iterations, args.warmup)
+    cache_after = backend.cache_stats() if args.system == "vdg" else {}
+
     results = {
         "system": args.system,
         "corpus": {
@@ -583,6 +665,9 @@ def main():
             "base_ts_ms": BASE_TS,
             "window_ms": WINDOW_MS,
             "trace_id": args.trace_id,
+            "trace_ids": args.trace_ids,
+            "cross_trace": CROSS_TRACE,
+            "missing_trace": args.missing_trace_id,
         },
         "ingest": {
             "elapsed_s": ingest_s,
@@ -594,14 +679,34 @@ def main():
             "recent_count": recent_count,
             "search_rows": len(search_rows),
             "trace_rows": len(trace_rows),
+            "cross_trace_rows": len(cross_rows),
+            "missing_trace_rows": len(missing_rows),
+            "tier_rows": tier_rows,
             "buckets": len(buckets),
             "total": total,
             "errors": errors,
         },
+        "trace_phase_ms": {
+            "engine": trace_engine_ms,
+            "manifest": trace_manifest_ms,
+            "plan": trace_plan_ms,
+        },
+        "query_cache": {
+            "before": cache_before,
+            "after": cache_after,
+            "metadata_hits_delta": (
+                int(cache_after.get("metadataHits", 0))
+                - int(cache_before.get("metadataHits", 0))
+                if cache_before and cache_after
+                else None
+            ),
+        },
         "queries": {
-            "recent_service_search": timed(backend.search_recent, args.iterations, args.warmup),
-            "trace_lookup": timed(backend.trace_lookup, args.iterations, args.warmup),
-            "minute_aggregation": timed(backend.aggregate_minute, args.iterations, args.warmup),
+            "recent_service_search": q_search,
+            "trace_lookup": q_trace,
+            "trace_lookup_miss": q_trace_miss,
+            "trace_lookup_cross_tier": q_trace_cross,
+            "minute_aggregation": q_aggregate,
         },
     }
     backend.close()

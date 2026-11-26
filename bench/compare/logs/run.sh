@@ -79,13 +79,15 @@ container_mem() {
 }
 
 write_meta() {
-  local system=$1 image=$2 cpus=$3 mem=$4 bytes=$5
-  python3 - "$OUT/$system.meta.json" "$system" "$image" "$cpus" "$mem" "$bytes" <<'PY'
+  local system=$1 image=$2 cpus=$3 mem=$4 bytes=$5 image_id
+  image_id=$(docker image inspect "$image" --format '{{.Id}}' 2>/dev/null || true)
+  python3 - "$OUT/$system.meta.json" "$system" "$image" "$image_id" "$cpus" "$mem" "$bytes" <<'PY'
 import json, sys
-path, system, image, cpus, mem, data_bytes = sys.argv[1:]
+path, system, image, image_id, cpus, mem, data_bytes = sys.argv[1:]
 json.dump({
     "system": system,
     "image": image,
+    "image_id": image_id or None,
     "cpu_limit": int(cpus),
     "memory_limit": mem,
     "retained_bytes": int(data_bytes) if data_bytes.isdigit() else None,

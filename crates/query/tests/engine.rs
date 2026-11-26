@@ -20,7 +20,7 @@ use verdigris_core::estimate::select_files;
 use verdigris_core::manifest::Manifest;
 use verdigris_core::model::{Level, Tier};
 use verdigris_ingest::Ingestor;
-use verdigris_query::engine::{self, QueryLimits, ResultTooLarge};
+use verdigris_query::engine::{self, QueryCache, QueryLimits, ResultTooLarge};
 use verdigris_query::index::IndexedFile;
 
 const BASE_TS: i64 = 1_700_000_000_000;
@@ -140,6 +140,61 @@ async fn trace_id_equality_lookup_returns_the_exact_row() {
     assert_eq!(rows[0]["service"].as_str(), Some("auth"));
     assert_eq!(rows[0]["message"].as_str(), Some("auth event 7"));
     assert_eq!(rows[0]["trace_id"].as_str(), Some(TRACE));
+}
+
+// A warm request must reuse the schema and Parquet footer metadata instead of
+// re-listing the store and re-reading every footer. The cache is still only an
+// optimization: hits, misses, and the returned row are identical.
+#[tokio::test]
+async fn shared_query_cache_reuses_metadata_without_changing_results() {
+    let (store, manifest) = seeded_table().await;
+    let files = all_paths(&manifest);
+    let cache = QueryCache::new(8 * 1024 * 1024);
+    let sql = format!("SELECT service, message FROM logs WHERE trace_id = '{TRACE}'");
+
+    let first = engine::query_table_json_cached(
+        store.clone(),
+        "logs",
+        &files,
+        &sql,
+        &limits(),
+        Some(&cache),
+    )
+    .await
+    .expect("cold trace lookup");
+    let (entries_after_cold, _, hits_after_cold) = cache.metadata_stats();
+    assert!(entries_after_cold > 0, "cold query must populate metadata");
+
+    let second = engine::query_table_json_cached(
+        store.clone(),
+        "logs",
+        &files,
+        &sql,
+        &limits(),
+        Some(&cache),
+    )
+    .await
+    .expect("warm trace lookup");
+    let (entries_after_warm, _, hits_after_warm) = cache.metadata_stats();
+    assert_eq!(first, second, "cache must not change the result");
+    assert_eq!(second.len(), 1);
+    assert!(
+        hits_after_warm > hits_after_cold,
+        "warm query must hit the shared metadata cache ({hits_after_cold} -> {hits_after_warm})"
+    );
+    assert_eq!(entries_after_cold, entries_after_warm, "no footer re-reads");
+
+    let missing = engine::query_table_json_cached(
+        store,
+        "logs",
+        &files,
+        "SELECT service FROM logs WHERE trace_id = 'no-such-trace'",
+        &limits(),
+        Some(&cache),
+    )
+    .await
+    .expect("cache miss lookup");
+    assert!(missing.is_empty(), "a missing trace returns no rows");
 }
 
 // The M4.1 guarantee at the execution layer: the engine reads exactly the files
