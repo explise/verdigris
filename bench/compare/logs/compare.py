@@ -634,8 +634,6 @@ def main():
     trace_engine_ms = []
     trace_manifest_ms = []
     trace_plan_ms = []
-    trace_audit_ms = []
-    trace_total_ms = []
 
     def next_trace():
         tid = args.trace_ids[trace_cursor[0] % len(args.trace_ids)]
@@ -645,8 +643,6 @@ def main():
             trace_engine_ms.append(backend.last_stats.get("elapsedMs"))
             trace_manifest_ms.append(backend.last_stats.get("manifestMs"))
             trace_plan_ms.append(backend.last_stats.get("planMs"))
-            trace_audit_ms.append(backend.last_stats.get("auditMs"))
-            trace_total_ms.append(backend.last_stats.get("totalMs"))
         return rows
 
     cache_before = backend.cache_stats() if args.system == "vdg" else {}
@@ -694,8 +690,6 @@ def main():
             "engine": trace_engine_ms,
             "manifest": trace_manifest_ms,
             "plan": trace_plan_ms,
-            "audit": trace_audit_ms,
-            "total": trace_total_ms,
         },
         "query_cache": {
             "before": cache_before,

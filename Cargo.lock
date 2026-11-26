@@ -4813,6 +4813,7 @@ dependencies = [
  "datafusion",
  "futures",
  "object_store",
+ "parquet",
  "serde_json",
  "thiserror",
  "tokio",
