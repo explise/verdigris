@@ -1373,6 +1373,15 @@ struct QueryReq {
     /// scan cold.
     #[serde(default)]
     tiers: Vec<String>,
+    /// Return the severity histogram (and its exact matched-event total).
+    /// Defaults to `true` for the UI. A rows-only caller can set this to `false`
+    /// and skip a second full scan of the same files.
+    #[serde(default = "default_true")]
+    histogram: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// True when the client's `Accept` header asks for the Arrow stream wire. The UI
@@ -1431,7 +1440,7 @@ async fn h_query(
 
     // Run the query once, in the negotiated wire (never both).
     let t0 = st.clock.monotonic_micros();
-    let (arrow_body, json_rows) = if arrow {
+    let (arrow_body, json_rows, rows_returned) = if arrow {
         let out = verdigris_query::engine::query_table_arrow_with_rows(
             s.clone(),
             st.table.as_str(),
@@ -1441,7 +1450,7 @@ async fn h_query(
         )
         .await
         .map_err(AppError::from_query)?;
-        (out.bytes, Value::Null)
+        (out.bytes, Value::Null, out.rows)
     } else {
         let rows = verdigris_query::engine::query_table_json(
             s.clone(),
@@ -1452,19 +1461,33 @@ async fn h_query(
         )
         .await
         .map_err(AppError::from_query)?;
-        (Vec::new(), Value::Array(rows))
+        let n = rows.len();
+        (Vec::new(), Value::Array(rows), n)
     };
     let elapsed = st.clock.monotonic_micros().saturating_sub(t0) / 1_000;
 
-    let (min_ts, max_ts) = time_range(&m);
-    let histogram = histogram(&s, st.table.as_str(), &files, min_ts, max_ts, &limits(&st))
-        .await
-        .unwrap_or_default();
-    // `events` is the total matched count (histogram sum), not the page of rows.
-    let events: i64 = histogram
-        .iter()
-        .filter_map(|b| b.get("total").and_then(Value::as_i64))
-        .sum();
+    // Only callers that actually render the strip pay for the second scan over
+    // the same files. A rows-only caller (`"histogram": false`) gets the rows and
+    // a row count from the scan it already ran.
+    let histogram = if req.histogram {
+        let (min_ts, max_ts) = time_range(&m);
+        histogram(&s, st.table.as_str(), &files, min_ts, max_ts, &limits(&st))
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    // With a histogram, `events` is the exact total matched count (histogram
+    // sum). Without one, it is the page of rows this response actually carries —
+    // no second scan is spent inferring a total the caller did not ask for.
+    let events: i64 = if req.histogram {
+        histogram
+            .iter()
+            .filter_map(|b| b.get("total").and_then(Value::as_i64))
+            .sum()
+    } else {
+        rows_returned as i64
+    };
     // What the row-group text index actually saved, over the files that carry one.
     // `scannedBytes` is charged at file granularity (that is what the estimate
     // quoted, and what a cold-tier GET really costs), so without this a free-text
@@ -1476,6 +1499,9 @@ async fn h_query(
         .fold((0usize, 0usize), |(s, t), (fs, ft)| (s + fs, t + ft));
     let stats = json!({
         "events": events,
+        // False when the caller opted out of the histogram: `events` is then the
+        // returned row count, not the total match count.
+        "eventsExact": req.histogram,
         "scannedBytes": scanned_bytes,
         "elapsedMs": elapsed,
         "engine": "datafusion",

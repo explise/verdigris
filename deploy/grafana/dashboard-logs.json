@@ -257,7 +257,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "application/json",
-            "data": "{\"sql\": \"${query:raw}\"}"
+            "data": "{\"sql\": \"${query:raw}\", \"histogram\": false}"
           },
           "root_selector": "rows",
           "columns": [

@@ -64,12 +64,14 @@ Run a query and get a page of rows, a time histogram, and stats in one envelope.
 
 Request:
 ```json
-{ "sql": "SELECT * FROM logs LIMIT 200" }
+{ "sql": "SELECT * FROM logs LIMIT 200", "tiers": ["hot"], "histogram": true }
 ```
 `sql` accepts **either** raw SQL (DataFusion) **or** the search DSL
-(`service:auth status>=500 | last 1h`), which is compiled to SQL. A malformed query
-returns **400** `{ "error": ... }` (so the client distinguishes a broken query from zero
-matches).
+(`service:auth status>=500 | last 1h`), which is compiled to SQL. `tiers` is optional
+(empty/omitted = all tiers). `histogram` defaults to `true`; set it to `false` for a
+rows-only caller and the server skips the second scan that builds the severity strip.
+A malformed query returns **400** `{ "error": ... }` (so the client distinguishes a
+broken query from zero matches).
 
 Response:
 ```json
@@ -83,7 +85,9 @@ Response:
   "histogram": [ { "total": 807, "errors": 331 }, … ]   // ~60 buckets over the table's time range
 }
 ```
-`stats.events` is the **total matched count** (histogram sum), not the returned row page.
+`stats.events` is the **total matched count** (histogram sum), not the returned row page,
+and `stats.eventsExact` says so. With `"histogram": false` no second scan runs, `histogram`
+is empty, and `events` is the returned row count instead (`eventsExact: false`).
 Rows carry attributes as the `attrs_json` string (schema-evolution escape hatch); the UI
 parses it into an `attrs` object.
 
