@@ -280,21 +280,34 @@ pub async fn query_table_json(
     serde_json::from_slice(&buf).context("parsing json rows")
 }
 
+/// Arrow-IPC bytes plus the number of rows they encode. The row count is what
+/// `stats.events` needs when the caller did not ask for a histogram — otherwise
+/// the server would have to spend a second scan just to count what it already
+/// materialized here.
+#[derive(Debug)]
+pub struct ArrowOutput {
+    pub bytes: Vec<u8>,
+    pub rows: usize,
+}
+
 /// Run a query and return the rows encoded as an **Arrow IPC stream** — the
 /// columnar wire the UI can decode near-zero-copy (vs parsing millions of JSON
 /// objects). Same in-place read path as [`query_table_json`]; only the output
-/// encoding differs. An empty result set yields an empty buffer (no rows), which
-/// the client treats as zero matches.
-pub async fn query_table_arrow(
+/// encoding differs.
+pub async fn query_table_arrow_with_rows(
     store: Arc<dyn ObjectStore>,
     table: &str,
     files: &[IndexedFile],
     sql: &str,
     limits: &QueryLimits,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<ArrowOutput> {
     let batches = collect_batches(store, table, files, sql, limits).await?;
+    let rows = batches.iter().map(|b| b.num_rows()).sum();
     if batches.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ArrowOutput {
+            bytes: Vec::new(),
+            rows,
+        });
     }
     // DataFusion 54's Parquet reader yields Arrow `Utf8View`/`BinaryView` columns,
     // a type too new for many IPC decoders (e.g. apache-arrow JS in the web UI),
@@ -315,7 +328,25 @@ pub async fn query_table_arrow(
         }
         writer.finish().context("finishing arrow stream")?;
     }
-    Ok(buf)
+    Ok(ArrowOutput { bytes: buf, rows })
+}
+
+/// Bytes-only wrapper for callers that do not need the row count.
+///
+/// An empty result set yields an empty buffer (no rows), which the client treats
+/// as zero matches.
+pub async fn query_table_arrow(
+    store: Arc<dyn ObjectStore>,
+    table: &str,
+    files: &[IndexedFile],
+    sql: &str,
+    limits: &QueryLimits,
+) -> anyhow::Result<Vec<u8>> {
+    Ok(
+        query_table_arrow_with_rows(store, table, files, sql, limits)
+            .await?
+            .bytes,
+    )
 }
 
 /// Cast any `Utf8View`/`BinaryView` columns of a batch down to `Utf8`/`Binary`.

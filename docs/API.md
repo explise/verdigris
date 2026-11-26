@@ -99,7 +99,10 @@ string the JSON wire sends.
 Pre-query scan-size + dollar estimate — powers the cold-scan confirm gate.
 
 Request: `{ "tiers": ["hot","warm","cold"], "sql": "… | last 1h" }` (`sql` optional; when
-present, prunes by the query's time window).
+present, prunes by the query's time window). Empty/omitted `tiers` means **all tiers** —
+the same normalization execution uses — so a quote never prices zero files while the query
+scans everything. The estimator and executor build one shared scan plan, so the quote
+covers the exact file set the query reads.
 
 Response:
 ```json

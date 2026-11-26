@@ -12,6 +12,7 @@
 use crate::cost::{self, RetrievalMode};
 use crate::manifest::{DataFile, Manifest, Predicate};
 use crate::model::Tier;
+use crate::scan::ScanPlan;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TierEstimate {
@@ -78,10 +79,41 @@ pub fn estimate_scan(
     throughput_bytes_per_sec: f64,
     retrieval: RetrievalMode,
 ) -> QueryEstimate {
+    estimate_files(
+        select_files(manifest, tiers, window, preds).into_iter(),
+        manifest.files.len(),
+        throughput_bytes_per_sec,
+        retrieval,
+    )
+}
+
+/// Price the exact file set a [`ScanPlan`] selected.
+///
+/// This is the estimator half of the shared-plan guarantee: given the plan the
+/// executor will run, charge for its [`ScanPlan::files`] and nothing else.
+pub fn estimate_plan(
+    plan: &ScanPlan<'_>,
+    throughput_bytes_per_sec: f64,
+    retrieval: RetrievalMode,
+) -> QueryEstimate {
+    estimate_files(
+        plan.files.iter().copied(),
+        plan.files_total,
+        throughput_bytes_per_sec,
+        retrieval,
+    )
+}
+
+fn estimate_files<'a>(
+    files: impl Iterator<Item = &'a DataFile>,
+    files_total: usize,
+    throughput_bytes_per_sec: f64,
+    retrieval: RetrievalMode,
+) -> QueryEstimate {
     // Bytes of touched files per tier (index 0/1/2 = hot/warm/cold).
     let mut per = [0u64; 3];
     let mut files_touched = 0;
-    for f in select_files(manifest, tiers, window, preds) {
+    for f in files {
         per[f.tier.index()] += f.bytes;
         files_touched += 1;
     }
@@ -128,7 +160,7 @@ pub fn estimate_scan(
         scan_ms,
         cold_restore,
         files_touched,
-        files_total: manifest.files.len(),
+        files_total,
         per_tier,
     }
 }
@@ -312,6 +344,27 @@ mod tests {
         // No predicate → nothing pruned by value.
         let all = estimate_scan(&m, &[Tier::Hot], None, &[], 1e9, RetrievalMode::Standard);
         assert_eq!(all.files_touched, 3);
+    }
+
+    #[test]
+    fn estimate_plan_prices_exactly_the_plan_files() {
+        use crate::scan::{plan_scan, DEFAULT_QUERY_LIMIT};
+        let m = manifest();
+        let plan = plan_scan(
+            &m,
+            "service:auth status>=500 | last 1h",
+            "logs",
+            &[],
+            3_600_000,
+            DEFAULT_QUERY_LIMIT,
+        )
+        .unwrap();
+        let e = estimate_plan(&plan, 1e9, RetrievalMode::Standard);
+        assert_eq!(e.files_touched, plan.files.len());
+        assert_eq!(e.scan_bytes, plan.scanned_bytes());
+        // Empty tiers normalized to all, so the cold file is priced too.
+        assert_eq!(e.files_touched, 3);
+        assert!(!e.per_tier.is_empty());
     }
 
     // The executed scan (which registers `select_files`) and the cost estimate

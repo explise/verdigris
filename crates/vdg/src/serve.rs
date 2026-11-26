@@ -1397,24 +1397,26 @@ async fn h_query(
     let preds = verdigris_core::search::stat_predicates(&req.sql);
     let (s, m) = manifest_for(&st, &preds).await?;
 
-    // Scope the scan to the requested tiers + the query's time window — the SAME
-    // selection `POST /v1/query/estimate` prices (`core::estimate::select_files`),
-    // so the quoted cost and the executed query provably read the same files.
-    // Empty/omitted tiers = all tiers (non-UI callers; the UI always sends them).
-    let mut tiers: Vec<Tier> = req.tiers.iter().filter_map(|t| parse_tier(t)).collect();
-    if tiers.is_empty() {
-        tiers = Tier::ALL.to_vec();
-    }
-    let window = verdigris_core::search::time_window(&req.sql, st.clock.now_millis() as i64);
-    // `service:`/`level:` equality in the query skips files proven free of the
-    // value — the SAME predicates the estimate prunes on, so quote and scan stay
-    // in lockstep. (Empty for raw SQL; those files prune by tier+window only.)
-    let selected = verdigris_core::estimate::select_files(&m, &tiers, window, &preds);
+    // Build ONE scan plan, the same call `POST /v1/query/estimate` makes. It
+    // compiles the DSL (or passes SQL through), normalizes the tier selection
+    // (empty = all tiers), and selects the files tier + time window + prunable
+    // predicates admit. The quote prices this file set; execution registers it.
+    let tiers: Vec<Tier> = req.tiers.iter().filter_map(|t| parse_tier(t)).collect();
+    let plan = verdigris_core::scan::plan_scan(
+        &m,
+        &req.sql,
+        st.table.as_str(),
+        &tiers,
+        st.clock.now_millis() as i64,
+        verdigris_core::scan::DEFAULT_QUERY_LIMIT,
+    )
+    .map_err(AppError::bad_request)?;
+    let selected = &plan.files;
     if selected.is_empty() {
         let stats = json!({ "events": 0, "scannedBytes": 0, "elapsedMs": 0, "engine": "datafusion", "files": 0 });
         return Ok(query_response(arrow, Vec::new(), &stats, &Vec::new()));
     }
-    let scanned_bytes: u64 = selected.iter().map(|f| f.bytes).sum();
+    let scanned_bytes: u64 = plan.scanned_bytes();
     // Same predicates again, one level down: `select_files` decided which files to
     // open, this decides which row groups inside them to read. A file kept because
     // the term's trigrams appear *somewhere* in it can still skip most of itself.
@@ -1423,25 +1425,14 @@ async fn h_query(
         .map(|f| IndexedFile::plan(f, &preds))
         .collect();
 
-    // The frontend search bar sends its DSL in `sql`; raw SQL is passed through.
     // A malformed query is a 400, not a 200-with-empty-rows, so the client can
-    // tell a broken query from zero matches.
-    let sql = if verdigris_core::search::looks_like_sql(&req.sql) {
-        req.sql.clone()
-    } else {
-        verdigris_core::search::to_sql(
-            &req.sql,
-            st.table.as_str(),
-            st.clock.now_millis() as i64,
-            200,
-        )
-        .map_err(AppError::bad_request)?
-    };
+    // tell a broken query from zero matches. The plan already compiled it.
+    let sql = plan.sql.clone();
 
     // Run the query once, in the negotiated wire (never both).
     let t0 = st.clock.monotonic_micros();
     let (arrow_body, json_rows) = if arrow {
-        let bytes = verdigris_query::engine::query_table_arrow(
+        let out = verdigris_query::engine::query_table_arrow_with_rows(
             s.clone(),
             st.table.as_str(),
             &files,
@@ -1450,7 +1441,7 @@ async fn h_query(
         )
         .await
         .map_err(AppError::from_query)?;
-        (bytes, Value::Null)
+        (out.bytes, Value::Null)
     } else {
         let rows = verdigris_query::engine::query_table_json(
             s.clone(),
@@ -1759,34 +1750,28 @@ struct EstimateReq {
 }
 
 async fn h_estimate(State(st): State<AppState>, Json(req): Json<EstimateReq>) -> ApiResult {
-    let preds = req
-        .sql
-        .as_deref()
-        .map(verdigris_core::search::stat_predicates)
-        .unwrap_or_default();
+    let input = req.sql.as_deref().unwrap_or("");
+    let preds = verdigris_core::search::stat_predicates(input);
     let (_s, m) = manifest_for(&st, &preds).await?;
     let tiers: Vec<Tier> = req.tiers.iter().filter_map(|t| parse_tier(t)).collect();
 
-    // Prune by the query's time window (metadata-only).
-    let window = req
-        .sql
-        .as_deref()
-        .and_then(|q| verdigris_core::search::time_window(q, st.clock.now_millis() as i64));
+    // The exact plan `/v1/query` will execute: same compiled SQL, same
+    // normalized tiers (empty = all), same window + predicates, same file set.
+    let plan = verdigris_core::scan::plan_scan(
+        &m,
+        input,
+        st.table.as_str(),
+        &tiers,
+        st.clock.now_millis() as i64,
+        verdigris_core::scan::DEFAULT_QUERY_LIMIT,
+    )
+    .map_err(AppError::bad_request)?;
 
-    // …and by `service:`/`level:` equality, the same file-level pruning the
-    // executed query applies — so the quote prices exactly what the scan reads.
-    // Provisioned throughput = cores × per-core rate (the storage/compute dial).
+    // Price that file set. Provisioned throughput = cores × per-core rate (the
+    // storage/compute dial).
     let throughput =
         st.cfg.query.modeled_mibps_per_core * st.cfg.query.cores as f64 * 1024.0 * 1024.0;
-
-    let est = verdigris_core::estimate::estimate_scan(
-        &m,
-        &tiers,
-        window,
-        &preds,
-        throughput,
-        RetrievalMode::Standard,
-    );
+    let est = verdigris_core::estimate::estimate_plan(&plan, throughput, RetrievalMode::Standard);
 
     let per_tier: Vec<Value> = est
         .per_tier
