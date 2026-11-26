@@ -489,8 +489,17 @@ impl Ingestor {
                     }
                     let in_progress = w.in_progress_size();
                     let (data, stats) = w.finish()?;
+                    // The output key includes a digest of the bytes, not just the
+                    // generation and bin sequence. Two concurrent compaction
+                    // attempts can observe the same generation and write the same
+                    // bin index; if their input sets differ, a generation-only key
+                    // would let the loser overwrite the file the winning manifest
+                    // references. Content-addressing makes each output immutable:
+                    // identical bytes reuse the same key (idempotent), different
+                    // bytes cannot collide.
+                    let digest = content_hash(&data);
                     let path = format!(
-                        "{}/{}/c{generation}-{seq:05}.parquet",
+                        "{}/{}/c{generation}-{seq:05}-{digest}.parquet",
                         self.table,
                         tier.as_str()
                     );
