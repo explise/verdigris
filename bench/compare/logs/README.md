@@ -61,9 +61,13 @@ does not express it.
 
 The trace workload rotates through a fixed set of real IDs spread across the
 corpus, and also checks a missing ID and one ID deliberately written to a row in
-each tier. Verdigris additionally checks each tier independently. Raw per-request
-timings and the shared metadata-cache hit delta are recorded in the JSON for
-issue #70; see [`bench/results/issue70/`](../../results/issue70/README.md).
+each tier. Verdigris additionally checks each tier independently. Rows carry the
+same `attrs_json` values on all three systems, and every one-minute bucket's
+total/error counts are validated against the generator (not just the sums).
+Raw per-request timings and the shared metadata-cache hit delta are recorded in
+the JSON. See [`bench/results/issue63/`](../../results/issue63/README.md) for the
+normalized three-engine run and [`bench/results/issue70/`](../../results/issue70/README.md)
+for the trace-latency work.
 
 ## Measured 2026-11-26
 

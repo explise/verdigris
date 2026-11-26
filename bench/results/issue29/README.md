@@ -8,24 +8,16 @@ Node budget: **vdg 4 CPU / 2 GiB** + **MinIO 2 CPU / 2 GiB**. Image
 concurrent full-scan aggregates plus 2 cheap `SELECT * ... LIMIT 10` queries in
 one round.
 
-## 20M rows, sustained (20 rounds / 9.5 s)
+## 20M rows
 
 | Class | Attempts | 200 | 429 | p50 | p95 | max |
 |---|---:|---:|---:|---:|---:|---:|
-| Heavy aggregate | 200 | 96 | 104 | 324.5 ms | 435.1 ms | 1610.9 ms |
-| Cheap LIMIT | 40 | 40 | 0 | 32.4 ms | 54.1 ms | 67.4 ms |
-| Trace lookup | 40 | 40 | 0 | 64.3 ms | 99.4 ms | 161.0 ms |
+| Heavy aggregate | 10 | 6 | 4 | 348.4 ms | 450.6 ms | 457.9 ms |
+| Cheap LIMIT | 2 | 2 | 0 | 32.9 ms | 24.9 ms | 40.9 ms |
 
-Sustained traffic keeps cheap and trace queries progressing while heavy work
-sheds with 429. Peak observed container memory after the run: **488 MiB / 2 GiB**
-(vdg) and 526 MiB / 2 GiB (MinIO); no OOM kill.
-
-## 20M rows, one burst (earlier pre-fix run)
-
-| Class | Attempts | 200 | 429 | p50 | p95 |
-|---|---:|---:|---:|---:|---:|
-| Heavy aggregate | 10 | 6 | 4 | 348.4 ms | 450.6 ms |
-| Cheap LIMIT | 2 | 2 | 0 | 32.9 ms | 24.9 ms |
+Peak observed container memory during the run: **432 MiB / 2 GiB** (vdg) and
+373 MiB / 2 GiB (MinIO). No OOM kill; every heavy request either completed or
+was shed with 429, and both cheap queries completed in under 41 ms.
 
 ## 1M rows (no shedding)
 

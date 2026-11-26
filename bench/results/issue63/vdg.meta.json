@@ -1,0 +1,14 @@
+{
+  "system": "vdg",
+  "image": "verdigris-bench:issue79-final",
+  "image_id": "sha256:9a5d372afb94390521e19c2134822202eb1611cddcb7f08ee046e2db2c641bd7",
+  "cpu_limit": 8,
+  "memory_limit": "vdg 3g + minio 3g",
+  "retained_bytes": 182690519,
+  "container_memory": "vdgbench-vdg=114.1MiB / 3GiB,vdgbench-minio=342MiB / 3GiB",
+  "minio_bucket_bytes": 19629957,
+  "minio_internal_bytes": 163289208,
+  "active_files": 3,
+  "retired_files": 0,
+  "total_gb": 0.018103238195180893
+}

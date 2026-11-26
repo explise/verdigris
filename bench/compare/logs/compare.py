@@ -21,6 +21,7 @@ Usage:
 """
 import argparse
 import concurrent.futures
+import datetime
 import http.client
 import json
 import math
@@ -59,6 +60,38 @@ WINDOW_MS = 50 * 60_000
 def iso_ms(ms: int) -> str:
     """RFC3339 with milliseconds, accepted by ClickHouse and VictoriaLogs."""
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms / 1000)) + f".{ms % 1000:03d}Z"
+
+
+def normalize_rows(rows):
+    """Map each engine's native field names to the common log-row contract."""
+    out = []
+    for r in rows:
+        r = dict(r)
+        if "_msg" in r and "message" not in r:
+            r["message"] = r.pop("_msg")
+        if "_time" in r and "ts" not in r:
+            r["ts"] = r.pop("_time")
+        out.append(r)
+    return out
+
+
+def bucket_ms(value) -> int:
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).replace("Z", "+00:00")
+    dt = datetime.datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def expected_buckets(rows: int):
+    buckets = {}
+    for i in range(rows):
+        bucket = (ts_for(i, rows) // 60_000) * 60_000
+        total, errors = buckets.get(bucket, (0, 0))
+        buckets[bucket] = (total + 1, errors + (1 if level_for(i) == "ERROR" else 0))
+    return buckets
 
 
 def level_for(i: int) -> str:
@@ -119,6 +152,10 @@ def record(i: int, rows: int, system: str) -> dict:
             "status": status_for(level),
             "message": msg,
             "trace_id": trace_id,
+            "attrs_json": json.dumps(
+                {"region": REGIONS[i % len(REGIONS)], "host": f"node-{i % 50:02d}"},
+                separators=(",", ":"),
+            ),
         }
     return {
         "_time": iso_ms(ts),
@@ -127,6 +164,10 @@ def record(i: int, rows: int, system: str) -> dict:
         "service": service,
         "status": status_for(level),
         "trace_id": trace_id,
+        "attrs_json": json.dumps(
+            {"region": REGIONS[i % len(REGIONS)], "host": f"node-{i % 50:02d}"},
+            separators=(",", ":"),
+        ),
     }
 
 
@@ -339,7 +380,8 @@ class ClickHouse(Backend):
                 service LowCardinality(String),
                 status Nullable(Int32),
                 message String,
-                trace_id String
+                trace_id String,
+                attrs_json String
             ) ENGINE = MergeTree ORDER BY (service, level, ts)""",
             self.auth_headers,
         )
@@ -388,7 +430,7 @@ class ClickHouse(Backend):
 
     def search_recent(self):
         return self._sql_json(
-            "SELECT ts, level, service, status, message, trace_id FROM bench "
+            "SELECT ts, level, service, status, message, trace_id, attrs_json FROM bench "
             "WHERE service = 'checkout' AND level = 'ERROR' "
             "ORDER BY ts DESC LIMIT 200"
         )
@@ -396,7 +438,7 @@ class ClickHouse(Backend):
     def trace_lookup(self, trace_id=None):
         trace_id = trace_id or self.args.trace_id
         return self._sql_json(
-            "SELECT ts, level, service, status, message, trace_id FROM bench "
+            "SELECT ts, level, service, status, message, trace_id, attrs_json FROM bench "
             f"WHERE trace_id = '{trace_id}' LIMIT 10"
         )
 
@@ -449,7 +491,7 @@ class VictoriaLogs(Backend):
     def search_recent(self):
         return self._query_rows(
             "service:checkout level:ERROR "
-            "| fields _time, level, service, status, message, trace_id "
+            "| fields _time, level, service, status, _msg, trace_id, attrs_json "
             "| sort by (_time) desc | limit 200"
         )
 
@@ -457,7 +499,7 @@ class VictoriaLogs(Backend):
         trace_id = trace_id or self.args.trace_id
         return self._query_rows(
             f'trace_id:="{trace_id}" '
-            "| fields _time, level, service, status, message, trace_id | limit 10"
+            "| fields _time, level, service, status, _msg, trace_id, attrs_json | limit 10"
         )
 
     def aggregate_minute(self):
@@ -586,21 +628,31 @@ def main():
         raise SystemExit(
             f"{args.system}: recent count {recent_count}, expected {expected_recent}"
         )
-    search_rows = backend.search_recent()
+    search_rows = normalize_rows(backend.search_recent())
     if len(search_rows) != min(200, expected_recent):
         raise SystemExit(
             f"{args.system}: search returned {len(search_rows)}, expected {min(200, expected_recent)}"
         )
-    trace_rows = backend.trace_lookup(args.trace_id)
+    for r in search_rows:
+        attrs = json.loads(r.get("attrs_json") or "{}")
+        if (
+            r.get("level") != "ERROR"
+            or r.get("service") != "checkout"
+            or "checkout" not in str(r.get("message", ""))
+            or attrs.get("region") not in REGIONS
+            or not str(attrs.get("host", "")).startswith("node-")
+        ):
+            raise SystemExit(f"{args.system}: unexpected search row: {r}")
+    trace_rows = normalize_rows(backend.trace_lookup(args.trace_id))
     if len(trace_rows) != 1:
         raise SystemExit(f"{args.system}: trace lookup returned {len(trace_rows)}, expected 1")
-    cross_rows = backend.trace_lookup(CROSS_TRACE)
+    cross_rows = normalize_rows(backend.trace_lookup(CROSS_TRACE))
     if len(cross_rows) != len(CROSS_TRACE_ROWS):
         raise SystemExit(
             f"{args.system}: cross-tier trace returned {len(cross_rows)}, "
             f"expected {len(CROSS_TRACE_ROWS)}"
         )
-    missing_rows = backend.trace_lookup(args.missing_trace_id)
+    missing_rows = normalize_rows(backend.trace_lookup(args.missing_trace_id))
     if missing_rows:
         raise SystemExit(
             f"{args.system}: missing trace returned {len(missing_rows)} rows, expected 0"
@@ -623,6 +675,20 @@ def main():
         raise SystemExit(
             f"{args.system}: aggregate total={total} errors={errors}, "
             f"expected {rows}/{expected_errors}"
+        )
+    want = expected_buckets(rows)
+    got = {
+        bucket_ms(r.get("bucket") or r.get("_time")): (
+            int(r["total"]),
+            int(r.get("errors", 0) or 0),
+        )
+        for r in buckets
+    }
+    if got != want:
+        bad = [(k, got.get(k), v) for k, v in want.items() if got.get(k) != v][:3]
+        raise SystemExit(
+            f"{args.system}: per-bucket mismatch (bucket, got, want): {bad}; "
+            f"got keys={list(got)[:2]} want keys={list(want)[:2]}"
         )
     print(
         f"{args.system}: equivalence OK (recent={recent_count}, "

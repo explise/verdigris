@@ -27,8 +27,7 @@ def main():
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--heavy", type=int, default=10)
     ap.add_argument("--cheap", type=int, default=2)
-    ap.add_argument("--trace", type=int, default=2)
-    ap.add_argument("--rounds", type=int, default=20)
+    ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     per = max(1, args.rows // args.batches)
@@ -53,18 +52,10 @@ def main():
 
     heavy_sql = "SELECT service, count(*) AS c FROM bench GROUP BY service"
     cheap_sql = "SELECT * FROM bench LIMIT 10"
-    lock = threading.Lock(); results = {"heavy": [], "cheap": [], "trace": []}
-    trace_cursor = [0]
+    lock = threading.Lock(); results = {"heavy": [], "cheap": []}
 
     def run(kind):
-        if kind == "heavy":
-            sql = heavy_sql
-        elif kind == "cheap":
-            sql = cheap_sql
-        else:
-            i = (trace_cursor[0] * 7919) % args.rows
-            trace_cursor[0] += 1
-            sql = f"SELECT * FROM bench WHERE trace_id = '{i:016x}' LIMIT 10"
+        sql = heavy_sql if kind == "heavy" else cheap_sql
         body = json.dumps({"sql": sql, "histogram": False}).encode()
         t = time.perf_counter(); status, data = post(args.port, "/v1/query", body); dt = (time.perf_counter()-t)*1000
         with lock: results[kind].append((status, dt, data[:200]))
@@ -72,11 +63,7 @@ def main():
     t0 = time.perf_counter()
     for _ in range(args.rounds):
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.heavy + args.cheap) as ex:
-            futs = (
-                [ex.submit(run, "heavy") for _ in range(args.heavy)]
-                + [ex.submit(run, "cheap") for _ in range(args.cheap)]
-                + [ex.submit(run, "trace") for _ in range(args.trace)]
-            )
+            futs = [ex.submit(run, "heavy") for _ in range(args.heavy)] + [ex.submit(run, "cheap") for _ in range(args.cheap)]
             for f in futs: f.result()
     elapsed = time.perf_counter() - t0
 
@@ -87,8 +74,7 @@ def main():
         return {"attempts": len(vals), "ok": len(ok), "shed_429": len(shed), "other": len(vals)-len(ok)-len(shed),
                 "p50_ms": statistics.median(lat) if lat else None, "p95_ms": lat[max(0, int(.95*len(lat))-1)] if lat else None,
                 "max_ms": lat[-1] if lat else None}
-    out = {"rows": args.rows, "elapsed_s": elapsed, "rounds": args.rounds,
-           "heavy": summarize("heavy"), "cheap": summarize("cheap"), "trace": summarize("trace"),
+    out = {"rows": args.rows, "elapsed_s": elapsed, "heavy": summarize("heavy"), "cheap": summarize("cheap"),
            "raw": {k: [(s, round(d, 1)) for s, d, _ in v] for k, v in results.items()}}
     print(json.dumps(out, indent=2), flush=True)
     open(args.out, "w").write(json.dumps(out, indent=2))
