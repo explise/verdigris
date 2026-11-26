@@ -31,6 +31,16 @@ export default function Logs() {
     () => ({ a: api(), q: submitted() }),
     ({ a, q }) => a.queryLogs({ sql: q.sql, tiers: q.tiers }),
   );
+  // The activity strip is a separate aggregation request tied to the submitted
+  // query/tiers/workspace. Solid's keyed resource discards an older response when
+  // the key changes, so a late chart cannot overwrite the current query's chart.
+  const [activity, { refetch: refetchActivity }] = createResource(
+    () => ({ a: api(), q: submitted() }),
+    ({ a, q }) => a.queryActivity({ sql: q.sql, tiers: q.tiers }),
+  );
+  const activityTotal = createMemo(() =>
+    (activity()?.histogram ?? []).reduce((n, b) => n + (b.total || 0), 0),
+  );
   const [est] = createResource(tiers, (t) => api().estimate(t));
 
   const execute = () => setSubmitted({ sql: sql(), tiers: tiers() });
@@ -86,15 +96,30 @@ export default function Logs() {
         </div>
 
         <div class="histo">
-          <For each={query()?.histogram ?? []}>{(b) => {
-            // normalize against the tallest bucket so bars are correct at any data scale
-            const max = Math.max(1, ...(query()?.histogram ?? []).map((x) => x.total || 0));
-            return (
-              <div class="bar" style={{ height: `${Math.max(3, Math.min(100, (b.total / max) * 100))}%` }} title={`${b.total} events · ${b.errors} errors`}>
-                <div class="err" style={{ height: `${b.total ? (b.errors / b.total) * 100 : 0}%` }} />
+          <Show
+            when={!activity.error}
+            fallback={
+              <div class="histo-state">
+                activity unavailable{" "}
+                <button type="button" class="btn sm" onClick={() => refetchActivity()}>Retry</button>
               </div>
-            );
-          }}</For>
+            }
+          >
+            <Show when={!activity.loading} fallback={<div class="histo-state">loading activity…</div>}>
+              <For each={activity()?.histogram ?? []}>{(b) => {
+                // normalize against the tallest bucket so bars are correct at any data scale
+                const max = Math.max(1, ...(activity()?.histogram ?? []).map((x) => x.total || 0));
+                return (
+                  <div class="bar" style={{ height: `${Math.max(3, Math.min(100, (b.total / max) * 100))}%` }} title={`${b.total} events · ${b.errors} errors`}>
+                    <div class="err" style={{ height: `${b.total ? (b.errors / b.total) * 100 : 0}%` }} />
+                  </div>
+                );
+              }}</For>
+            </Show>
+          </Show>
+          <Show when={!activity.loading && !activity.error}>
+            <span class="histo-total">{activityTotal().toLocaleString()} events in chart range</span>
+          </Show>
         </div>
       </div>
 
@@ -115,7 +140,7 @@ export default function Logs() {
       </div>
 
       <div class="logs-foot">
-        <span class="count"><b>{query()?.stats.events.toLocaleString() ?? "…"}</b> events</span>
+        <span class="count"><b>{query()?.stats.events.toLocaleString() ?? "…"}</b> rows</span>
         <span class="sep">·</span><span>queried in place · no rehydration</span>
         <span class="sep">·</span>
         <span>scanned {query()?.stats.files ?? "…"} files in <b class="mono" style={{ color: "var(--ink)" }}>{query()?.stats.elapsedMs ?? "…"}ms</b></span>

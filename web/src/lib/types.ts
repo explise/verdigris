@@ -35,6 +35,12 @@ export interface QueryStats {
   // means something". `scannedBytes` is per-file and does not reflect the skip.
   rowGroupsScanned?: number;
   rowGroupsTotal?: number;
+  /** False when the caller asked for rows only: `events` is the row count. */
+  eventsExact?: boolean;
+  manifestMs?: number;
+  planMs?: number;
+  auditMs?: number;
+  totalMs?: number;
 }
 
 export interface HistogramBucket { total: number; errors: number; }
@@ -43,6 +49,12 @@ export interface QueryResult {
   rows: LogRow[];
   stats: QueryStats;
   histogram: HistogramBucket[];
+}
+
+/** `/v1/query/activity`: the chart strip only, with its own aggregate total. */
+export interface ActivityResult {
+  histogram: HistogramBucket[];
+  stats: { events: number; files: number; elapsedMs: number; engine: string };
 }
 
 export interface EstimateResult {
