@@ -1,0 +1,53 @@
+{
+  "system": "vdg",
+  "corpus": {
+    "rows": 1000000,
+    "raw_bytes": 261301254,
+    "base_ts_ms": 1795712340000,
+    "window_ms": 3000000,
+    "trace_id": "000000000007a120"
+  },
+  "ingest": {
+    "elapsed_s": 3.159099723001418,
+    "rows_per_s": 316545.87942222774,
+    "mib_per_s": 78.88206028133479,
+    "visibility_s": 0.06230369499826338
+  },
+  "equivalence": {
+    "recent_count": 5883,
+    "search_rows": 200,
+    "trace_rows": 1,
+    "buckets": 50,
+    "total": 1000000,
+    "errors": 58824
+  },
+  "queries": {
+    "recent_service_search": {
+      "samples": 10,
+      "min_ms": 34.69307599880267,
+      "p50_ms": 36.40342899961979,
+      "p95_ms": 38.84773799654795,
+      "p99_ms": 38.84773799654795,
+      "max_ms": 38.84773799654795,
+      "result_rows": 200
+    },
+    "trace_lookup": {
+      "samples": 10,
+      "min_ms": 30.8487439979217,
+      "p50_ms": 31.62855900154682,
+      "p95_ms": 32.78474599937908,
+      "p99_ms": 32.78474599937908,
+      "max_ms": 32.78474599937908,
+      "result_rows": 1
+    },
+    "minute_aggregation": {
+      "samples": 10,
+      "min_ms": 34.923378996609244,
+      "p50_ms": 38.144803496834356,
+      "p95_ms": 39.62057699391153,
+      "p99_ms": 39.62057699391153,
+      "max_ms": 39.62057699391153,
+      "result_rows": 50
+    }
+  }
+}

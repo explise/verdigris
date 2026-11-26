@@ -1,0 +1,8 @@
+{
+  "system": "victorialogs",
+  "image": "victoriametrics/victoria-logs@sha256:ee4e820cac3721f5f5d91641b950c22439593adc4224f9655e5333d5a84c1dfe",
+  "cpu_limit": 8,
+  "memory_limit": "6g",
+  "retained_bytes": 19608894,
+  "container_memory": "vlbench=236.5MiB / 6GiB"
+}
