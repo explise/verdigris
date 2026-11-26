@@ -307,6 +307,9 @@ body {
 .histo .bar { flex: 1; background: var(--copper-deep); border-radius: 2px 2px 0 0; min-height: 2px; position: relative; transition: background .12s; }
 .histo .bar .err { position: absolute; bottom: 0; left: 0; right: 0; background: var(--error); border-radius: 2px 2px 0 0; }
 .histo .bar:hover { background: var(--copper); }
+.histo { position: relative; }
+.histo-state { flex: 1; align-self: center; text-align: center; color: var(--muted); font-size: 12px; }
+.histo-total { position: absolute; right: 4px; top: 2px; font-size: 10px; color: var(--muted); pointer-events: none; }
 
 /* log rows */
 .logwrap { flex: 1; min-height: 0; overflow: auto; }

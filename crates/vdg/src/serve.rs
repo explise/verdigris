@@ -1285,6 +1285,7 @@ pub async fn serve_with_clock(
     if role.serves_reads() {
         api = api
             .route("/v1/query", post(h_query))
+            .route("/v1/query/activity", post(h_activity))
             .route("/v1/query/estimate", post(h_estimate))
             .route("/v1/metrics", get(h_metrics))
             .route("/v1/alerts", get(h_alerts).post(h_alert_create))
@@ -1926,6 +1927,71 @@ async fn h_query(
                 .into_response(),
         )
     }
+}
+
+/// `POST /v1/query/activity` — the severity histogram only.
+///
+/// The browser loads rows first (`histogram:false`) and requests this strip
+/// separately, so the row response pays for one scan and the chart pays for only
+/// its aggregation. It reuses the same scan plan, tier selection and file set as
+/// `/v1/query` and `/v1/query/estimate`.
+#[derive(Deserialize)]
+struct ActivityReq {
+    sql: String,
+    #[serde(default)]
+    tiers: Vec<String>,
+}
+
+async fn h_activity(State(st): State<AppState>, Json(req): Json<ActivityReq>) -> ApiResult {
+    let t0 = st.clock.monotonic_micros();
+    let preds = verdigris_core::search::stat_predicates(&req.sql);
+    let (s, m) = manifest_for(&st, &preds).await?;
+    let tiers: Vec<Tier> = req.tiers.iter().filter_map(|t| parse_tier(t)).collect();
+    let plan = verdigris_core::scan::plan_scan(
+        &m,
+        &req.sql,
+        st.table.as_str(),
+        &tiers,
+        st.clock.now_millis() as i64,
+        verdigris_core::scan::DEFAULT_QUERY_LIMIT,
+    )
+    .map_err(AppError::bad_request)?;
+
+    let files: Vec<IndexedFile> = plan
+        .files
+        .iter()
+        .map(|f| IndexedFile::plan(f, &preds))
+        .collect();
+    let histogram = if files.is_empty() {
+        Vec::new()
+    } else {
+        let (min_ts, max_ts) = time_range(&m);
+        histogram(
+            &s,
+            st.table.as_str(),
+            &files,
+            min_ts,
+            max_ts,
+            &limits(&st),
+            &st.query_cache,
+        )
+        .await
+        .unwrap_or_default()
+    };
+    let events: i64 = histogram
+        .iter()
+        .filter_map(|b| b.get("total").and_then(Value::as_i64))
+        .sum();
+    let elapsed_ms = st.clock.monotonic_micros().saturating_sub(t0) / 1_000;
+    Ok(Json(json!({
+        "histogram": histogram,
+        "stats": {
+            "events": events,
+            "files": files.len(),
+            "elapsedMs": elapsed_ms,
+            "engine": "datafusion",
+        }
+    })))
 }
 
 /// Build a `/v1/query` response in the requested wire. Arrow: the rows are the
