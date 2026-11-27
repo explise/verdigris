@@ -8,7 +8,7 @@ import statistics
 import time
 from pathlib import Path
 
-from compare import CROSS_TRACE, Vdg
+from compare import CROSS_TRACE, RECENT_SEARCH_SQL, Vdg, expected_search, validate_search
 
 SHAPES = ("trace_hit", "trace_miss", "trace_cross_tier", "recent_search", "minute_aggregation")
 
@@ -85,6 +85,51 @@ def summarize(samples):
     return summary
 
 
+def compare_search(backend, corpus, iterations, warmup):
+    """Compare equivalent SQL and search requests on one settled corpus."""
+    inputs = (RECENT_SEARCH_SQL, "service:checkout level:ERROR")
+    expected = expected_search(corpus["rows"])
+
+    def estimates():
+        quotes = []
+        for sql in inputs:
+            args = json.dumps({"sql": sql, "tiers": []}).encode()
+            status, _, data = backend.client.request(
+                "POST", "/v1/query/estimate", args, {"content-type": "application/json"}
+            )
+            if status != 200:
+                raise RuntimeError(f"search estimate HTTP {status}: {data[:300]!r}")
+            quotes.append(json.loads(data))
+        return quotes
+
+    def query(index, mode):
+        backend.profile_mode = mode
+        start = time.perf_counter_ns()
+        rows = backend._query(inputs[index])
+        elapsed_ms = (time.perf_counter_ns() - start) / 1e6
+        validate_search(rows, expected)
+        stats = backend.last_stats
+        quote = quotes[index]
+        if (stats["files"], stats["scannedBytes"]) != (quote["filesTouched"], quote["scanBytes"]):
+            raise RuntimeError("search estimate and execution disagree on file count or bytes")
+        return {"elapsed_ms": elapsed_ms, "rows": len(rows), "profile": backend.last_profile}
+
+    quotes = estimates()
+    samples = [[], []]
+    for i in range(warmup + iterations):
+        for index in (0, 1) if i % 2 == 0 else (1, 0):
+            result = query(index, "1")
+            if i >= warmup:
+                samples[index].append(result)
+    comparison = {
+        name: {"estimate": quotes[i], "samples": summarize(samples[i]), "plan": query(i, "plan")}
+        for i, name in enumerate(("sql", "dsl"))
+    }
+    if estimates() != quotes:
+        raise RuntimeError("search estimates changed during the comparison")
+    return comparison
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -93,7 +138,9 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--first", choices=SHAPES)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--first", choices=SHAPES)
+    mode.add_argument("--compare-search", action="store_true")
     args = parser.parse_args()
     if args.iterations < 1 or args.warmup < 0:
         parser.error("iterations must be positive and warmup cannot be negative")
@@ -102,7 +149,11 @@ def main():
     backend = Vdg(args)
     out = {"corpus": corpus, "mode": "first_after_restart" if args.first else "warm", "queries": {}}
     try:
-        if args.first:
+        if args.compare_search:
+            out.pop("queries")
+            out["mode"] = "search_comparison"
+            out["comparison"] = compare_search(backend, corpus, args.iterations, args.warmup)
+        elif args.first:
             out["queries"][args.first] = run_one(backend, args.first, 0, corpus, "1")
         else:
             for shape in SHAPES:
