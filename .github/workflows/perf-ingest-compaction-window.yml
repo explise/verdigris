@@ -1,0 +1,47 @@
+name: Verdigris ingest compaction-window control
+
+on:
+  push:
+    branches: [codex/perf-ingest-compaction-window]
+
+permissions:
+  contents: read
+
+jobs:
+  sustained:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the release node and streaming driver
+        run: |
+          docker build -f bench/Dockerfile.vdg -t verdigris-compaction-window:local .
+          cargo build --locked --release --manifest-path bench/loadgen/Cargo.toml
+      - name: Compare normal compaction and deferred compaction with bounded drain
+        env:
+          VDG_IMAGE: verdigris-compaction-window:local
+          VDG_CPUS: '3'
+          MINIO_CPUS: '1'
+          INGEST_GROUP_SIZE: '1'
+          PROFILE_INGEST_PHASES: '1'
+          INGEST_CORPUS_TS_MS: '1795764240000'
+          ROOT: ${{ runner.temp }}/verdigris-compaction-window
+        run: |
+          status=0
+          for arm in normal deferred; do
+            LOADGEN="$PWD/bench/loadgen/target/release/verdigris-loadgen" OUT="$ROOT/$arm" \
+              COMPACTION_CONTROL="$arm" bench/loadgen/run-sustained.sh || status=1
+          done
+          if [[ "$status" == 0 ]]; then
+            python3 -B bench/loadgen/check-compaction-window.py "$ROOT" | tee "$ROOT/decision.json"
+          fi
+          exit "$status"
+      - name: Upload durability, storage and compaction samples
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-compaction-window
+          path: ${{ runner.temp }}/verdigris-compaction-window
+          retention-days: 7

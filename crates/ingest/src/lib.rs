@@ -355,6 +355,7 @@ impl Ingestor {
                 .await
                 .with_context(|| format!("writing {path}"))?;
         }
+        tracing::debug!(target: "vdg_bench_ingest_io", io = "ingest_put", bytes = len);
         Ok(DataFile {
             path,
             bytes: len,
@@ -601,6 +602,7 @@ impl Ingestor {
                     // row group, NOT the bin's whole decompressed size — see
                     // `MergeWriter` (issue #13).
                     let mut w = encode::MergeWriter::new(schema::log_schema())?;
+                    let mut bytes_read = 0u64;
                     for f in &bin {
                         let bytes = self
                             .store
@@ -609,6 +611,7 @@ impl Ingestor {
                             .with_context(|| format!("reading {} for compaction", f.path))?
                             .bytes()
                             .await?;
+                        bytes_read += bytes.len() as u64;
                         encode::stream_parquet_into(bytes, &mut w)?;
                     }
                     let in_progress = w.in_progress_size();
@@ -634,6 +637,8 @@ impl Ingestor {
                         .await
                         .with_context(|| format!("writing compacted {path}"))?;
 
+                    tracing::debug!(target: "vdg_bench_ingest_io", io = "compact_get", bytes = bytes_read);
+                    tracing::debug!(target: "vdg_bench_ingest_io", io = "compact_put", bytes = len);
                     tracing::debug!(
                         tier = tier.as_str(),
                         files = bin.len(),

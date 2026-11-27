@@ -400,6 +400,10 @@ async fn run_compact(cfg: &Config, table: &str, target_mb: u64) -> anyhow::Resul
     let manifest = ingestor.load_manifest().await?;
     let after = manifest.files.len();
     println!(
+        "pending_merge_files={}",
+        verdigris_ingest::pending_compaction_total(&manifest, target_mb * 1024 * 1024),
+    );
+    println!(
         "compaction: '{table}' {before} -> {after} files (target {target_mb} MiB); \
          {} retired file(s) pending reclamation",
         manifest.retired.len()

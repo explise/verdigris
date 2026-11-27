@@ -11,6 +11,13 @@ if [[ ! "$vdg_cpus" =~ ^[1-9][0-9]*$ || ! "$minio_cpus" =~ ^[1-9][0-9]*$ ]]; the
   exit 2
 fi
 query_cores=$(( vdg_cpus < 4 ? vdg_cpus : 4 ))
+compaction_control=${COMPACTION_CONTROL:-}
+case "$compaction_control" in
+  ''|normal|deferred) ;;
+  *) echo 'COMPACTION_CONTROL must be normal or deferred' >&2; exit 2 ;;
+esac
+rust_log=warn
+if [[ -n "$compaction_control" ]]; then rust_log=warn,vdg_bench_ingest_io=debug; fi
 out=$(realpath -m "${OUT:-$(mktemp -d)}")
 mkdir -p "$out"
 minio_image=cgr.dev/chainguard/minio@sha256:634c989a2f1029162fc2676c263caa181213b9410449968532f750a6fb77532d
@@ -21,7 +28,9 @@ net=
 vol=
 minio=
 vdg=
+drain_container=
 cleanup() {
+  if [[ -n "$drain_container" ]]; then docker rm -f "$drain_container" >/dev/null 2>&1 || true; fi
   if [[ -n "$vdg" ]]; then
     docker inspect --format 'OOMKilled={{.State.OOMKilled}} restarts={{.RestartCount}}' "$vdg" > "$out/vdg-state.txt" || true
     docker logs "$vdg" > "$out/vdg.log" 2>&1 || true
@@ -62,9 +71,12 @@ fi
 if [[ -n "${INGEST_GROUP_SIZE:-}" ]]; then
   sed -i "/^\[ingest\]$/a commit_group_size = $INGEST_GROUP_SIZE" "$out/config.toml"
 fi
+if [[ "$compaction_control" == deferred ]]; then
+  sed -i '/^\[compaction\]/,$ s/^enabled = true$/enabled = false/' "$out/config.toml"
+fi
 chmod 644 "$out/config.toml"
 vdg=$(docker run -d --pull never --network "$net" --cpus="$vdg_cpus" --memory=4g -p 127.0.0.1::8080 \
-  -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS="$vdg_cpus" -e RUST_LOG=warn \
+  -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS="$vdg_cpus" -e RUST_LOG="$rust_log" \
   --mount "type=bind,src=$out/config.toml,dst=/app/config/bench.toml,readonly" \
   "$VDG_IMAGE" serve --port 8080 --table logs --role all)
 wait_ready() {
@@ -91,6 +103,7 @@ capture_phases
   echo "minio_image=$minio_image"
   echo "budget=vdg ${vdg_cpus} CPU / 4 GiB, disk-backed MinIO ${minio_cpus} CPU / 2 GiB"
   echo "driver=shared host"
+  echo "compaction_control=$compaction_control"
   uname -srm
   lscpu
 } > "$out/machine.txt"
@@ -115,9 +128,55 @@ if [[ "${PROFILE_INGEST_PHASES:-0}" == 1 ]]; then
   grep -qE '^verdigris_ingest_phase_observations_total\{phase="manifest_cas"\} [1-9][0-9]*$' "$out/phases-final.prom"
 fi
 python3 -B bench/loadgen/check-sustained.py snapshot --url "$url" --table logs --out "$out/before.json"
-docker kill --signal KILL "$vdg" >/dev/null
+drain_status=0
+if [[ -n "$compaction_control" ]]; then
+  docker stop "$vdg" >/dev/null
+  docker logs "$vdg" > "$out/online.log" 2>&1
+  mc_run stat --json local/verdigris/logs/_metadata/manifest.json > "$out/manifest-before-drain.json"
+  docker exec "$minio" du -sb /data > "$out/volume-before-drain.txt"
+
+  drain_container="$nonce-drain"
+  target_mib=$(sed -n 's/^target_mib = //p' "$out/config.toml")
+  drain_start=$SECONDS
+  pending=1
+  while (( pending > 0 )); do
+    remaining=$((600 - (SECONDS - drain_start)))
+    if (( remaining <= 0 )); then drain_status=1; break; fi
+    if ! timeout --kill-after=5s "${remaining}s" docker run --rm --pull never \
+        --name "$drain_container" --network "$net" --cpus="$vdg_cpus" --memory=4g \
+        -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS="$vdg_cpus" \
+        -e RUST_LOG="$rust_log" \
+        --mount "type=bind,src=$out/config.toml,dst=/app/config/bench.toml,readonly" \
+        "$VDG_IMAGE" compact --table logs --target-mb "$target_mib" \
+        2>&1 | tee -a "$out/drain.log" | sed -n 's/^pending_merge_files=//p' > "$out/drain-pending.txt"; then
+      drain_status=1
+      break
+    fi
+    pending=$(cat "$out/drain-pending.txt")
+    if [[ ! "$pending" =~ ^[0-9]+$ ]]; then drain_status=1; break; fi
+  done
+  elapsed=$((SECONDS - drain_start))
+  printf '{"elapsed_s":%s,"completed":%s}\n' "$elapsed" \
+    "$([[ "$drain_status" == 0 ]] && echo true || echo false)" > "$out/drain.json"
+  docker rm -f "$drain_container" >/dev/null 2>&1 || true
+  drain_container=
+  mc_run stat --json local/verdigris/logs/_metadata/manifest.json > "$out/manifest-after-drain.json"
+  docker exec "$minio" du -sb /data > "$out/volume-after-drain.txt"
+else
+  docker kill --signal KILL "$vdg" >/dev/null
+fi
 docker start "$vdg" >/dev/null
 wait_ready
+if [[ -n "$compaction_control" ]]; then
+  docker kill --signal KILL "$vdg" >/dev/null
+  docker start "$vdg" >/dev/null
+  wait_ready
+fi
 python3 -B bench/loadgen/check-sustained.py snapshot --url "$url" --table logs --out "$out/after.json"
 python3 -B bench/loadgen/check-sustained.py verify --run "$out/run.json" --before "$out/before.json" \
   --after "$out/after.json" --out "$out/recovery.json"
+
+if (( drain_status != 0 )); then
+  echo "compaction drain did not finish within its bound" >&2
+  exit "$drain_status"
+fi
