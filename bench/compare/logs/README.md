@@ -13,7 +13,8 @@ Useful knobs:
 
 ```sh
 ROWS=200000 ITERATIONS=5 SYSTEMS="vdg clickhouse" bench/compare/logs/run.sh
-VDG_SKIP_BUILD=1 bench/compare/logs/run.sh      # reuse a built verdigris-bench image
+VDG_SKIP_BUILD=1 VDG_IMAGE=verdigris-bench:<tag> bench/compare/logs/run.sh
+RESTART=1 bench/compare/logs/run.sh             # also restart once per first-query shape
 ```
 
 Results land in `bench/results/compare-logs/` (`<system>.json`,
@@ -40,9 +41,10 @@ exit.
   … FINAL`; Verdigris runs its background compaction until `/v1/metrics`
   reports `pendingFiles == 0`; VictoriaLogs is given a fixed settle window.
 - **Equivalence is a gate, not a hope.** Before timing, each system must return
-  the same exact recent-match count, the same 200-row search page size, exactly
-  one row for the middle trace id, and the same total/error counts across the
-  same number of one-minute buckets. A mismatch exits nonzero.
+  the same exact recent-match count, the same 200-row search page in newest-first
+  order, exactly one row for the trace id with the same field/attribute values,
+  exactly three cross-tier rows, zero rows for the missing id, and the same
+  total/error count for every one-minute bucket. A mismatch exits nonzero.
 - **Latency** is one warm connection per backend, `WARMUP` warmups then
   `ITERATIONS` measured requests; p50/p95/p99 use nearest-rank percentiles.
 
@@ -50,69 +52,33 @@ exit.
 
 | Shape | Verdigris | ClickHouse | VictoriaLogs |
 |---|---|---|---|
-| Recent service search | `service:checkout level:error \| last 1h` (the product DSL) | `WHERE service='checkout' AND level='ERROR' ORDER BY ts DESC LIMIT 200` | `service:checkout level:ERROR \| sort by (_time) desc \| limit 200` |
+| Recent service search | `WHERE service='checkout' AND level='ERROR' ORDER BY ts DESC LIMIT 200` | same predicate/order | `service:checkout level:ERROR \| sort by (_time) desc \| limit 200` |
 | Trace lookup | `trace_id:<id>` | `WHERE trace_id='<id>'` | `trace_id:="<id>"` |
 | Minute aggregation | `date_bin(INTERVAL '60 seconds', …)` + `count(*) FILTER` | `toStartOfInterval(ts, INTERVAL 60 SECOND)` + `countIf` | `stats by (_time:1m) count() total, count() if (level:ERROR) errors` |
 
-The Verdigris search uses its search DSL rather than raw SQL because that is the
-path the Logs explorer uses (and the path that applies file-level
-`service`/`level` pruning). The aggregation is SQL on all three because the DSL
-does not express it.
+All three search queries use the same predicate and newest-first order. Verdigris
+uses SQL for this comparison so a relative `last 1h` cannot drift between
+separately started engine processes; the aggregation is SQL on all three.
 
 The trace workload rotates through a fixed set of real IDs spread across the
 corpus, and also checks a missing ID and one ID deliberately written to a row in
-each tier. Verdigris additionally checks each tier independently. Raw per-request
-timings and the shared metadata-cache hit delta are recorded in the JSON for
-issue #70; see [`bench/results/issue70/`](../../results/issue70/README.md).
+each tier. Verdigris additionally checks each tier independently. Rows carry the
+same `attrs_json` values on all three systems, and every one-minute bucket's
+total/error counts are validated against the generator (not just the sums).
+Raw per-request timings and the shared metadata-cache hit delta are recorded in
+the JSON. See [`bench/results/issue63/`](../../results/issue63/README.md) for the
+normalized three-engine run and [`bench/results/issue70/`](../../results/issue70/README.md)
+for the trace-latency work.
 
-## Measured 2026-11-26
+## Measured 2026-11-27
 
-Host: 16 vCPU / 14 GiB, Docker 29.9; one system at a time. 1,000,000 events,
-249.2 MiB Verdigris wire bytes (208 MiB for the flat ClickHouse/VictoriaLogs
-wire encoding), 50 one-minute buckets. Full machine/config record is written to
-`bench/results/compare-logs/machine.txt`.
+The current run is in [`bench/results/issue63/`](../../results/issue63/README.md):
+three-engine, 100 warm samples per shape, with per-query restart samples and
+storage decomposed into bucket bytes vs MinIO internals. The earlier
+2026-11-26 numbers in history used 10 samples and a relative search window; do
+not mix the two tables.
 
-| System | Retained after settle | Memory after queries | Ingest acked | Visible after |
-|---|---:|---:|---:|---:|
-| **Verdigris + MinIO** | 165.0 MiB | 375 MiB | 317k rows/s (79 MiB/s) | 0.1 s |
-| **ClickHouse** | 95.2 MiB | 231 MiB | 210k rows/s (44 MiB/s) | 0.0 s |
-| **VictoriaLogs** | 18.7 MiB | 237 MiB | 945k rows/s (197 MiB/s) | 2.0 s |
-
-Query latency, p50 / p95 (ms), 10 samples after warmup:
-
-| System | Service search | Trace lookup | 1-minute aggregation |
-|---|---:|---:|---:|
-| **Verdigris + MinIO** | 36.4 / 38.8 | 31.6 / 32.8 | 38.1 / 39.6 |
-| **ClickHouse** | 4.1 / 5.3 | 2.3 / 3.1 | 6.8 / 7.5 |
-| **VictoriaLogs** | 4.6 / 5.0 | 0.7 / 0.7 | 6.2 / 7.3 |
-
-All three returned the same `5,883` recent matches, the same 200-row page, one
-row for the trace id, and the same `1,000,000 / 58,824` total/error split across
-50 buckets.
-
-What the Verdigris numbers are actually measuring: half of its 8-CPU budget is
-the MinIO object store, so query execution gets 4 cores, and every scanned file
-crosses an HTTP object-store boundary instead of a local page cache. The
-30–40 ms band is the same for all three shapes, which points at fixed per-query
-planning/object-store overhead rather than bytes scanned. ClickHouse and
-VictoriaLogs read local files with all 8 cores. This is the architectural trade the product makes for data sovereignty
-and no rehydration, and the comparison should be read that way — not as a
-like-for-like CPU benchmark of three identical storage models.
-
-Ingest rates are also not comparable across acknowledgement policies:
-Verdigris acknowledges after the Parquet PUT and manifest CAS commit;
-VictoriaLogs acknowledged the same corpus ~2 s before it became fully queryable.
-The visibility column exists so that difference stays visible.
-
-## What this does and does not prove
-
-It proves relative query latency for three common log-and-archive shapes on one
-host, with the corpus and result cardinalities held constant. It does **not**
-prove performance at billion-row scale, across cold S3/Glacier tiers, or under
-concurrent query load. All three deployments use local disk; Verdigris's bytes
-go through MinIO's S3 API, which is slow relative to real S3 but is charged to
-its budget as the production deployment would be.
-
-The retained-bytes column is the on-disk footprint after settling, not S3
-storage-class charges. A cold-storage comparison needs a lifecycle/restore run
-(see `docs/cost.md`), not this harness.
+Host: 16 vCPU / 14 GiB, Docker 29.9; one system at a time. Verdigris + MinIO is
+charged 8 CPU / 6 GiB total, same as each single-container competitor. Raw
+machine/config metadata, image IDs and every request sample are in the result
+directory.

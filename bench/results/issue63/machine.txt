@@ -1,0 +1,12 @@
+date_utc=2026-11-27T07:04:59Z
+host_cpus=16
+host_mem_kb=15587268
+kernel=7.0.0-38-generic
+docker=29.9.0
+git_commit=cfe5146
+git_dirty=0
+rows=1000000 batch_rows=10000 threads=4 iterations=100 warmup=5
+corpus_ts_ms=1795759740000
+run_id=20261127070459-228124
+vdg_image=verdigris-bench:perf81-cfe5146
+budget=8cpu/6GiB per system; vdg=4cpu/3GiB + minio=4cpu/3GiB

@@ -21,6 +21,7 @@ Usage:
 """
 import argparse
 import concurrent.futures
+import datetime
 import http.client
 import json
 import math
@@ -52,13 +53,96 @@ CROSS_TRACE_ROWS = (0, 1, 3)  # ERROR/hot, INFO/warm, DEBUG/cold
 # The corpus sits wholly inside "the last hour" so a `| last 1h` DSL query is
 # equivalent to an absolute [start, end) filter on the other two systems.
 NOW_MS = int(time.time() * 1_000)
-BASE_TS = (NOW_MS - 55 * 60_000) // 60_000 * 60_000
+# One run computes this once and exports it to every backend process, so all
+# three engines ingest the exact same timestamps. A per-process default keeps
+# the standalone invocation useful.
+BASE_TS = int(
+    os.environ.get(
+        "CORPUS_TS_MS", str((NOW_MS - 55 * 60_000) // 60_000 * 60_000)
+    )
+)
 WINDOW_MS = 50 * 60_000
 
 
 def iso_ms(ms: int) -> str:
     """RFC3339 with milliseconds, accepted by ClickHouse and VictoriaLogs."""
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms / 1000)) + f".{ms % 1000:03d}Z"
+
+
+def normalize_rows(rows):
+    """Map each engine's native field names to the common log-row contract."""
+    out = []
+    for r in rows:
+        r = dict(r)
+        if "_msg" in r and "message" not in r:
+            r["message"] = r.pop("_msg")
+        if "_time" in r and "ts" not in r:
+            r["ts"] = r.pop("_time")
+        out.append(r)
+    return out
+
+
+def bucket_ms(value) -> int:
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).replace("Z", "+00:00")
+    dt = datetime.datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def row_ts_ms(row):
+    value = row.get("ts", row.get("_time"))
+    if value is None:
+        raise SystemExit(f"row has no timestamp: {row}")
+    return bucket_ms(value)
+
+
+def expected_trace(trace_id: str, rows: int):
+    index = int(trace_id, 16)
+    if not 0 <= index < rows:
+        return None
+    level = level_for(index)
+    service = service_for(index)
+    return {
+        "level": level,
+        "service": service,
+        "message": message_for(index, level, service),
+        "trace_id": CROSS_TRACE if index in CROSS_TRACE_ROWS else f"{index:016x}",
+        "attrs": {
+            "region": REGIONS[index % len(REGIONS)],
+            "host": f"node-{index % 50:02d}",
+        },
+    }
+
+
+def validate_trace(trace_id: str, got, rows: int):
+    expected = expected_trace(trace_id, rows)
+    if expected is None:
+        return
+    if len(got) != 1:
+        raise SystemExit(f"trace {trace_id} returned {len(got)} rows, expected 1")
+    row = got[0]
+    for field in ("level", "service", "message", "trace_id"):
+        if str(row.get(field)) != str(expected.get(field)):
+            raise SystemExit(
+                f"trace {trace_id} field {field}={row.get(field)!r}, "
+                f"expected {expected.get(field)!r}"
+            )
+    attrs = json.loads(row.get("attrs_json") or "{}")
+    want_attrs = expected["attrs"]
+    if attrs != want_attrs:
+        raise SystemExit(f"trace {trace_id} attrs={attrs}, expected {want_attrs}")
+
+
+def expected_buckets(rows: int):
+    buckets = {}
+    for i in range(rows):
+        bucket = (ts_for(i, rows) // 60_000) * 60_000
+        total, errors = buckets.get(bucket, (0, 0))
+        buckets[bucket] = (total + 1, errors + (1 if level_for(i) == "ERROR" else 0))
+    return buckets
 
 
 def level_for(i: int) -> str:
@@ -119,6 +203,10 @@ def record(i: int, rows: int, system: str) -> dict:
             "status": status_for(level),
             "message": msg,
             "trace_id": trace_id,
+            "attrs_json": json.dumps(
+                {"region": REGIONS[i % len(REGIONS)], "host": f"node-{i % 50:02d}"},
+                separators=(",", ":"),
+            ),
         }
     return {
         "_time": iso_ms(ts),
@@ -127,6 +215,10 @@ def record(i: int, rows: int, system: str) -> dict:
         "service": service,
         "status": status_for(level),
         "trace_id": trace_id,
+        "attrs_json": json.dumps(
+            {"region": REGIONS[i % len(REGIONS)], "host": f"node-{i % 50:02d}"},
+            separators=(",", ":"),
+        ),
     }
 
 
@@ -235,11 +327,9 @@ class Vdg(Backend):
             raise RuntimeError(f"vdg ingest {status}: {data[:300]!r}")
         return int(json.loads(data)["ingested"])
 
-    def _query(self, sql: str):
-        body = json.dumps({"sql": sql, "tiers": [], "histogram": False}).encode()
-        status, _, data = self.client.request(
-            "POST", "/v1/query", body, {"content-type": "application/json"},
-        )
+    def _query(self, sql: str, tiers=()):
+        body = json.dumps({"sql": sql, "tiers": list(tiers), "histogram": False}).encode()
+        status, _, data = self.client.request("POST", "/v1/query", body, {"content-type": "application/json"})
         if status != 200:
             raise RuntimeError(f"vdg query {status}: {data[:300]!r}")
         payload = json.loads(data)
@@ -274,19 +364,14 @@ class Vdg(Backend):
         return int(rows[0]["n"])
 
     def search_recent(self):
-        # The product's search path, not raw SQL: this is what exercises
-        # file-level service/level pruning.
-        body = json.dumps(
-            {"sql": "service:checkout level:error | last 1h", "tiers": [], "histogram": False}
-        ).encode()
-        status, _, data = self.client.request(
-            "POST", "/v1/query", body, {"content-type": "application/json"},
+        # SQL over the same columns/predicate/order as the other engines. A
+        # relative `last 1h` would drift between separately started runs; the
+        # corpus is one fixed window, so the explicit query schedule is stable.
+        return self._query(
+            "SELECT ts, level, service, status, message, trace_id, attrs_json "
+            "FROM bench WHERE service = 'checkout' AND level = 'ERROR' "
+            "ORDER BY ts DESC LIMIT 200"
         )
-        if status != 200:
-            raise RuntimeError(f"vdg search {status}: {data[:300]!r}")
-        payload = json.loads(data)
-        self.last_stats = payload.get("stats") or {}
-        return payload["rows"]
 
     def trace_lookup(self, trace_id=None):
         trace_id = trace_id or self.args.trace_id
@@ -296,17 +381,7 @@ class Vdg(Backend):
         return self._trace_query(trace_id, tiers)
 
     def _trace_query(self, trace_id: str, tiers):
-        body = json.dumps(
-            {"sql": f"trace_id:{trace_id}", "tiers": tiers, "histogram": False}
-        ).encode()
-        status, _, data = self.client.request(
-            "POST", "/v1/query", body, {"content-type": "application/json"},
-        )
-        if status != 200:
-            raise RuntimeError(f"vdg trace {status}: {data[:300]!r}")
-        payload = json.loads(data)
-        self.last_stats = payload.get("stats") or {}
-        return payload["rows"]
+        return self._query(f"trace_id:{trace_id}", tiers)
 
     def aggregate_minute(self):
         return self._query(
@@ -339,7 +414,8 @@ class ClickHouse(Backend):
                 service LowCardinality(String),
                 status Nullable(Int32),
                 message String,
-                trace_id String
+                trace_id String,
+                attrs_json String
             ) ENGINE = MergeTree ORDER BY (service, level, ts)""",
             self.auth_headers,
         )
@@ -388,7 +464,7 @@ class ClickHouse(Backend):
 
     def search_recent(self):
         return self._sql_json(
-            "SELECT ts, level, service, status, message, trace_id FROM bench "
+            "SELECT ts, level, service, status, message, trace_id, attrs_json FROM bench "
             "WHERE service = 'checkout' AND level = 'ERROR' "
             "ORDER BY ts DESC LIMIT 200"
         )
@@ -396,7 +472,7 @@ class ClickHouse(Backend):
     def trace_lookup(self, trace_id=None):
         trace_id = trace_id or self.args.trace_id
         return self._sql_json(
-            "SELECT ts, level, service, status, message, trace_id FROM bench "
+            "SELECT ts, level, service, status, message, trace_id, attrs_json FROM bench "
             f"WHERE trace_id = '{trace_id}' LIMIT 10"
         )
 
@@ -449,7 +525,7 @@ class VictoriaLogs(Backend):
     def search_recent(self):
         return self._query_rows(
             "service:checkout level:ERROR "
-            "| fields _time, level, service, status, message, trace_id "
+            "| fields _time, level, service, status, _msg, trace_id, attrs_json "
             "| sort by (_time) desc | limit 200"
         )
 
@@ -457,7 +533,7 @@ class VictoriaLogs(Backend):
         trace_id = trace_id or self.args.trace_id
         return self._query_rows(
             f'trace_id:="{trace_id}" '
-            "| fields _time, level, service, status, message, trace_id | limit 10"
+            "| fields _time, level, service, status, _msg, trace_id, attrs_json | limit 10"
         )
 
     def aggregate_minute(self):
@@ -586,21 +662,35 @@ def main():
         raise SystemExit(
             f"{args.system}: recent count {recent_count}, expected {expected_recent}"
         )
-    search_rows = backend.search_recent()
+    search_rows = normalize_rows(backend.search_recent())
     if len(search_rows) != min(200, expected_recent):
         raise SystemExit(
             f"{args.system}: search returned {len(search_rows)}, expected {min(200, expected_recent)}"
         )
-    trace_rows = backend.trace_lookup(args.trace_id)
+    for r in search_rows:
+        attrs = json.loads(r.get("attrs_json") or "{}")
+        if (
+            r.get("level") != "ERROR"
+            or r.get("service") != "checkout"
+            or "checkout" not in str(r.get("message", ""))
+            or attrs.get("region") not in REGIONS
+            or not str(attrs.get("host", "")).startswith("node-")
+        ):
+            raise SystemExit(f"{args.system}: unexpected search row: {r}")
+    search_ts = [row_ts_ms(r) for r in search_rows]
+    if search_ts != sorted(search_ts, reverse=True):
+        raise SystemExit(f"{args.system}: search rows are not newest-first")
+    trace_rows = normalize_rows(backend.trace_lookup(args.trace_id))
     if len(trace_rows) != 1:
         raise SystemExit(f"{args.system}: trace lookup returned {len(trace_rows)}, expected 1")
-    cross_rows = backend.trace_lookup(CROSS_TRACE)
+    validate_trace(args.trace_id, trace_rows, rows)
+    cross_rows = normalize_rows(backend.trace_lookup(CROSS_TRACE))
     if len(cross_rows) != len(CROSS_TRACE_ROWS):
         raise SystemExit(
             f"{args.system}: cross-tier trace returned {len(cross_rows)}, "
             f"expected {len(CROSS_TRACE_ROWS)}"
         )
-    missing_rows = backend.trace_lookup(args.missing_trace_id)
+    missing_rows = normalize_rows(backend.trace_lookup(args.missing_trace_id))
     if missing_rows:
         raise SystemExit(
             f"{args.system}: missing trace returned {len(missing_rows)} rows, expected 0"
@@ -624,6 +714,24 @@ def main():
             f"{args.system}: aggregate total={total} errors={errors}, "
             f"expected {rows}/{expected_errors}"
         )
+    want = expected_buckets(rows)
+    got = {
+        bucket_ms(r.get("bucket") or r.get("_time")): (
+            int(r["total"]),
+            int(r.get("errors", 0) or 0),
+        )
+        for r in buckets
+    }
+    # Backends return bucket groups in different orders; normalize the order
+    # before the value check so the comparison is about values, not engine
+    # group-ordering quirks.
+    got = dict(sorted(got.items()))
+    if got != want:
+        bad = [(k, got.get(k), v) for k, v in want.items() if got.get(k) != v][:3]
+        raise SystemExit(
+            f"{args.system}: per-bucket mismatch (bucket, got, want): {bad}; "
+            f"got keys={list(got)[:2]} want keys={list(want)[:2]}"
+        )
     print(
         f"{args.system}: equivalence OK (recent={recent_count}, "
         f"buckets={len(buckets)}, total={total}, errors={errors})",
@@ -634,19 +742,16 @@ def main():
     trace_engine_ms = []
     trace_manifest_ms = []
     trace_plan_ms = []
-    trace_audit_ms = []
-    trace_total_ms = []
 
     def next_trace():
         tid = args.trace_ids[trace_cursor[0] % len(args.trace_ids)]
         trace_cursor[0] += 1
-        rows = backend.trace_lookup(tid)
+        rows = normalize_rows(backend.trace_lookup(tid))
+        validate_trace(tid, rows, args.rows)
         if args.system == "vdg":
             trace_engine_ms.append(backend.last_stats.get("elapsedMs"))
             trace_manifest_ms.append(backend.last_stats.get("manifestMs"))
             trace_plan_ms.append(backend.last_stats.get("planMs"))
-            trace_audit_ms.append(backend.last_stats.get("auditMs"))
-            trace_total_ms.append(backend.last_stats.get("totalMs"))
         return rows
 
     cache_before = backend.cache_stats() if args.system == "vdg" else {}
@@ -694,8 +799,6 @@ def main():
             "engine": trace_engine_ms,
             "manifest": trace_manifest_ms,
             "plan": trace_plan_ms,
-            "audit": trace_audit_ms,
-            "total": trace_total_ms,
         },
         "query_cache": {
             "before": cache_before,
