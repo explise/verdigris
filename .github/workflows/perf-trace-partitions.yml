@@ -1,0 +1,54 @@
+name: Verdigris cross-tier trace partition control
+
+on:
+  push:
+    branches: [codex/perf-trace-partitions]
+
+permissions:
+  contents: read
+
+jobs:
+  trace-test:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate tied cross-tier trace rows at both partition caps
+        run: cargo test --locked -p verdigris-query --features datafusion --test engine trace_partition_cap
+  profiles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the integrated release image
+        run: docker build -f bench/Dockerfile.vdg -t verdigris-trace-partitions:local .
+      - name: Pull the pinned benchmark fixture images
+        run: |
+          set -o pipefail
+          sed -nE 's/^(MINIO|MC|BUSYBOX)=//p' bench/compare/logs/run-profile.sh |
+            while IFS= read -r image; do docker pull "$image" || exit; done
+      - name: Compare one and two partitions on settled 1M and 20M fixtures
+        env:
+          VDG_IMAGE: verdigris-trace-partitions:local
+          SERVICE_CPUS: '2'
+          TRACE_PARTITIONS_AB: '1'
+          ITERATIONS: '100'
+          WARMUP: '10'
+          CORPUS_TS_MS: '1795764240000'
+          RAW: ${{ runner.temp }}/verdigris-trace-partitions
+        run: |
+          mkdir -p "$RAW"
+          OUT="$RAW/one-million" ROWS=1000000 bench/compare/logs/run-profile.sh
+          OUT="$RAW/twenty-million" ROWS=20000000 BATCH_ROWS=50000 TRACE_SERIAL_FIRST=1 bench/compare/logs/run-profile.sh
+      - name: Upload raw timings and physical plans
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-trace-partitions
+          path: ${{ runner.temp }}/verdigris-trace-partitions
+          retention-days: 7

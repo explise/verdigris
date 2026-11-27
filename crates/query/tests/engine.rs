@@ -445,6 +445,43 @@ async fn limits_are_derived_from_the_config_knobs() {
     assert_eq!(l.target_partitions, 3);
 }
 
+#[tokio::test]
+async fn trace_partition_cap_preserves_tied_cross_tier_rows() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(store.clone(), "logs");
+    let records = vec![
+        rec(7, Level::Error, "auth", Some(TRACE)),
+        rec(7, Level::Info, "api", Some(TRACE)),
+        rec(7, Level::Debug, "worker", Some(TRACE)),
+        rec(9, Level::Error, "auth", Some("other")),
+    ];
+    let files: Vec<_> = ingestor
+        .ingest(records, &RoutingConfig::default(), BatchPolicy::default())
+        .await
+        .unwrap()
+        .iter()
+        .map(IndexedFile::whole)
+        .collect();
+    let query =
+        format!("SELECT * FROM logs WHERE trace_id = '{TRACE}' ORDER BY ts DESC, service ASC");
+    let mut results = Vec::new();
+    for cap in [None, Some(1), Some(0), Some(9)] {
+        let cfg = verdigris_core::config::QueryConfig {
+            cores: 2,
+            profile_scan_partitions: cap,
+            ..Default::default()
+        };
+        let limits = QueryLimits::from_config(&cfg);
+        assert_eq!(limits.target_partitions, cap.unwrap_or(2).clamp(1, 2));
+        let rows = engine::query_table_json(store.clone(), "logs", &files, &query, &limits)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        results.push(rows);
+    }
+    assert!(results.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
 /// Cache safety for legacy keys. A legacy object can be replaced in place with
 /// different bytes of the same length; its key proves nothing about identity, so
 /// the shared schema/footer cache must be bypassed. A content-addressed key in

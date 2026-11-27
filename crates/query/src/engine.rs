@@ -173,11 +173,12 @@ pub struct QueryLimits {
 
 impl QueryLimits {
     pub fn from_config(q: &QueryConfig) -> Self {
+        let cores = (q.cores as usize).max(1);
         Self {
             memory_pool_bytes: (q.memory_pool_mib as usize).saturating_mul(1024 * 1024),
             max_result_rows: q.max_result_rows,
             max_result_bytes: q.max_result_mib.saturating_mul(1024 * 1024),
-            target_partitions: (q.cores as usize).max(1),
+            target_partitions: q.profile_scan_partitions.unwrap_or(cores).clamp(1, cores),
         }
     }
 }

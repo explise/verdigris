@@ -291,6 +291,9 @@ pub struct QueryConfig {
     /// each partition carries its own buffers, so this bounds concurrency and
     /// therefore peak execution memory.
     pub cores: u32,
+    /// Optional diagnostic cap on execution partitions. The provisioned cores
+    /// still determine the cost model and the upper bound.
+    pub profile_scan_partitions: Option<usize>,
 
     // ── Memory bounds (issue #2: run comfortably on a 1–2 GB box) ──────────
     //
@@ -335,6 +338,7 @@ impl Default for QueryConfig {
         Self {
             modeled_mibps_per_core: 100.0,
             cores: 4,
+            profile_scan_partitions: None,
             // Sized so the engine, the accumulated result and the rest of the
             // process all fit inside a 2 GB box with headroom.
             memory_pool_mib: 512,
