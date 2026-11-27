@@ -1,0 +1,36 @@
+name: Verdigris sustained ingest diagnostic
+
+on:
+  push:
+    branches: [codex/perf-sustained-ingest-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  sustained:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the release node and sustained driver
+        run: |
+          docker build -f bench/Dockerfile.vdg -t verdigris-sustained-ingest:local .
+          cargo build --locked --release --manifest-path bench/loadgen/Cargo.toml
+          df -h
+      - name: Measure ten minutes of disk-backed ingest and crash recovery
+        env:
+          VDG_IMAGE: verdigris-sustained-ingest:local
+          VDG_CPUS: '3'
+          MINIO_CPUS: '1'
+          OUT: ${{ runner.temp }}/verdigris-sustained-ingest
+        run: LOADGEN="$PWD/bench/loadgen/target/release/verdigris-loadgen" bench/loadgen/run-sustained.sh
+      - name: Upload the offered-arrival ledger and recovery evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-sustained-ingest
+          path: ${{ runner.temp }}/verdigris-sustained-ingest
+          retention-days: 7
