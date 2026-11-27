@@ -2191,7 +2191,31 @@ async fn h_query(
 
     // Run the query once, in the negotiated wire (never both).
     let t0 = st.clock.monotonic_micros();
-    let (arrow_body, json_rows, rows_returned) = if arrow {
+    #[cfg(feature = "bench-minute-summary")]
+    let summary = if !arrow
+        && !req.histogram
+        && st.table.as_str() == crate::minute_summary_bench::TABLE
+        && req.tiers.is_empty()
+        && sql == crate::minute_summary_bench::SQL
+        && headers
+            .get("x-vdg-bench-minute-summary")
+            .is_some_and(|value| value == "1")
+    {
+        crate::minute_summary_bench::read(&s, selected, m.compaction_gen, &limits(&st)).await
+    } else {
+        None
+    };
+    #[cfg(not(feature = "bench-minute-summary"))]
+    let summary: Option<(Vec<Value>, u64)> = None;
+    let summary_bytes = summary.as_ref().map(|(_, bytes)| *bytes);
+
+    let (arrow_body, json_rows, rows_returned) = if let Some((rows, _)) = summary {
+        if let Some(profile) = &mut profile {
+            profile.mark("execute");
+        }
+        let n = rows.len();
+        (Vec::new(), Value::Array(rows), n)
+    } else if arrow {
         let out = verdigris_query::engine::query_table_arrow_with_rows_profiled(
             s.clone(),
             st.table.as_str(),
@@ -2327,6 +2351,10 @@ async fn h_query(
     let audit_us = st.clock.monotonic_micros().saturating_sub(audit_start);
     let total_us = st.clock.monotonic_micros().saturating_sub(t_request);
     if let Some(obj) = stats.as_object_mut() {
+        if let Some(bytes) = summary_bytes {
+            obj.insert("benchmarkSummaryBytes".into(), json!(bytes));
+            obj.insert("benchmarkSummaryGets".into(), json!(1));
+        }
         obj.insert("auditMs".into(), json!(audit_us / 1_000));
         obj.insert("totalMs".into(), json!(total_us / 1_000));
     }

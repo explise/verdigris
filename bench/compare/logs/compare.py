@@ -108,6 +108,15 @@ RECENT_SEARCH_SQL = (
 )
 
 
+MINUTE_AGGREGATE_SQL = (
+    "SELECT date_bin(INTERVAL '60 seconds', ts, "
+    "TIMESTAMP '1970-01-01T00:00:00') AS bucket, "
+    "count(*) AS total, "
+    "count(*) FILTER (WHERE level = 'ERROR') AS errors "
+    "FROM bench GROUP BY bucket ORDER BY bucket"
+)
+
+
 def trace_schedule(rows):
     return [f"{i:016x}" for i in sorted({max(4, k * rows // 16) for k in range(16)}) if i < rows]
 
@@ -412,13 +421,7 @@ class Vdg(Backend):
         return self._query(f"trace_id:{trace_id}", tiers)
 
     def aggregate_minute(self):
-        return self._query(
-            "SELECT date_bin(INTERVAL '60 seconds', ts, "
-            "TIMESTAMP '1970-01-01T00:00:00') AS bucket, "
-            "count(*) AS total, "
-            "count(*) FILTER (WHERE level = 'ERROR') AS errors "
-            "FROM bench GROUP BY bucket ORDER BY bucket"
-        )
+        return self._query(MINUTE_AGGREGATE_SQL)
 
     def cache_stats(self):
         status, _, data = self.client.request("GET", "/v1/metrics")

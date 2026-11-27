@@ -13,6 +13,7 @@
 
 FROM rust:1-bookworm AS builder
 WORKDIR /src
+ARG VDG_BENCH_FEATURES=""
 
 # --- dependency cache layer -------------------------------------------------
 # Copy only the manifests and build against stub sources. This layer is keyed on
@@ -46,7 +47,7 @@ RUN mkdir -p crates/core/src crates/storage/src crates/query/src \
     && : > crates/query/tests/row_group_pruning.rs \
     && : > crates/query/examples/explain_pruning.rs \
     && echo 'fn main() {}' > crates/vdg/src/main.rs \
-    && cargo build --release --features "serve apply" -p vdg
+    && cargo build --release --features "serve apply ${VDG_BENCH_FEATURES}" -p vdg
 
 # --- real sources -----------------------------------------------------------
 COPY crates ./crates
@@ -54,7 +55,7 @@ COPY crates ./crates
 # above. Touch so cargo reliably sees our own crates as dirty; cached dependency
 # artifacts are untouched and are reused.
 RUN find crates -name '*.rs' -exec touch {} + \
-    && cargo build --release --features "serve apply" -p vdg \
+    && cargo build --release --features "serve apply ${VDG_BENCH_FEATURES}" -p vdg \
     && cp /src/target/release/vdg /usr/local/bin/vdg
 
 FROM debian:bookworm-slim

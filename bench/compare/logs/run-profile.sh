@@ -85,6 +85,41 @@ cp "$scratch/config.toml" "$OUT/config.toml"
 
 python3 -B bench/compare/logs/compare.py --system vdg --port "$port" --rows "$ROWS" --batch-rows "$BATCH_ROWS" \
   --iterations 1 --warmup 0 --out "$OUT/seed.json"
+if [[ "${MINUTE_SUMMARY_CONTROL:-0}" == 1 ]]; then
+  summary_image=(docker run --rm --pull never --network "$net" --cpus="$SERVICE_CPUS" --memory=3g
+    -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS="$SERVICE_CPUS"
+    -v "$scratch/config.toml:/app/config/bench.toml:ro" "$VDG_IMAGE")
+  measure_summary() {
+    python3 -B bench/compare/logs/minute_summary.py --port "$port" --case "$1" \
+      --iterations "$ITERATIONS" --warmup "$WARMUP" --out "$OUT/summary-$1.json"
+  }
+  measure_summary missing
+  { time "${summary_image[@]}" build-benchmark-minute-summary; } \
+    > "$OUT/summary-build.json" 2> "$OUT/summary-build.time"
+  measure_summary warm
+  measure_summary unsupported
+  docker restart "$vdg" >/dev/null
+  wait_ready
+  measure_summary restart
+  measure_summary late
+
+  docker stop "$vdg" >/dev/null
+  "${summary_image[@]}" manifest --table bench > "$OUT/late-manifest.txt"
+  "${summary_image[@]}" compact --table bench > "$OUT/late-compaction.txt"
+  "${summary_image[@]}" manifest --table bench > "$OUT/compacted-manifest.txt"
+  "${summary_image[@]}" build-benchmark-minute-summary > "$OUT/summary-rebuilt.json"
+  docker start "$vdg" >/dev/null
+  wait_ready
+  measure_summary rebuild
+  printf '%s' '{"version":1,"checksum":"invalid","files":{}}' |
+    docker run --rm -i --pull never --network "$net" \
+      -e MC_HOST_local=http://minioadmin:minioadmin@minio:9000 "$MC" pipe \
+      local/verdigris/bench/_metadata/benchmark-minute-summary-v1.json
+  measure_summary corrupt
+  docker inspect --format 'OOMKilled={{.State.OOMKilled}} restarts={{.RestartCount}}' "$vdg" > "$OUT/vdg-state.txt"
+  exit 0
+fi
+
 profile=(python3 -B bench/compare/logs/profile.py --seed-report "$OUT/seed.json")
 "${profile[@]}" --port "$port" --iterations "$ITERATIONS" --warmup "$WARMUP" --out "$OUT/warm.json"
 if [[ "${SEARCH_CONTROL:-0}" == 1 ]]; then

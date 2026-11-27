@@ -41,7 +41,12 @@ aws-sdk-s3 = { version = "1", optional = true }
 # avoid a system OpenSSL dependency; minimal features to keep the build light.
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
 
+# Used only on the exact-summary benchmark branch.
+chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
+sha2 = { version = "0.10", optional = true }
+
 [features]
+bench-minute-summary = ["serve", "dep:chrono", "dep:sha2"]
 # Forward the datafusion feature so `cargo run --features datafusion` wires real execution.
 datafusion = ["verdigris-query/datafusion"]
 # `serve` brings up the HTTP API + static frontend; it needs the query engine.

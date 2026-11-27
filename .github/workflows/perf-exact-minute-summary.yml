@@ -1,0 +1,51 @@
+name: Verdigris exact minute-summary feasibility
+
+on:
+  push:
+    branches: [codex/perf-exact-minute-summary]
+
+permissions:
+  contents: read
+
+jobs:
+  profiles:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rows: 1000000
+            batch_rows: 10000
+          - rows: 20000000
+            batch_rows: 50000
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the isolated benchmark feature
+        run: docker build --build-arg VDG_BENCH_FEATURES=bench-minute-summary -f bench/Dockerfile.vdg -t verdigris-minute-summary:local .
+      - name: Pull the pinned fixture images
+        run: |
+          set -o pipefail
+          sed -nE 's/^(MINIO|MC|BUSYBOX)=//p' bench/compare/logs/run-profile.sh |
+            while IFS= read -r image; do docker pull "$image" || exit; done
+      - name: Compare exact aggregation and verify fallback
+        env:
+          VDG_IMAGE: verdigris-minute-summary:local
+          MINUTE_SUMMARY_CONTROL: '1'
+          SERVICE_CPUS: '2'
+          CORPUS_TS_MS: '1795764240000'
+          ITERATIONS: '100'
+          WARMUP: '10'
+          ROWS: ${{ matrix.rows }}
+          BATCH_ROWS: ${{ matrix.batch_rows }}
+          OUT: ${{ runner.temp }}/verdigris-minute-summary
+        run: bench/compare/logs/run-profile.sh
+      - name: Upload the raw audit, scan and timing measurements
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-minute-summary-${{ matrix.rows }}
+          path: ${{ runner.temp }}/verdigris-minute-summary
+          retention-days: 7

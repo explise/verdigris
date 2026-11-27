@@ -4,6 +4,8 @@
 
 #[cfg(feature = "apply")]
 mod lifecycle_apply;
+#[cfg(feature = "bench-minute-summary")]
+mod minute_summary_bench;
 mod realclock;
 #[cfg(feature = "serve")]
 mod serve;
@@ -36,6 +38,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[cfg(feature = "bench-minute-summary")]
+    #[command(hide = true)]
+    BuildBenchmarkMinuteSummary,
     /// Print the resolved configuration.
     Config,
     /// Verify the configured storage backend by round-tripping a probe object.
@@ -242,6 +247,8 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
+        #[cfg(feature = "bench-minute-summary")]
+        Command::BuildBenchmarkMinuteSummary => minute_summary_bench::build(&cfg).await?,
         Command::Manifest { table } => {
             run_manifest(&cfg, &table).await?;
         }
