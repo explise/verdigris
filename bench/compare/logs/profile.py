@@ -8,12 +8,12 @@ import statistics
 import time
 from pathlib import Path
 
-from compare import CROSS_TRACE, RECENT_SEARCH_SQL, Vdg, expected_search, validate_search
+from compare import BASE_TS, CROSS_TRACE, RECENT_SEARCH_SQL, Vdg, expected_search, validate_search
 
 SHAPES = ("trace_hit", "trace_miss", "trace_cross_tier", "recent_search", "minute_aggregation")
 
 
-def run_one(backend, shape, index, corpus, mode):
+def run_one(backend, shape, index, corpus, mode, expected_recent):
     backend.profile_mode = mode
     trace = None
     if shape == "trace_hit":
@@ -37,8 +37,7 @@ def run_one(backend, shape, index, corpus, mode):
         if len(rows) != expected or any(row["trace_id"] != trace for row in rows):
             raise RuntimeError(f"{shape} returned {len(rows)} rows for {trace}, expected {expected}")
     elif shape == "recent_search":
-        if any(row["service"] != "checkout" or row["level"] != "ERROR" for row in rows) or not rows:
-            raise RuntimeError("recent search returned an unexpected page")
+        validate_search(rows, expected_recent)
     elif sum(row["total"] for row in rows) != corpus["rows"]:
         raise RuntimeError("aggregate did not cover the corpus")
 
@@ -85,10 +84,9 @@ def summarize(samples):
     return summary
 
 
-def compare_search(backend, corpus, iterations, warmup):
+def compare_search(backend, expected, iterations, warmup):
     """Compare equivalent SQL and search requests on one settled corpus."""
     inputs = (RECENT_SEARCH_SQL, "service:checkout level:ERROR")
-    expected = expected_search(corpus["rows"])
 
     def estimates():
         quotes = []
@@ -146,30 +144,35 @@ def main():
         parser.error("iterations must be positive and warmup cannot be negative")
 
     corpus = json.loads(args.seed_report.read_text())["corpus"]
+    if corpus["base_ts_ms"] != BASE_TS:
+        parser.error("CORPUS_TS_MS must match the seed report's corpus timestamp")
+    expected_recent = expected_search(corpus["rows"])
     backend = Vdg(args)
     out = {"corpus": corpus, "mode": "first_after_restart" if args.first else "warm", "queries": {}}
     try:
         if args.compare_search:
             out.pop("queries")
             out["mode"] = "search_comparison"
-            out["comparison"] = compare_search(backend, corpus, args.iterations, args.warmup)
+            out["comparison"] = compare_search(backend, expected_recent, args.iterations, args.warmup)
         elif args.first:
-            out["queries"][args.first] = run_one(backend, args.first, 0, corpus, "1")
+            out["queries"][args.first] = run_one(backend, args.first, 0, corpus, "1", expected_recent)
         else:
             for shape in SHAPES:
                 for index in range(args.warmup):
-                    run_one(backend, shape, index, corpus, "1")
+                    run_one(backend, shape, index, corpus, "1", expected_recent)
                 samples = {"on": [], "off": []}
                 for index in range(args.iterations):
                     modes = ("on", "off") if index % 2 == 0 else ("off", "on")
                     for mode in modes:
                         samples[mode].append(
-                            run_one(backend, shape, index, corpus, "1" if mode == "on" else None)
+                            run_one(
+                                backend, shape, index, corpus, "1" if mode == "on" else None, expected_recent
+                            )
                         )
                 out["queries"][shape] = {mode: summarize(samples[mode]) for mode in samples}
 
-            out["representative_plan"] = run_one(backend, "trace_hit", 0, corpus, "plan")["profile"]
-            out["recent_search_plan"] = run_one(backend, "recent_search", 0, corpus, "plan")
+            out["representative_plan"] = run_one(backend, "trace_hit", 0, corpus, "plan", expected_recent)["profile"]
+            out["recent_search_plan"] = run_one(backend, "recent_search", 0, corpus, "plan", expected_recent)
             status, _, data = backend.client.request("GET", "/v1/metrics")
             if status != 200:
                 raise RuntimeError(f"query metrics failed with HTTP {status}")
