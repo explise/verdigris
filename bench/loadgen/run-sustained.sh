@@ -81,6 +81,10 @@ wait_ready() {
   done
   return 1
 }
+corpus_args=()
+if [[ -n "${CORPUS_START_MS:-}" ]]; then
+  corpus_args+=(--corpus-start-ms="$CORPUS_START_MS")
+fi
 start_vdg
 wait_ready
 if [[ -n "${PRELOAD_COMPACT_MIB:-}" ]]; then
@@ -93,7 +97,7 @@ if [[ -n "${PRELOAD_COMPACT_MIB:-}" ]]; then
   sed -i '/^\[compaction\]/,$s/^enabled = true$/enabled = false/' "$out/config.toml"
   start_vdg
   wait_ready
-  VDG_BENCH_PRELOAD_ONLY=1 "$LOADGEN" --url "$url" --table logs \
+  VDG_BENCH_PRELOAD_ONLY=1 "$LOADGEN" --url "$url" --table logs "${corpus_args[@]}" \
     --sustain-rows-per-sec "${ROWS_PER_S:-220000}" --duration-secs "${DURATION_SECS:-600}" \
     --batch-rows "${BATCH_ROWS:-10000}" --out "$out/preload.json" > "$out/preload.log" 2>&1
   if [[ "$PRELOAD_COMPACT_MIB" != 0 ]]; then
@@ -125,7 +129,7 @@ capture_phases() {
 if [[ "${PROFILE_INGEST_PHASES:-0}" == 1 ]]; then
   capture_phases initial
 fi
-"$LOADGEN" --url "$url" --table logs --sustain-rows-per-sec "${ROWS_PER_S:-220000}" \
+"$LOADGEN" --url "$url" --table logs "${corpus_args[@]}" --sustain-rows-per-sec "${ROWS_PER_S:-220000}" \
   --duration-secs "${DURATION_SECS:-600}" --batch-rows "${BATCH_ROWS:-10000}" \
   --concurrency "${LOADGEN_CONCURRENCY:-16}" --out "$out/run.json" > "$out/loadgen.log" 2>&1 &
 load_pid=$!
