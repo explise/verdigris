@@ -1,0 +1,37 @@
+name: Verdigris dashboard freshness with reader grace
+
+on:
+  push:
+    branches: [codex/perf-dashboard-grace]
+
+permissions:
+  contents: read
+
+jobs:
+  experiment:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the experiment image
+        run: docker build -f bench/Dockerfile.vdg -t verdigris-dashboard-grace:local .
+      - name: Verify exact dashboard snapshots across acknowledged ingest and compaction
+        env:
+          VDG_IMAGE: verdigris-dashboard-grace:local
+          RETIRED_GRACE_SECS: '60'
+          RESULT_ROOT: ${{ runner.temp }}/verdigris-dashboard-grace
+        run: |
+          mkdir -p "$RESULT_ROOT"
+          for cache in false true; do
+            CHEAP_PERMITS=2 SCHEDULED_ALERT_WAIT_MS=1000 RUN_MUTATING_TRIAL=1 DASHBOARD_SNAPSHOT_CACHE="$cache" \
+              OUT="$RESULT_ROOT/cache-$cache" bench/admission/run-fixed.sh
+          done
+      - name: Upload both treatment arms
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-dashboard-grace
+          path: ${{ runner.temp }}/verdigris-dashboard-grace
+          retention-days: 7
