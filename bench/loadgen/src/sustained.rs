@@ -74,12 +74,13 @@ fn produce(
     rate: usize,
     rows: usize,
     epoch: i64,
+    namespace: &str,
     tx: mpsc::Sender<Batch>,
 ) -> Result<()> {
     let mut records = generate_iter(rows, args.seed, 0);
     for (id, first_row) in (0..rows).step_by(args.batch_rows).enumerate() {
         let batch_rows = args.batch_rows.min(rows - first_row);
-        let trace = marker(id);
+        let trace = format!("{namespace}-{id:012}");
         let mut body = String::with_capacity(args.body_bytes);
         for (offset, mut record) in records.by_ref().take(batch_rows).enumerate() {
             record.trace_id = Some(format!("{trace}-{offset:06}"));
@@ -288,10 +289,68 @@ pub(super) async fn run(args: &Args, rate: usize) -> Result<()> {
         "sustained mode requires a fresh dedicated benchmark table"
     );
 
+    if let Some(preload_rows) = std::env::var_os("VDG_BENCH_PRELOAD_ROWS") {
+        ensure!(
+            std::env::var("VDG_BENCH_ALLOW_PRELOAD").as_deref() == Ok("1"),
+            "preloading requires VDG_BENCH_ALLOW_PRELOAD=1"
+        );
+        let preload_rows: usize = preload_rows
+            .to_str()
+            .context("non-UTF-8 preload row count")?
+            .parse()?;
+        ensure!(preload_rows > 0, "preload row count must be positive");
+        let preload_ms = i64::try_from((preload_rows as u128 * 1_000).div_ceil(rate as u128))?;
+        let preload_epoch = epoch
+            .checked_sub(preload_ms)
+            .context("preload timestamp overflow")?;
+        let (tx, mut rx) = mpsc::channel(1);
+        let generator_args = args.clone();
+        let producer = tokio::task::spawn_blocking(move || {
+            produce(
+                &generator_args,
+                rate,
+                preload_rows,
+                preload_epoch,
+                "preload",
+                tx,
+            )
+        });
+        let (probe_tx, _probe_rx) = mpsc::channel(1);
+        let endpoint = format!("{url}{}", args.path);
+        let start = Instant::now();
+        let mut acknowledged = 0;
+        while let Some(batch) = rx.recv().await {
+            let expected = u64::try_from(batch.rows)?;
+            let outcome = submit(
+                client.clone(),
+                endpoint.clone(),
+                batch,
+                start,
+                false,
+                probe_tx.clone(),
+            )
+            .await;
+            ensure!(
+                outcome.acked_rows == Some(expected),
+                "preload batch {} failed: {:?}",
+                outcome.id,
+                outcome.error
+            );
+            acknowledged += expected;
+        }
+        producer.await??;
+        ensure!(
+            acknowledged == u64::try_from(preload_rows)?,
+            "incomplete preload"
+        );
+        eprintln!("preloaded {acknowledged} rows");
+    }
+
     let (tx, mut rx) = mpsc::channel(args.concurrency);
     let generator_args = args.clone();
-    let producer =
-        tokio::task::spawn_blocking(move || produce(&generator_args, rate, rows, epoch, tx));
+    let producer = tokio::task::spawn_blocking(move || {
+        produce(&generator_args, rate, rows, epoch, "sustained", tx)
+    });
     let (probe_tx, probe_rx) = mpsc::channel(VISIBILITY_QUEUE);
     let probes = tokio::spawn(visibility_worker(
         client.clone(),
