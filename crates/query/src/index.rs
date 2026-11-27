@@ -31,7 +31,7 @@ use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
-use datafusion::datasource::physical_plan::FileScanConfigBuilder;
+use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder};
 use datafusion::datasource::TableType;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
@@ -123,6 +123,7 @@ pub struct IndexedParquetTable {
     schema: SchemaRef,
     store_url: ObjectStoreUrl,
     files: Vec<IndexedFile>,
+    spread_partitions: usize,
 }
 
 impl IndexedParquetTable {
@@ -135,7 +136,63 @@ impl IndexedParquetTable {
             schema,
             store_url,
             files,
+            spread_partitions: 1,
         }
+    }
+
+    pub(crate) fn with_spread_ranges(mut self, partitions: usize) -> Self {
+        self.spread_partitions = partitions.max(1);
+        self
+    }
+
+    fn file_groups(&self) -> Vec<FileGroup> {
+        if self.spread_partitions == 1 {
+            return vec![FileGroup::new(
+                self.files
+                    .iter()
+                    .map(IndexedFile::to_partitioned_file)
+                    .collect(),
+            )];
+        }
+
+        // The normal byte-balancing pass can give the only selective file to
+        // one partition. Spread each sufficiently large immutable file across
+        // partitions so more than one worker can find qualifying rows.
+        const MIN_BYTES_PER_RANGE: u64 = 8 * 1024 * 1024;
+        let mut groups = vec![FileGroup::new(Vec::new()); self.spread_partitions];
+        let mut group = 0;
+        for file in &self.files {
+            let partition = file.to_partitioned_file();
+            let parts = if file.immutable && i64::try_from(file.bytes).is_ok() {
+                (file.bytes / MIN_BYTES_PER_RANGE)
+                    .min(self.spread_partitions as u64)
+                    .max(1)
+            } else {
+                1
+            };
+            if parts == 1 {
+                groups[group].push(partition);
+                group = (group + 1) % self.spread_partitions;
+                continue;
+            }
+            let size = file.bytes.div_ceil(parts);
+            let mut start = 0;
+            while start < file.bytes {
+                let end = (start + size).min(file.bytes);
+                groups[group].push(partition.clone().with_range(start as i64, end as i64));
+                group = (group + 1) % self.spread_partitions;
+                start = end;
+            }
+        }
+        // Preserve the empty scan used when the text index prunes every file.
+        let groups: Vec<_> = groups
+            .into_iter()
+            .filter(|group| !group.is_empty())
+            .collect();
+        if groups.is_empty() {
+            return vec![FileGroup::new(Vec::new())];
+        }
+        groups
     }
 
     /// Row groups this scan will read vs. how many the indexed files hold, for the
@@ -180,16 +237,54 @@ impl TableProvider for IndexedParquetTable {
         let format = ParquetFormat::default();
         let source = format.file_source(Arc::clone(&self.schema).into());
         let config = FileScanConfigBuilder::new(self.store_url.clone(), source)
-            .with_file_group(
-                self.files
-                    .iter()
-                    .map(|f| f.to_partitioned_file())
-                    .collect::<Vec<_>>()
-                    .into(),
-            )
+            .with_file_groups(self.file_groups())
             .with_projection_indices(projection.cloned())?
             .with_limit(limit)
             .build();
         format.create_physical_plan(state, config).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::Schema;
+
+    #[test]
+    fn distributed_groups_cover_full_ranges_and_retain_access_masks() {
+        let size = 20 * 1024 * 1024 + 1;
+        let files = vec![
+            IndexedFile {
+                path: "immutable.parquet".into(),
+                bytes: size,
+                row_groups: Some(vec![false, true]),
+                immutable: true,
+            },
+            IndexedFile {
+                path: "legacy.parquet".into(),
+                bytes: size,
+                row_groups: None,
+                immutable: false,
+            },
+        ];
+        let provider = IndexedParquetTable::new(
+            Arc::new(Schema::empty()),
+            ObjectStoreUrl::parse("verdigris://store").unwrap(),
+            files,
+        )
+        .with_spread_ranges(2);
+        let groups = provider.file_groups();
+        assert_eq!(groups.len(), 2);
+        let first = &groups[0].files()[0];
+        let second = &groups[1].files()[0];
+        assert_eq!(first.range(), (0, size.div_ceil(2)));
+        assert_eq!(second.range(), (size.div_ceil(2), size));
+        assert_eq!(first.path(), second.path());
+        assert!(first.extensions.get::<ParquetAccessPlan>().is_some());
+        assert!(second.extensions.get::<ParquetAccessPlan>().is_some());
+        let legacy = &groups[0].files()[1];
+        assert_ne!(legacy.path(), first.path());
+        assert!(legacy.range.is_none());
+        assert_eq!(groups.iter().map(FileGroup::len).sum::<usize>(), 3);
     }
 }

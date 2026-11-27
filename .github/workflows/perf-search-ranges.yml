@@ -1,0 +1,56 @@
+name: Verdigris recent-search range distribution
+
+on:
+  push:
+    branches: [codex/perf-recent-search]
+
+permissions:
+  contents: read
+
+jobs:
+  range-tests:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify range coverage and exact query results
+        run: |
+          cargo test --locked -p verdigris-query --features datafusion --lib distributed_groups
+          cargo test --locked -p verdigris-query --features datafusion --test engine distributed_parquet_groups
+  profiles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the integrated release image
+        run: docker build -f bench/Dockerfile.vdg -t verdigris-search-ranges:local .
+      - name: Pull the pinned benchmark fixture images
+        run: |
+          set -o pipefail
+          sed -nE 's/^(MINIO|MC|BUSYBOX)=//p' bench/compare/logs/run-profile.sh |
+            while IFS= read -r image; do docker pull "$image" || exit; done
+      - name: Compare both scan groupings on settled 1M and 20M fixtures
+        env:
+          VDG_IMAGE: verdigris-search-ranges:local
+          SERVICE_CPUS: '2'
+          SPREAD_RANGES_AB: '1'
+          ITERATIONS: '100'
+          WARMUP: '10'
+          CORPUS_TS_MS: '1795764240000'
+          RAW: ${{ runner.temp }}/verdigris-search-ranges
+        run: |
+          mkdir -p "$RAW"
+          OUT="$RAW/one-million" ROWS=1000000 bench/compare/logs/run-profile.sh
+          OUT="$RAW/twenty-million" ROWS=20000000 BATCH_ROWS=50000 SPREAD_RANGES_FIRST=true bench/compare/logs/run-profile.sh
+      - name: Upload raw timings and physical plans
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-search-ranges
+          path: ${{ runner.temp }}/verdigris-search-ranges
+          retention-days: 7

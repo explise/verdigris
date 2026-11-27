@@ -311,6 +311,8 @@ pub struct QueryConfig {
     /// bloom filters, page index), in MiB. Shared across requests; execution
     /// memory stays per query. Set to 0 to disable cross-request reuse.
     pub metadata_cache_mib: u64,
+    /// Experimental scan grouping that spreads ranges from large immutable Parquet files.
+    pub spread_parquet_ranges: bool,
 
     // ── Query admission (issue #29) ────────────────────────────────────────
     /// Total concurrent query executions admitted by this node. One permit is
@@ -341,6 +343,7 @@ impl Default for QueryConfig {
             max_result_rows: 1_000_000,
             max_result_mib: 256,
             metadata_cache_mib: 64,
+            spread_parquet_ranges: false,
             max_concurrent: 4,
             admission_wait_ms: 250,
             cheap_limit_rows: 1_000,

@@ -169,6 +169,7 @@ pub struct QueryLimits {
     pub max_result_bytes: u64,
     /// Target partitions for execution; each carries its own buffers.
     pub target_partitions: usize,
+    pub spread_parquet_ranges: bool,
 }
 
 impl QueryLimits {
@@ -178,6 +179,7 @@ impl QueryLimits {
             max_result_rows: q.max_result_rows,
             max_result_bytes: q.max_result_mib.saturating_mul(1024 * 1024),
             target_partitions: (q.cores as usize).max(1),
+            spread_parquet_ranges: q.spread_parquet_ranges,
         }
     }
 }
@@ -254,6 +256,9 @@ async fn collect_batches(
         opts.execution.parquet.bloom_filter_on_read = true;
         opts.execution.parquet.pushdown_filters = true;
         opts.execution.parquet.reorder_filters = true;
+        if limits.spread_parquet_ranges {
+            opts.optimizer.repartition_file_scans = false;
+        }
         opts.execution.sort_spill_reservation_bytes =
             sort_spill_reservation(limits.memory_pool_bytes);
     }
@@ -329,7 +334,10 @@ async fn collect_batches(
             schema
         }
     };
-    let provider = IndexedParquetTable::new(schema, base, files.to_vec());
+    let mut provider = IndexedParquetTable::new(schema, base, files.to_vec());
+    if limits.spread_parquet_ranges {
+        provider = provider.with_spread_ranges(limits.target_partitions);
+    }
     ctx.register_table(table, Arc::new(provider))
         .context("registering table")?;
 

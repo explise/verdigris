@@ -76,6 +76,32 @@ fn limits() -> QueryLimits {
 }
 
 #[tokio::test]
+async fn distributed_parquet_groups_preserve_ordered_ties_and_whole_table_counts() {
+    let (store, manifest) = seeded_table().await;
+    let files = all_paths(&manifest);
+    let baseline = QueryLimits {
+        target_partitions: 2,
+        ..limits()
+    };
+    let treatment = QueryLimits {
+        spread_parquet_ranges: true,
+        ..baseline.clone()
+    };
+    for sql in [
+        "SELECT * FROM logs ORDER BY ts DESC, service ASC LIMIT 20",
+        "SELECT service, count(*) AS total FROM logs GROUP BY service ORDER BY service",
+    ] {
+        let baseline = engine::query_table_json(store.clone(), "logs", &files, sql, &baseline)
+            .await
+            .unwrap();
+        let treatment = engine::query_table_json(store.clone(), "logs", &files, sql, &treatment)
+            .await
+            .unwrap();
+        assert_eq!(baseline, treatment, "changed results for {sql}");
+    }
+}
+
+#[tokio::test]
 async fn sql_filters_and_aggregates_in_place() {
     let (store, manifest) = seeded_table().await;
     let files = all_paths(&manifest);
