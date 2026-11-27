@@ -20,6 +20,7 @@ jobs:
       - name: Run the three-engine comparison in three fresh fixtures
         env:
           VDG_SKIP_BUILD: '1'
+          TOTAL_CPUS: '4'
           VDG_IMAGE: verdigris-comparator-replay:local
           ITERATIONS: '100'
           WARMUP: '10'
