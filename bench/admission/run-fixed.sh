@@ -70,7 +70,7 @@ if [[ -n "${RETIRED_GRACE_SECS:-}" ]]; then
 fi
 chmod 644 "$out/config.toml"
 vdg=$(docker run -d --pull never --network "$net" --cpus=4 --memory=2g -p 127.0.0.1::8080 \
-  -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS=4 -e RUST_LOG=warn \
+  -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS=4 -e RUST_LOG="${BENCH_RUST_LOG:-warn}" \
   --mount "type=bind,src=$out/config.toml,dst=/app/config/bench.toml,readonly" \
   "$VDG_IMAGE" serve --port 8080 --table bench --role all)
 port=$(docker port "$vdg" 8080/tcp | awk -F: '{print $NF}')

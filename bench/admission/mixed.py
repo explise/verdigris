@@ -264,6 +264,7 @@ def main():
             probe_rows.append({"offset": offset, "trace_id": row["trace_id"],
                                "sent_s": sent, "acknowledged_s": time.monotonic()})
 
+    wall_start_ms = time.time_ns() // 1_000_000
     t0 = time.perf_counter()
     if args.fixed_rates:
         sampler.start()
@@ -317,6 +318,7 @@ def main():
                 for f in futs:
                     f.result()
     elapsed = time.perf_counter() - t0
+    wall_end_ms = time.time_ns() // 1_000_000
 
     def percentile(lat, q):
         return lat[math.ceil(q * len(lat)) - 1] if lat else None
@@ -365,6 +367,8 @@ def main():
             sample["expected_max"] = args.rows + during
             if not sample["expected_min"] <= sample["rows"] <= sample["expected_max"]:
                 raise RuntimeError(f"dashboard returned a stale or mixed snapshot: {sample}")
+        out["window_start_ms"] = wall_start_ms
+        out["window_end_ms"] = wall_end_ms
         out["committed_probe_rows"] = probe_rows
         out["dashboard_snapshot_checks"] = dashboard_observations
         out["dashboard_post_ack_observations"] = sum(

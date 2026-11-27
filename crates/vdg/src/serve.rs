@@ -250,6 +250,7 @@ struct AuditMetrics {
 
 /// One queued record plus the channel used to tell the handler when it is durable.
 struct AuditJob {
+    queued_at_us: u64,
     rec: QueryRecord,
     ack: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
@@ -496,29 +497,47 @@ fn append_records_to_doc(doc: &mut AuditDoc, records: Vec<QueryRecord>) {
     }
 }
 
-async fn commit_audit_batch(
+#[derive(Default)]
+struct AuditBatchTiming {
+    load_us: u64,
+    encode_us: u64,
+    put_us: u64,
+    attempts: usize,
+    conflicts: usize,
+}
+
+async fn commit_audit_batch_observed(
     s: &Store,
     table: &str,
     cache: &mut Option<AuditCache>,
     records: Vec<QueryRecord>,
+    clock: &dyn Clock,
+    timing: &mut AuditBatchTiming,
 ) -> anyhow::Result<()> {
     for attempt in 0..8 {
+        timing.attempts += 1;
         if cache.is_none() {
-            let (doc, version) = load_audit(s, table).await?;
+            let begin = clock.monotonic_micros();
+            let loaded = load_audit(s, table).await;
+            timing.load_us += clock.monotonic_micros().saturating_sub(begin);
+            let (doc, version) = loaded?;
             *cache = Some(AuditCache {
                 doc,
                 version,
                 no_cas: false,
             });
         }
+        let encode_start = clock.monotonic_micros();
         let entry = cache.as_mut().expect("just loaded");
         let mut doc = entry.doc.clone();
         append_records_to_doc(&mut doc, records.clone());
         let bytes = serde_json::to_vec(&doc).context("serializing audit doc")?;
+        timing.encode_us += clock.monotonic_micros().saturating_sub(encode_start);
         if entry.no_cas {
-            s.put(&audit_path(table), bytes.into())
-                .await
-                .context("writing audit doc (no-CAS fallback)")?;
+            let begin = clock.monotonic_micros();
+            let result = s.put(&audit_path(table), bytes.into()).await;
+            timing.put_us += clock.monotonic_micros().saturating_sub(begin);
+            result.context("writing audit doc (no-CAS fallback)")?;
             entry.doc = doc;
             return Ok(());
         }
@@ -526,7 +545,8 @@ async fn commit_audit_batch(
             Some(v) => PutMode::Update(v.clone()),
             None => PutMode::Create,
         };
-        match s
+        let begin = clock.monotonic_micros();
+        let result = s
             .put_opts(
                 &audit_path(table),
                 bytes.clone().into(),
@@ -535,8 +555,9 @@ async fn commit_audit_batch(
                     ..Default::default()
                 },
             )
-            .await
-        {
+            .await;
+        timing.put_us += clock.monotonic_micros().saturating_sub(begin);
+        match result {
             Ok(res) => {
                 entry.doc = doc;
                 entry.version = match (res.e_tag, res.version) {
@@ -552,13 +573,15 @@ async fn commit_audit_batch(
             }
             Err(object_store::Error::Precondition { .. })
             | Err(object_store::Error::AlreadyExists { .. }) => {
+                timing.conflicts += 1;
                 *cache = None; // stale; reload and retry
             }
             Err(object_store::Error::NotImplemented { .. }) => {
                 entry.no_cas = true;
-                s.put(&audit_path(table), bytes.into())
-                    .await
-                    .context("writing audit doc (no-CAS fallback)")?;
+                let begin = clock.monotonic_micros();
+                let result = s.put(&audit_path(table), bytes.into()).await;
+                timing.put_us += clock.monotonic_micros().saturating_sub(begin);
+                result.context("writing audit doc (no-CAS fallback)")?;
                 entry.doc = doc;
                 entry.version = None;
                 return Ok(());
@@ -577,6 +600,18 @@ async fn commit_audit_batch(
     anyhow::bail!("audit append failed after retries under contention")
 }
 
+#[cfg(test)]
+async fn commit_audit_batch(
+    s: &Store,
+    table: &str,
+    cache: &mut Option<AuditCache>,
+    records: Vec<QueryRecord>,
+) -> anyhow::Result<()> {
+    let clock = verdigris_core::clock::SimClock::default();
+    let mut timing = AuditBatchTiming::default();
+    commit_audit_batch_observed(s, table, cache, records, &clock, &mut timing).await
+}
+
 /// One durable-audit worker. It coalesces whatever is already queued into one
 /// conditional append, then acknowledges every record in that batch. A failed
 /// batch is reported to its waiters and counted; the query itself stays
@@ -586,6 +621,7 @@ async fn audit_worker(
     table: String,
     mut rx: tokio::sync::mpsc::Receiver<AuditJob>,
     metrics: Arc<AuditMetrics>,
+    clock: Arc<dyn Clock>,
 ) {
     let mut cache: Option<AuditCache> = None;
     while let Some(first) = rx.recv().await {
@@ -597,9 +633,35 @@ async fn audit_worker(
             }
         }
         let records: Vec<QueryRecord> = batch.iter().map(|j| j.rec.clone()).collect();
-        let result = commit_audit_batch(&s, &table, &mut cache, records)
-            .await
-            .map_err(|e| format!("{e:#}"));
+        let start_us = clock.monotonic_micros();
+        let start_ms = clock.now_millis();
+        let oldest_queued_us = batch
+            .iter()
+            .map(|job| job.queued_at_us)
+            .min()
+            .unwrap_or(start_us);
+        let queue_us = start_us.saturating_sub(oldest_queued_us);
+        let mut timing = AuditBatchTiming::default();
+        let result = commit_audit_batch_observed(
+            &s,
+            &table,
+            &mut cache,
+            records,
+            clock.as_ref(),
+            &mut timing,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"));
+        let commit_us = clock.monotonic_micros().saturating_sub(start_us);
+        if queue_us.saturating_add(commit_us) >= 50_000 {
+            tracing::info!(
+                target: "vdg_bench_audit",
+                start_ms, end_ms = clock.now_millis(), queue_us, commit_us,
+                load_us = timing.load_us, encode_us = timing.encode_us, put_us = timing.put_us,
+                attempts = timing.attempts, conflicts = timing.conflicts,
+                records = batch.len(), ok = result.is_ok(), "slow audit batch"
+            );
+        }
         match &result {
             Ok(()) => {
                 metrics
@@ -638,6 +700,7 @@ async fn persist_audit_with(st: &AppState, rec: QueryRecord, deadline: Duration)
     let deadline_us = started.saturating_add(deadline.as_micros() as u64);
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let job = AuditJob {
+        queued_at_us: started,
         rec: rec.clone(),
         ack: ack_tx,
     };
@@ -1386,10 +1449,19 @@ async fn maybe_compact(
     let mut passes = 0usize;
     loop {
         let _g = ingest_lock.lock().await;
-        let (reports, more) = ingestor
+        let start_us = clock.monotonic_micros();
+        let start_ms = clock.now_millis();
+        let result = ingestor
             .compact_bounded(target_bytes, max_merge_files)
-            .await?;
+            .await;
         drop(_g);
+        tracing::info!(
+            target: "vdg_bench_compaction",
+            start_ms, end_ms = clock.now_millis(),
+            held_us = clock.monotonic_micros().saturating_sub(start_us),
+            ok = result.is_ok(), "compaction pass"
+        );
+        let (reports, more) = result?;
         total_merged += reports.iter().map(|r| r.files_merged).sum::<usize>();
         passes += 1;
         if !more || passes >= 10_000 {
@@ -1584,8 +1656,16 @@ pub async fn serve_with_clock(
         let audit_store = query_store.clone();
         let audit_table = table.clone();
         let audit_metrics = audit_metrics.clone();
+        let audit_clock = clock.clone();
         tokio::spawn(async move {
-            audit_worker(audit_store, audit_table, audit_rx, audit_metrics).await;
+            audit_worker(
+                audit_store,
+                audit_table,
+                audit_rx,
+                audit_metrics,
+                audit_clock,
+            )
+            .await;
         })
     };
 
@@ -4139,12 +4219,20 @@ mod tests {
         let s: Store = Arc::new(object_store::memory::InMemory::new());
         let metrics = Arc::new(AuditMetrics::default());
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let handle = tokio::spawn(audit_worker(s.clone(), "t".into(), rx, metrics.clone()));
+        let clock = Arc::new(verdigris_core::clock::SimClock::default());
+        let handle = tokio::spawn(audit_worker(
+            s.clone(),
+            "t".into(),
+            rx,
+            metrics.clone(),
+            clock,
+        ));
 
         let mut acks = Vec::new();
         for i in 0..20 {
             let (ack, ack_rx) = tokio::sync::oneshot::channel();
             tx.send(AuditJob {
+                queued_at_us: 0,
                 rec: audit_rec(i),
                 ack,
             })
@@ -4235,6 +4323,7 @@ mod tests {
         let st = audit_test_state(s.clone(), tx.clone());
         let (ack, _) = tokio::sync::oneshot::channel();
         tx.try_send(AuditJob {
+            queued_at_us: 0,
             rec: audit_rec(99),
             ack,
         })

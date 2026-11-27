@@ -1,0 +1,58 @@
+name: Verdigris dashboard and audit slow-path replay
+
+on:
+  push:
+    branches: [codex/perf-dashboard-audit]
+
+permissions:
+  contents: read
+
+jobs:
+  experiment:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - trial: 1
+            order: false true
+          - trial: 2
+            order: true false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the instrumented experiment image
+        run: docker build -f bench/Dockerfile.vdg -t verdigris-dashboard-audit:local .
+      - name: Check mutating dashboard freshness and attribute slow audit batches
+        env:
+          VDG_IMAGE: verdigris-dashboard-audit:local
+          RETIRED_GRACE_SECS: '60'
+          MIXED_BASE_TS_MS: '1795764240000'
+          BENCH_RUST_LOG: warn,vdg_bench_audit=info,vdg_bench_compaction=info
+          CACHE_ORDER: ${{ matrix.order }}
+          RESULT_ROOT: ${{ runner.temp }}/verdigris-dashboard-audit
+        run: |
+          set -o pipefail
+          mkdir -p "$RESULT_ROOT"
+          read -r -a arms <<< "$CACHE_ORDER"
+          failures=0
+          for cache in "${arms[@]}"; do
+            if ! CHEAP_PERMITS=2 SCHEDULED_ALERT_WAIT_MS=1000 RUN_MUTATING_TRIAL=1 \
+              CHECK_DRAINED_FRESHNESS=1 DASHBOARD_SNAPSHOT_CACHE="$cache" \
+              OUT="$RESULT_ROOT/cache-$cache" bench/admission/run-fixed.sh; then
+              failures=1
+            fi
+          done
+          if (( failures == 0 )); then
+            python3 -B bench/admission/check-dashboard-audit.py "$RESULT_ROOT" | tee "$RESULT_ROOT/decision.json"
+          fi
+          exit "$failures"
+      - name: Upload both treatment arms
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-dashboard-audit-${{ matrix.trial }}
+          path: ${{ runner.temp }}/verdigris-dashboard-audit
+          retention-days: 7
