@@ -13,6 +13,9 @@ from compare import (
     row_ts_ms, validate_aggregation, validate_search, validate_trace,
 )
 
+from newest_window import compare as compare_newest_window
+
+
 SHAPES = ("trace_hit", "trace_miss", "trace_cross_tier", "recent_search", "minute_aggregation")
 
 
@@ -244,6 +247,7 @@ def main():
     mode.add_argument("--first", choices=SHAPES)
     mode.add_argument("--compare-search", action="store_true")
     mode.add_argument("--compare-cutoff", action="store_true")
+    mode.add_argument("--compare-window", action="store_true")
     args = parser.parse_args()
     if args.iterations < 1 or args.warmup < 0:
         parser.error("iterations must be positive and warmup cannot be negative")
@@ -252,12 +256,18 @@ def main():
     if corpus["base_ts_ms"] != BASE_TS:
         parser.error("CORPUS_TS_MS must match the seed report's corpus timestamp")
     expected = {"recent_search": expected_search(corpus["rows"])}
-    if not (args.compare_search or args.compare_cutoff) and args.first in (None, "minute_aggregation"):
+    if not (args.compare_search or args.compare_cutoff or args.compare_window) and args.first in (None, "minute_aggregation"):
         expected["minute_aggregation"] = expected_buckets(corpus["rows"])
     backend = Vdg(args)
     out = {"corpus": corpus, "mode": "first_after_restart" if args.first else "warm", "queries": {}}
     try:
-        if args.compare_cutoff:
+        if args.compare_window:
+            out.pop("queries")
+            out["mode"] = "search_newest_window"
+            out["comparison"] = compare_newest_window(
+                backend, corpus["rows"], expected["recent_search"], args.iterations, args.warmup, percentiles,
+            )
+        elif args.compare_cutoff:
             out.pop("queries")
             out["mode"] = "search_cutoff"
             out["comparison"] = compare_cutoff(backend, expected["recent_search"], args.iterations, args.warmup)
