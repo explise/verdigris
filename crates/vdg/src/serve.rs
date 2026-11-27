@@ -4003,6 +4003,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audit_batch_reloads_after_stale_etag() {
+        let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let table = "test-audit-stale-update";
+        let path = audit_path(table);
+        match store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => panic!("clearing test audit object: {error}"),
+        }
+        append_audit(&store, table, audit_rec(0)).await.unwrap();
+        let (established, version) = load_audit(&store, table).await.unwrap();
+        let version = version.unwrap();
+        let initial_etag = version.e_tag.clone().expect("CAS requires an ETag");
+        // Establish the same cached version in both replicas before either writes.
+        let mut first = Some(AuditCache {
+            doc: established.clone(),
+            version: Some(version.clone()),
+            no_cas: false,
+        });
+        let mut stale = Some(AuditCache {
+            doc: established,
+            version: Some(version),
+            no_cas: false,
+        });
+        commit_audit_batch(&store, table, &mut first, vec![audit_rec(1)])
+            .await
+            .unwrap();
+        let (_, written_version) = load_audit(&store, table).await.unwrap();
+        assert_ne!(
+            written_version.unwrap().e_tag.as_deref(),
+            Some(initial_etag.as_str())
+        );
+        assert_eq!(
+            stale
+                .as_ref()
+                .unwrap()
+                .version
+                .as_ref()
+                .unwrap()
+                .e_tag
+                .as_deref(),
+            Some(initial_etag.as_str()),
+        );
+        commit_audit_batch(&store, table, &mut stale, vec![audit_rec(2)])
+            .await
+            .unwrap();
+        let (durable, _) = load_audit(&store, table).await.unwrap();
+        let ids: Vec<_> = durable
+            .queries
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect();
+        assert_eq!(ids, ["audit-0", "audit-1", "audit-2"]);
+        assert!(!stale.unwrap().no_cas);
+    }
+
+    #[tokio::test]
     async fn same_clock_and_counter_replicas_keep_both_records() {
         let s: Store = Arc::new(object_store::memory::InMemory::new());
         let clock: Arc<dyn Clock> =
