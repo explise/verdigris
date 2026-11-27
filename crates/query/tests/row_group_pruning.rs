@@ -98,6 +98,7 @@ async fn seeded() -> (Arc<dyn ObjectStore>, DataFile) {
         services: stats.services,
         levels: stats.levels,
         row_groups: stats.row_groups,
+        minute_summary: None,
         message_trigrams: Some(stats.message_trigrams),
         row_group_trigrams: Some(stats.row_group_trigrams),
     };
@@ -355,6 +356,7 @@ async fn trace_lookup_prunes_by_bloom_when_statistics_overlap() {
         services: stats.services,
         levels: stats.levels,
         row_groups: stats.row_groups,
+        minute_summary: None,
         message_trigrams: Some(stats.message_trigrams),
         row_group_trigrams: Some(stats.row_group_trigrams),
     };

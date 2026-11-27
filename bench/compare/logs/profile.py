@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from compare import (
-    BASE_TS, CROSS_TRACE, RECENT_SEARCH_SQL, Vdg, expected_buckets, expected_search,
+    BASE_TS, CROSS_TRACE, MINUTE_AGGREGATE_SQL, RECENT_SEARCH_SQL, Vdg, expected_buckets, expected_search,
     validate_aggregation, validate_search, validate_trace,
 )
 
@@ -53,6 +53,8 @@ def run_one(backend, shape, index, corpus, mode, expected):
         "audit_ms": backend.last_stats.get("auditMs"),
         "planned_files": backend.last_stats.get("files"),
         "planned_bytes": backend.last_stats.get("scannedBytes"),
+        "execution": backend.last_stats.get("execution"),
+        "minute_summary_bytes_upper_bound": backend.last_stats.get("minuteSummaryBytesUpperBound"),
         "profile": backend.last_profile,
     }
 
@@ -143,6 +145,7 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--first", choices=SHAPES)
     mode.add_argument("--compare-search", action="store_true")
+    parser.add_argument("--minute-summary-pilot", action="store_true")
     args = parser.parse_args()
     if args.iterations < 1 or args.warmup < 0:
         parser.error("iterations must be positive and warmup cannot be negative")
@@ -183,6 +186,14 @@ def main():
             if status != 200:
                 raise RuntimeError(f"query metrics failed with HTTP {status}")
             out["audit_counters_after"] = json.loads(data)["audit"]
+            if args.minute_summary_pilot:
+                body = json.dumps({"sql": MINUTE_AGGREGATE_SQL, "tiers": []}).encode()
+                status, _, data = backend.client.request(
+                    "POST", "/v1/query/estimate", body, {"content-type": "application/json"}
+                )
+                if status != 200:
+                    raise RuntimeError(f"minute-summary estimate failed: HTTP {status}")
+                out["minute_summary_quote"] = json.loads(data)
     finally:
         backend.close()
 

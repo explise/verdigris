@@ -179,6 +179,7 @@ mod tests {
             tier,
             services: vec![],
             levels: vec![],
+            minute_summary: None,
             message_trigrams: None,
             row_groups: 0,
             row_group_trigrams: None,
@@ -259,6 +260,7 @@ mod tests {
             levels: vec!["ERROR".into()],
             message_trigrams: trigrams_of("connection timeout to db-primary"),
             row_groups: 0,
+            minute_summary: None,
             row_group_trigrams: None,
         });
         m.add(DataFile {
@@ -272,6 +274,7 @@ mod tests {
             levels: vec!["INFO".into()],
             message_trigrams: trigrams_of("invoice generated"),
             row_groups: 0,
+            minute_summary: None,
             row_group_trigrams: None,
         });
         // A legacy file with no stats must always be scanned (no false prune).
@@ -284,6 +287,7 @@ mod tests {
             tier: Tier::Hot,
             services: vec![],
             levels: vec![],
+            minute_summary: None,
             message_trigrams: None,
             row_groups: 0,
             row_group_trigrams: None,

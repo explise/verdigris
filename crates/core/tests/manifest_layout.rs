@@ -13,6 +13,7 @@ fn file(path: &str) -> DataFile {
         tier: Tier::Hot,
         services: vec![],
         levels: vec![],
+        minute_summary: None,
         message_trigrams: None,
         row_groups: 0,
         row_group_trigrams: None,

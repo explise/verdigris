@@ -43,6 +43,12 @@ pub struct ScanPlan<'a> {
 }
 
 impl ScanPlan<'_> {
+    /// Metadata execution reads no object beyond the manifest that formed this
+    /// plan. Its admission and quote still reserve the full raw file scope.
+    pub fn minute_summary(&self) -> Option<(Vec<crate::minute::MinuteCount>, u64)> {
+        crate::minute::MinuteSummary::merge(&self.files)
+    }
+
     /// Bytes the plan will read. Charged at file granularity, which is what a
     /// cold-tier retrieval bills and what the estimator quotes.
     pub fn scanned_bytes(&self) -> u64 {
@@ -110,6 +116,7 @@ mod tests {
             tier,
             services: vec![],
             levels: vec![],
+            minute_summary: None,
             message_trigrams: None,
             row_groups: 0,
             row_group_trigrams: None,

@@ -16,6 +16,7 @@ pub mod cost;
 pub mod estimate;
 pub mod lifecycle;
 pub mod manifest;
+pub mod minute;
 pub mod model;
 pub mod rng;
 pub mod scan;

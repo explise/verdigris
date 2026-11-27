@@ -1298,11 +1298,13 @@ async fn maybe_compact(
     trigger: usize,
     max_merge_files: usize,
     retired_grace_ms: u64,
+    minute_summaries: bool,
     metrics: &CompactionMetrics,
 ) -> anyhow::Result<()> {
     let ingestor = verdigris_ingest::Ingestor::new(s.clone(), table)
         .with_clock(clock.clone())
-        .with_retired_grace_ms(retired_grace_ms);
+        .with_retired_grace_ms(retired_grace_ms)
+        .with_minute_summaries(minute_summaries);
     // Reclaim expired tombstones even when there is no merge work this tick:
     // otherwise the last compaction's old files would stay forever once the
     // backlog falls below the trigger.
@@ -1602,6 +1604,7 @@ pub async fn serve_with_clock(
             let cm = state.compaction.clone();
             let lock = state.ingest_lock.clone();
             let ccfg = state.cfg.compaction.clone();
+            let minute_summaries = state.cfg.ingest.minute_summaries;
             let clock = state.clock.clone();
             tokio::spawn(async move {
                 let target = ccfg.target_bytes();
@@ -1617,6 +1620,7 @@ pub async fn serve_with_clock(
                         ccfg.trigger_pending_files,
                         ccfg.max_merge_files_per_pass,
                         ccfg.retired_grace_ms(),
+                        minute_summaries,
                         &cm,
                     )
                     .await
@@ -2191,7 +2195,21 @@ async fn h_query(
 
     // Run the query once, in the negotiated wire (never both).
     let t0 = st.clock.monotonic_micros();
-    let (arrow_body, json_rows, rows_returned) = if arrow {
+    let summary =
+        if st.cfg.query.minute_summaries && !arrow && !req.histogram && req.tiers.is_empty() {
+            verdigris_query::engine::minute_summary_json(&plan, st.table.as_str(), &limits(&st))
+                .map_err(AppError::from_query)?
+        } else {
+            None
+        };
+    let minute_summary_bytes = summary.as_ref().map(|(_, bytes)| *bytes);
+    let (arrow_body, json_rows, rows_returned) = if let Some((rows, _)) = summary {
+        if let Some(profile) = &mut profile {
+            profile.mark("execute");
+        }
+        let n = rows.len();
+        (Vec::new(), Value::Array(rows), n)
+    } else if arrow {
         let out = verdigris_query::engine::query_table_arrow_with_rows_profiled(
             s.clone(),
             st.table.as_str(),
@@ -2327,6 +2345,11 @@ async fn h_query(
     let audit_us = st.clock.monotonic_micros().saturating_sub(audit_start);
     let total_us = st.clock.monotonic_micros().saturating_sub(t_request);
     if let Some(obj) = stats.as_object_mut() {
+        if let Some(bytes) = minute_summary_bytes {
+            obj.insert("execution".into(), json!("minute_summary"));
+            obj.insert("minuteSummaryBytesUpperBound".into(), json!(bytes));
+            obj.insert("parquetDataBytesRead".into(), json!(0));
+        }
         obj.insert("auditMs".into(), json!(audit_us / 1_000));
         obj.insert("totalMs".into(), json!(total_us / 1_000));
     }
@@ -2594,7 +2617,8 @@ async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
     let ingested = records.len();
 
     let s = store(&st)?;
-    let ingestor = verdigris_ingest::Ingestor::new(s, st.table.as_str());
+    let ingestor = verdigris_ingest::Ingestor::new(s, st.table.as_str())
+        .with_minute_summaries(st.cfg.ingest.minute_summaries);
     let written = ingest_write_then_commit(&st, &ingestor, records).await?;
     let bytes: u64 = written.iter().map(|f| f.bytes).sum();
     st.metrics
@@ -2624,7 +2648,8 @@ async fn h_otlp(State(st): State<AppState>, body: String) -> ApiResult {
     let ingested = records.len();
 
     let s = store(&st)?;
-    let ingestor = verdigris_ingest::Ingestor::new(s, st.table.as_str());
+    let ingestor = verdigris_ingest::Ingestor::new(s, st.table.as_str())
+        .with_minute_summaries(st.cfg.ingest.minute_summaries);
     let written = ingest_write_then_commit(&st, &ingestor, records).await?;
     let bytes: u64 = written.iter().map(|f| f.bytes).sum();
     st.metrics
@@ -3577,6 +3602,7 @@ mod tests {
             10_000,
             128,
             verdigris_ingest::DEFAULT_RETIRED_GRACE_MS,
+            false,
             &metrics,
         )
         .await
@@ -3599,6 +3625,7 @@ mod tests {
             2,
             2,
             verdigris_ingest::DEFAULT_RETIRED_GRACE_MS,
+            false,
             &metrics,
         )
         .await

@@ -295,7 +295,8 @@ async fn run_ingest(
     use verdigris_core::batch::{BatchPolicy, LogRecord};
 
     let store = verdigris_storage::build(&cfg.storage)?;
-    let ingestor = verdigris_ingest::Ingestor::new(store, table);
+    let ingestor = verdigris_ingest::Ingestor::new(store, table)
+        .with_minute_summaries(cfg.ingest.minute_summaries);
     let policy = BatchPolicy {
         max_rows,
         ..BatchPolicy::default()
@@ -387,7 +388,8 @@ async fn run_compact(cfg: &Config, table: &str, target_mb: u64) -> anyhow::Resul
     let store = verdigris_storage::build(&cfg.storage)?;
     let ingestor = verdigris_ingest::Ingestor::new(store, table)
         .with_clock(std::sync::Arc::new(crate::realclock::RealClock::new()))
-        .with_retired_grace_ms(cfg.compaction.retired_grace_ms());
+        .with_retired_grace_ms(cfg.compaction.retired_grace_ms())
+        .with_minute_summaries(cfg.ingest.minute_summaries);
     let before = ingestor.load_manifest().await?.files.len();
 
     let reports = ingestor.compact(target_mb * 1024 * 1024).await?;

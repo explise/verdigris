@@ -53,6 +53,18 @@ for attempt in {1..30}; do
   sleep 1
 done
 sed -e 's/vdgbench-minio/minio/g' -e "s/^cores = .*/cores = $SERVICE_CPUS/" bench/compare/logs/vdg.toml > "$scratch/config.toml"
+pilot=${MINUTE_SUMMARY_PILOT:-}
+case "$pilot" in
+  ''|off|on) ;;
+  *) echo 'MINUTE_SUMMARY_PILOT must be off or on' >&2; exit 2 ;;
+esac
+if [[ -n "$pilot" ]]; then
+  sed -i '/^\[compaction\]/,$ s/^enabled = true$/enabled = false/' "$scratch/config.toml"
+fi
+if [[ "$pilot" == on ]]; then
+  sed -i '/^\[ingest\]$/a minute_summaries = true' "$scratch/config.toml"
+  sed -i '/^\[query\]$/a minute_summaries = true' "$scratch/config.toml"
+fi
 chmod 644 "$scratch/config.toml"
 
 vdg=$(docker run -d --pull never --network "$net" --cpus="$SERVICE_CPUS" --memory=3g \
@@ -83,10 +95,23 @@ wait_ready
 } > "$OUT/machine.txt"
 cp "$scratch/config.toml" "$OUT/config.toml"
 
+seed_args=()
+profile_args=()
+if [[ -n "$pilot" ]]; then
+  seed_args=(--threads 1 --vdg-compact-container "$vdg")
+  profile_args=(--minute-summary-pilot)
+fi
 python3 -B bench/compare/logs/compare.py --system vdg --port "$port" --rows "$ROWS" --batch-rows "$BATCH_ROWS" \
-  --iterations 1 --warmup 0 --out "$OUT/seed.json"
+  "${seed_args[@]}" --iterations 1 --warmup 0 --out "$OUT/seed.json"
+if [[ -n "$pilot" ]]; then
+  docker run --rm --pull never --network "$net" \
+    -e MC_HOST_local=http://minioadmin:minioadmin@minio:9000 "$MC" \
+    stat --json local/verdigris/bench/_metadata/manifest.json > "$OUT/manifest-object.json"
+  docker inspect --format 'OOMKilled={{.State.OOMKilled}} restarts={{.RestartCount}}' "$vdg" > "$OUT/vdg-state.txt"
+fi
 profile=(python3 -B bench/compare/logs/profile.py --seed-report "$OUT/seed.json")
-"${profile[@]}" --port "$port" --iterations "$ITERATIONS" --warmup "$WARMUP" --out "$OUT/warm.json"
+"${profile[@]}" --port "$port" --iterations "$ITERATIONS" --warmup "$WARMUP" \
+  "${profile_args[@]}" --out "$OUT/warm.json"
 if [[ "${SEARCH_CONTROL:-0}" == 1 ]]; then
   "${profile[@]}" --port "$port" --compare-search --iterations 20 --warmup 5 --out "$OUT/search-comparison.json"
 fi

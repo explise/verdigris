@@ -326,6 +326,7 @@ fn a_count_mismatch_disables_pruning_rather_than_misapplying_it() {
         services: stats.services.clone(),
         levels: stats.levels.clone(),
         row_groups: stats.row_groups,
+        minute_summary: None,
         message_trigrams: Some(stats.message_trigrams.clone()),
         row_group_trigrams: Some(stats.row_group_trigrams.clone()),
     };
