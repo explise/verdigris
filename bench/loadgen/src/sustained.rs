@@ -501,7 +501,7 @@ mod tests {
     fn batches_have_unique_row_ids_in_the_requested_time_range() {
         let args = Args::parse_from(["loadgen", "--batch-rows", "2", "--body-bytes", "4096"]);
         let (tx, mut rx) = mpsc::channel(2);
-        produce(&args, 2, 3, 1000, tx).unwrap();
+        produce(&args, 2, 3, 1000, "sustained", tx).unwrap();
         let first = rx.try_recv().unwrap();
         let last = rx.try_recv().unwrap();
         assert_eq!((first.rows, last.rows), (2, 1));
