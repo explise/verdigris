@@ -25,10 +25,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - rows: 1000000
+          - trial: 2
+            rows: 1000000
+            batch: 10000
+            order: summary raw
+          - trial: 2
+            rows: 20000000
+            batch: 50000
+            order: raw summary
+          - trial: 3
+            rows: 1000000
             batch: 10000
             order: raw summary
-          - rows: 20000000
+          - trial: 3
+            rows: 20000000
             batch: 50000
             order: summary raw
     runs-on: ubuntu-24.04
@@ -54,7 +64,9 @@ jobs:
           PILOT_ORDER: ${{ matrix.order }}
           ROOT: ${{ runner.temp }}/verdigris-minute-pilot
         run: |
+          set -o pipefail
           mkdir -p "$ROOT"
+          printf '%s\n' "$PILOT_ORDER" > "$ROOT/arm-order.txt"
           failures=0
           read -r -a arms <<< "$PILOT_ORDER"
           for arm in "${arms[@]}"; do
@@ -63,13 +75,13 @@ jobs:
             MINUTE_SUMMARY_PILOT="$pilot" OUT="$ROOT/$arm" bench/compare/logs/run-profile.sh || failures=1
           done
           if (( failures == 0 )); then
-            python3 -B bench/compare/logs/check-minute-summary-pilot.py "$ROOT" | tee "$ROOT/decision.json"
+            python3 -B bench/compare/logs/check-minute-summary-pilot.py "$ROOT" | tee "$ROOT/decision.json" || failures=1
           fi
           exit "$failures"
       - name: Upload raw storage, timing and audit evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: verdigris-minute-pilot-${{ matrix.rows }}
+          name: verdigris-minute-pilot-${{ matrix.rows }}-trial-${{ matrix.trial }}
           path: ${{ runner.temp }}/verdigris-minute-pilot
           retention-days: 7

@@ -12,8 +12,21 @@ def read(path, enabled):
     seed, warm, meta = (load(name) for name in ("seed.json", "warm.json", "manifest-object.json"))
     if not warm["validated_exact_results"] or "OOMKilled=false" not in (path / "vdg-state.txt").read_text():
         raise ValueError(f"{path.name}: data or container verification failed")
-    if any(warm["audit_counters_after"][key] for key in ("failedTotal", "timedOutTotal", "saturatedTotal")):
+    after = warm["audit_counters_after"]
+    if any(after[key] for key in ("failedTotal", "timedOutTotal", "saturatedTotal")):
         raise ValueError(f"{path.name}: audit was unhealthy")
+    if "audit_counters_before" in warm:
+        before = warm["audit_counters_before"]
+        if after["ackedTotal"] - before["ackedTotal"] != warm["expected_audit_acks"]:
+            raise ValueError(f"{path.name}: missing durable query audit acknowledgement")
+    for shape in warm["queries"]:
+        restart = load(f"restart-{shape}.json")
+        sample = restart["queries"][shape]
+        if not restart["validated_exact_results"] or sample["audit_ms"] is None:
+            raise ValueError(f"{path.name}/{shape}: restart data or audit verification failed")
+        summarized = enabled and shape == "minute_aggregation"
+        if (sample["execution"] == "minute_summary") != summarized:
+            raise ValueError(f"{path.name}/{shape}: wrong execution path after restart")
     quote = warm["minute_summary_quote"]
     cohorts = warm["queries"]["minute_aggregation"]
     for mode, cohort in cohorts.items():

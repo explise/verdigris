@@ -166,6 +166,12 @@ def main():
         elif args.first:
             out["queries"][args.first] = run_one(backend, args.first, 0, corpus, "1", expected)
         else:
+            if args.minute_summary_pilot:
+                status, _, data = backend.client.request("GET", "/v1/metrics")
+                if status != 200:
+                    raise RuntimeError(f"initial query metrics failed with HTTP {status}")
+                out["audit_counters_before"] = json.loads(data)["audit"]
+                out["expected_audit_acks"] = len(SHAPES) * (args.warmup + 2 * args.iterations) + 2
             for shape in SHAPES:
                 for index in range(args.warmup):
                     run_one(backend, shape, index, corpus, "1", expected)
