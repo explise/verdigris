@@ -1,0 +1,40 @@
+name: Verdigris 20M sizing profile
+
+on:
+  push:
+    branches: [codex/perf-sizing-replay]
+
+permissions:
+  contents: read
+
+jobs:
+  sizing:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the release benchmark image
+        run: docker build -f bench/Dockerfile.vdg -t verdigris-sizing-replay:local .
+      - name: Fetch the profile script's pinned images
+        run: |
+          set -o pipefail
+          sed -nE 's/^(MINIO|MC|BUSYBOX)=//p' bench/compare/logs/run-profile.sh |
+            while IFS= read -r image; do docker pull "$image" || exit; done
+      - name: Profile five warm and restart query shapes at 20M rows
+        env:
+          VDG_IMAGE: verdigris-sizing-replay:local
+          ROWS: '20000000'
+          BATCH_ROWS: '50000'
+          ITERATIONS: '100'
+          WARMUP: '10'
+          OUT: ${{ runner.temp }}/verdigris-sizing-replay
+        run: bench/compare/logs/run-profile.sh
+      - name: Upload raw sizing profiles
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-sizing-replay
+          path: ${{ runner.temp }}/verdigris-sizing-replay
+          retention-days: 7
