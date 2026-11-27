@@ -1,0 +1,40 @@
+name: Verdigris integration-head S3 CAS contract
+
+on:
+  push:
+    branches: [codex/perf-integration-s3-cas]
+
+permissions:
+  contents: read
+
+jobs:
+  s3-cas:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CAS_CONTAINER: vdg-cas-${{ github.run_id }}-${{ github.run_attempt }}
+      VERDIGRIS_S3_BUCKET: verdigris-test
+      VERDIGRIS_S3_ACCESS_KEY: minioadmin
+      VERDIGRIS_S3_SECRET_KEY: minioadmin
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Start and verify the pinned loopback fixture
+        run: |
+          docker run -d --rm --name "$CAS_CONTAINER" -p 127.0.0.1::9000 \
+            -e MINIO_ROOT_USER="$VERDIGRIS_S3_ACCESS_KEY" -e MINIO_ROOT_PASSWORD="$VERDIGRIS_S3_SECRET_KEY" \
+            cgr.dev/chainguard/minio@sha256:634c989a2f1029162fc2676c263caa181213b9410449968532f750a6fb77532d server /data
+          address=$(docker port "$CAS_CONTAINER" 9000/tcp)
+          endpoint="http://$address"
+          curl -fsS --max-time 2 --retry 20 --retry-all-errors "$endpoint/minio/health/ready"
+          docker run --rm --network host \
+            -e "MC_HOST_local=http://$VERDIGRIS_S3_ACCESS_KEY:$VERDIGRIS_S3_SECRET_KEY@$address" \
+            cgr.dev/chainguard/minio-client@sha256:36ac7ab6d181f259ab62defe0bb55ad1dbf89b152f0b8f49b1c63049374d812f \
+            mb --ignore-existing "local/$VERDIGRIS_S3_BUCKET"
+          printf 'VERDIGRIS_S3_ENDPOINT=%s\n' "$endpoint" >> "$GITHUB_ENV"
+      - name: Verify conditional writes and concurrent committed rows
+        run: cargo test --locked -p verdigris-ingest --test minio_s3 -- --include-ignored
+      - name: Stop the fixture
+        if: always()
+        run: docker rm -f "$CAS_CONTAINER" >/dev/null || true
