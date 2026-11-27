@@ -81,6 +81,11 @@ def summarize(samples):
             "read_wait_sum_us", "read_wait_max_us", "read_wait_critical_us",
             "read_max_concurrent",
         )
+        summary["scan_work"] = {
+            key: percentiles([p[key] for p in profiles])
+            for key in ("scan_output_rows", "parquet_pushdown_rows_pruned",
+                        "parquet_file_ranges_pruned", "row_groups_pruned", "pages_pruned")
+        }
         summary["object_reads"] = {
             key: percentiles([p["object_reads"][key] for p in profiles])
             for key in read_keys
@@ -132,6 +137,32 @@ def compare_search(backend, expected, iterations, warmup):
     return comparison
 
 
+def check_recent_scope(backend, expected, plan):
+    """Capture the approved scan and both activity responses for the A/B."""
+    args = {"sql": RECENT_SEARCH_SQL, "tiers": []}
+
+    def post(path, payload):
+        status, _, data = backend.client.request(
+            "POST", path, json.dumps(payload).encode(), {"content-type": "application/json"}
+        )
+        if status != 200:
+            raise RuntimeError(f"{path} failed with HTTP {status}: {data[:300]!r}")
+        return json.loads(data)
+
+    quote = post("/v1/query/estimate", args)
+    combined = post("/v1/query", {**args, "histogram": True})
+    activity = post("/v1/query/activity", args)
+    validate_search(combined["rows"], expected)
+    quoted = (quote["filesTouched"], quote["scanBytes"])
+    if quoted != (plan["planned_files"], plan["planned_bytes"]):
+        raise RuntimeError("recent-search quote and rows-only execution disagree")
+    if quoted != (combined["stats"]["files"], combined["stats"]["scannedBytes"]):
+        raise RuntimeError("recent-search quote and combined execution disagree")
+    if activity["stats"]["files"] != quoted[0] or activity["histogram"] != combined["histogram"]:
+        raise RuntimeError("recent-search activity differs from the combined histogram")
+    return {"files": quoted[0], "bytes": quoted[1], "quote": quote, "histogram": activity["histogram"]}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -140,6 +171,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--check-recent-scope", action="store_true")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--first", choices=SHAPES)
     mode.add_argument("--compare-search", action="store_true")
@@ -179,6 +211,13 @@ def main():
 
             out["representative_plan"] = run_one(backend, "trace_hit", 0, corpus, "plan", expected)["profile"]
             out["recent_search_plan"] = run_one(backend, "recent_search", 0, corpus, "plan", expected)
+            if args.check_recent_scope:
+                scope = check_recent_scope(backend, expected["recent_search"], out["recent_search_plan"])
+                out["recent_scope"] = scope
+                for cohort in out["queries"]["recent_search"].values():
+                    for sample in cohort["samples"]:
+                        if (sample["planned_files"], sample["planned_bytes"]) != (scope["files"], scope["bytes"]):
+                            raise RuntimeError("recent-search scope changed during the warm run")
             status, _, data = backend.client.request("GET", "/v1/metrics")
             if status != 200:
                 raise RuntimeError(f"query metrics failed with HTTP {status}")

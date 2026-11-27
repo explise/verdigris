@@ -169,6 +169,7 @@ pub struct QueryLimits {
     pub max_result_bytes: u64,
     /// Target partitions for execution; each carries its own buffers.
     pub target_partitions: usize,
+    pub profile_batch_rows: Option<usize>,
 }
 
 impl QueryLimits {
@@ -178,6 +179,7 @@ impl QueryLimits {
             max_result_rows: q.max_result_rows,
             max_result_bytes: q.max_result_mib.saturating_mul(1024 * 1024),
             target_partitions: (q.cores as usize).max(1),
+            profile_batch_rows: q.profile_batch_rows.map(|rows| rows.clamp(256, 8192)),
         }
     }
 }
@@ -249,6 +251,9 @@ async fn collect_batches(
     // equality lookup (`trace_id = '…'`, `service = 'auth'`) reads only the row
     // groups whose bloom filter admits the value, instead of every row.
     let mut cfg = SessionConfig::new().with_target_partitions(limits.target_partitions);
+    if let Some(batch_rows) = limits.profile_batch_rows {
+        cfg = cfg.with_batch_size(batch_rows);
+    }
     {
         let opts = cfg.options_mut();
         opts.execution.parquet.bloom_filter_on_read = true;

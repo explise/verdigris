@@ -291,6 +291,8 @@ pub struct QueryConfig {
     /// each partition carries its own buffers, so this bounds concurrency and
     /// therefore peak execution memory.
     pub cores: u32,
+    /// Optional execution batch size for controlled profiling.
+    pub profile_batch_rows: Option<usize>,
 
     // ── Memory bounds (issue #2: run comfortably on a 1–2 GB box) ──────────
     //
@@ -335,6 +337,7 @@ impl Default for QueryConfig {
         Self {
             modeled_mibps_per_core: 100.0,
             cores: 4,
+            profile_batch_rows: None,
             // Sized so the engine, the accumulated result and the rest of the
             // process all fit inside a 2 GB box with headroom.
             memory_pool_mib: 512,

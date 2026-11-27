@@ -445,6 +445,27 @@ async fn limits_are_derived_from_the_config_knobs() {
     assert_eq!(l.target_partitions, 3);
 }
 
+#[tokio::test]
+async fn profile_batch_size_preserves_exact_order_and_limits() {
+    let (store, manifest) = seeded_table().await;
+    let files = all_paths(&manifest);
+    let standard = QueryLimits::default();
+    let tuned = QueryLimits::from_config(&verdigris_core::config::QueryConfig {
+        profile_batch_rows: Some(1024),
+        ..Default::default()
+    });
+    assert_eq!(tuned.profile_batch_rows, Some(1024));
+    assert_eq!(tuned.target_partitions, standard.target_partitions);
+    let sql = "SELECT * FROM logs ORDER BY ts DESC, service ASC LIMIT 20";
+    let baseline = engine::query_table_json(store.clone(), "logs", &files, sql, &standard)
+        .await
+        .unwrap();
+    let treatment = engine::query_table_json(store, "logs", &files, sql, &tuned)
+        .await
+        .unwrap();
+    assert_eq!(treatment, baseline);
+}
+
 /// Cache safety for legacy keys. A legacy object can be replaced in place with
 /// different bytes of the same length; its key proves nothing about identity, so
 /// the shared schema/footer cache must be bypassed. A content-addressed key in

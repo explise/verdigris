@@ -22,6 +22,9 @@ pub struct QueryProfile {
     parquet_bytes: usize,
     row_groups_pruned: usize,
     pages_pruned: usize,
+    scan_output_rows: usize,
+    parquet_pushdown_rows_pruned: usize,
+    parquet_file_ranges_pruned: usize,
 }
 
 impl QueryProfile {
@@ -37,6 +40,9 @@ impl QueryProfile {
             parquet_bytes: 0,
             row_groups_pruned: 0,
             pages_pruned: 0,
+            scan_output_rows: 0,
+            parquet_pushdown_rows_pruned: 0,
+            parquet_file_ranges_pruned: 0,
         }
     }
 
@@ -55,6 +61,9 @@ impl QueryProfile {
             "parquet_bytes": self.parquet_bytes,
             "row_groups_pruned": self.row_groups_pruned,
             "pages_pruned": self.pages_pruned,
+            "scan_output_rows": self.scan_output_rows,
+            "parquet_pushdown_rows_pruned": self.parquet_pushdown_rows_pruned,
+            "parquet_file_ranges_pruned": self.parquet_file_ranges_pruned,
             "physical_plan": self.plan,
         })
     }
@@ -81,6 +90,14 @@ impl QueryProfile {
                     ("bytes_scanned", MetricValue::Count { count, .. }) => {
                         self.parquet_bytes += count.value()
                     }
+                    ("pushdown_rows_pruned", MetricValue::Count { count, .. }) => {
+                        self.parquet_pushdown_rows_pruned += count.value()
+                    }
+                    ("output_rows", MetricValue::OutputRows(count))
+                        if plan.name() == "DataSourceExec" =>
+                    {
+                        self.scan_output_rows += count.value()
+                    }
                     (
                         name,
                         MetricValue::PruningMetrics {
@@ -91,6 +108,8 @@ impl QueryProfile {
                             self.row_groups_pruned += pruning_metrics.pruned();
                         } else if name.starts_with("page_index_pages_pruned") {
                             self.pages_pruned += pruning_metrics.pruned();
+                        } else if name == "files_ranges_pruned_statistics" {
+                            self.parquet_file_ranges_pruned += pruning_metrics.pruned();
                         }
                     }
                     _ => {}

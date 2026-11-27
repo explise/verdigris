@@ -1,0 +1,54 @@
+name: Verdigris recent-search execution batch size
+
+on:
+  push:
+    branches: [codex/perf-search-batch]
+
+permissions:
+  contents: read
+
+jobs:
+  batch-test:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify ordered query results at the smaller batch size
+        run: cargo test --locked -p verdigris-query --features datafusion --test engine profile_batch_size
+  profiles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the integrated release image
+        run: docker build -f bench/Dockerfile.vdg -t verdigris-search-batch:local .
+      - name: Pull the pinned benchmark fixture images
+        run: |
+          set -o pipefail
+          sed -nE 's/^(MINIO|MC|BUSYBOX)=//p' bench/compare/logs/run-profile.sh |
+            while IFS= read -r image; do docker pull "$image" || exit; done
+      - name: Compare 8192 and 1024 rows per batch on settled 1M and 20M fixtures
+        env:
+          VDG_IMAGE: verdigris-search-batch:local
+          SERVICE_CPUS: '2'
+          SEARCH_BATCH_AB: '1'
+          ITERATIONS: '100'
+          WARMUP: '10'
+          CORPUS_TS_MS: '1795764240000'
+          RAW: ${{ runner.temp }}/verdigris-search-batch
+        run: |
+          mkdir -p "$RAW"
+          OUT="$RAW/one-million" ROWS=1000000 bench/compare/logs/run-profile.sh
+          OUT="$RAW/twenty-million" ROWS=20000000 BATCH_ROWS=50000 SEARCH_SMALL_BATCH_FIRST=1 bench/compare/logs/run-profile.sh
+      - name: Upload raw timings and physical plans
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-search-batch
+          path: ${{ runner.temp }}/verdigris-search-batch
+          retention-days: 7
