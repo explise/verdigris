@@ -858,6 +858,17 @@ async fn h_prometheus(State(st): State<AppState>) -> Response {
             "# TYPE verdigris_ingest_phase_microseconds_total counter\n",
             "# TYPE verdigris_ingest_phase_microseconds_max gauge\n",
         ));
+        let (payload_bytes, conflicts) = metrics.manifest_totals();
+        let _ = write!(
+            body,
+            concat!(
+                "# TYPE verdigris_ingest_manifest_payload_bytes_total counter\n",
+                "verdigris_ingest_manifest_payload_bytes_total {}\n",
+                "# TYPE verdigris_ingest_manifest_cas_conflicts_total counter\n",
+                "verdigris_ingest_manifest_cas_conflicts_total {}\n",
+            ),
+            payload_bytes, conflicts
+        );
         for phase in IngestPhase::ALL {
             let (total_us, max_us, count) = metrics.totals(phase);
             let phase = phase.label();

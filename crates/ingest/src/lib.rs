@@ -259,6 +259,11 @@ impl Ingestor {
         base: Option<UpdateVersion>,
     ) -> anyhow::Result<CommitOutcome> {
         let bytes = serde_json::to_vec_pretty(manifest).context("serializing manifest")?;
+        if let Some(metrics) = &self.phase_metrics {
+            metrics
+                .manifest_payload_bytes
+                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let mode = match base {
             Some(v) => PutMode::Update(v),
             None => PutMode::Create,
@@ -276,7 +281,14 @@ impl Ingestor {
             // Another writer got there first (Update precondition failed, or Create
             // found an existing object).
             Err(object_store::Error::Precondition { .. })
-            | Err(object_store::Error::AlreadyExists { .. }) => Ok(CommitOutcome::Conflict),
+            | Err(object_store::Error::AlreadyExists { .. }) => {
+                if let Some(metrics) = &self.phase_metrics {
+                    metrics
+                        .manifest_cas_conflicts
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(CommitOutcome::Conflict)
+            }
             // Backend can't do conditional puts (some local stores): fall back to a
             // plain put. Correct under the single-writer deployment model.
             Err(object_store::Error::NotImplemented { .. }) => {

@@ -53,9 +53,19 @@ struct PhaseTotals {
 #[derive(Default)]
 pub struct IngestPhaseMetrics {
     phases: [PhaseTotals; IngestPhase::ALL.len()],
+    pub(crate) manifest_payload_bytes: AtomicU64,
+    pub(crate) manifest_cas_conflicts: AtomicU64,
 }
 
 impl IngestPhaseMetrics {
+    /// Serialized payload bytes across attempts and conditional-write conflicts.
+    pub fn manifest_totals(&self) -> (u64, u64) {
+        (
+            self.manifest_payload_bytes.load(Ordering::Relaxed),
+            self.manifest_cas_conflicts.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn timer<'a>(&'a self, clock: &'a dyn Clock, phase: IngestPhase) -> PhaseTimer<'a> {
         PhaseTimer {
             totals: &self.phases[phase as usize],
