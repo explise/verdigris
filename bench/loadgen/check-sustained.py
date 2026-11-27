@@ -47,11 +47,16 @@ def batch_windows(counts):
         yield window
 
 
-def snapshot(url, table):
+def snapshot(url, table, allow_preload=False):
     # Count every prefix first, including unexpected or malformed ones, then
     # check distinct offsets in disjoint windows to stay within query memory.
+    # Keep NULL and other unexpected IDs visible to the existing verifier.
+    exclude_preload = (
+        "coalesce(trace_id NOT LIKE 'preload-%', true)" if allow_preload else "true"
+    )
     counts = batch_counts(query_rows(
-        url, f"SELECT substr(trace_id, 1, 22) AS batch_id, count(*) AS n FROM {table} GROUP BY 1"
+        url, f"SELECT substr(trace_id, 1, 22) AS batch_id, count(*) AS n FROM {table} "
+        f"WHERE {exclude_preload} GROUP BY 1"
     ))
     for window in batch_windows(counts):
         first, last = min(window), max(window)
@@ -59,7 +64,8 @@ def snapshot(url, table):
             WITH fixture AS (
                 SELECT trace_id, substr(trace_id, 1, 22) AS batch_id,
                        try_cast(substr(trace_id, 24) AS bigint) AS row_index
-                FROM {table} WHERE trace_id >= '{first}' AND trace_id < '{last}~'
+                FROM {table} WHERE {exclude_preload}
+                    AND trace_id >= '{first}' AND trace_id < '{last}~'
             )
             SELECT batch_id, count(*) AS n, count(DISTINCT row_index) AS unique_offsets,
                    min(row_index) AS first_offset, max(row_index) AS last_offset,
@@ -110,6 +116,7 @@ def main():
     capture = modes.add_parser("snapshot")
     capture.add_argument("--url", required=True)
     capture.add_argument("--table", required=True)
+    capture.add_argument("--allow-preload", action="store_true")
     capture.add_argument("--out", type=Path, required=True)
     check = modes.add_parser("verify")
     for arg in ("run", "before", "after", "out"):
@@ -118,7 +125,7 @@ def main():
     if args.mode == "snapshot":
         if not re.fullmatch(r"[a-zA-Z][a-zA-Z_0-9]*", args.table):
             parser.error("invalid benchmark table name")
-        result = snapshot(args.url, args.table)
+        result = snapshot(args.url, args.table, args.allow_preload)
         status = 0
     else:
         result = reconcile(*(json.loads(p.read_text()) for p in (args.run, args.before, args.after)))
