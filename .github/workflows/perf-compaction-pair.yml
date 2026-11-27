@@ -35,7 +35,7 @@ jobs:
           export CORPUS_START_MS=$(date +%s%3N)
           root="$OUT"
           export LOADGEN="$PWD/bench/loadgen/target/release/verdigris-loadgen"
-          for arm in control-first optimized-first; do
+          for arm in optimized-first control-first; do
             export OUT="$root/$arm"
             image=verdigris-preload:local
             case "$arm" in
