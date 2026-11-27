@@ -52,6 +52,10 @@ The [reserved-permit experiment](permit-split/README.md) restored the trace
 latency and success criteria with two slots. Scheduled alerts still starved
 and dashboard progress regressed. The treatments remain experimental.
 
+The [scheduled-alert wait experiment](scheduled-alert-wait/README.md) restored
+scheduled evaluations while retaining the trace gate. Dashboard refreshes
+still needed a separate treatment.
+
 ## Check a fixed-rate replay
 
 ```sh
