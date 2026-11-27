@@ -28,6 +28,9 @@ volume=
 minio=
 vdg=
 cleanup() {
+  if [[ -n "${vdg:-}" && -n "${MINUTE_SUMMARY_PILOT:-}" ]]; then
+    timeout 5s docker logs --timestamps --tail 2000 "$vdg" > "$OUT/server-warnings-final.log" 2>&1 || true
+  fi
   if [[ -n "$vdg" ]]; then docker rm -f "$vdg" >/dev/null || true; fi
   if [[ -n "$minio" ]]; then docker rm -f "$minio" >/dev/null || true; fi
   if [[ -n "$volume" ]]; then docker volume rm "$volume" >/dev/null || true; fi
@@ -112,6 +115,9 @@ fi
 profile=(python3 -B bench/compare/logs/profile.py --seed-report "$OUT/seed.json")
 "${profile[@]}" --port "$port" --iterations "$ITERATIONS" --warmup "$WARMUP" \
   "${profile_args[@]}" --out "$OUT/warm.json"
+if [[ -n "$pilot" ]]; then
+  timeout 5s docker logs --timestamps --tail 2000 "$vdg" > "$OUT/server-warnings-warm.log" 2>&1 || true
+fi
 if [[ "${SEARCH_CONTROL:-0}" == 1 ]]; then
   "${profile[@]}" --port "$port" --compare-search --iterations 20 --warmup 5 --out "$OUT/search-comparison.json"
 fi

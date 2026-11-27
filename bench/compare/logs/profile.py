@@ -172,6 +172,21 @@ def main():
                     raise RuntimeError(f"initial query metrics failed with HTTP {status}")
                 out["audit_counters_before"] = json.loads(data)["audit"]
                 out["expected_audit_acks"] = len(SHAPES) * (args.warmup + 2 * args.iterations) + 2
+            if args.minute_summary_pilot:
+                out["audit_blocks"] = {}
+
+            def record_audit_block(name, previous):
+                status, _, data = backend.client.request("GET", "/v1/metrics")
+                if status != 200:
+                    raise RuntimeError(f"audit metrics for {name} failed with HTTP {status}")
+                current = json.loads(data)["audit"]
+                out["audit_blocks"][name] = {
+                    key: current[key] - previous[key]
+                    for key in ("ackedTotal", "failedTotal", "saturatedTotal", "timedOutTotal")
+                }
+                return current
+
+            previous = out.get("audit_counters_before")
             for shape in SHAPES:
                 for index in range(args.warmup):
                     run_one(backend, shape, index, corpus, "1", expected)
@@ -186,12 +201,20 @@ def main():
                         )
                 out["queries"][shape] = {mode: summarize(samples[mode]) for mode in samples}
 
+                if args.minute_summary_pilot:
+                    previous = record_audit_block(shape, previous)
+
             out["representative_plan"] = run_one(backend, "trace_hit", 0, corpus, "plan", expected)["profile"]
             out["recent_search_plan"] = run_one(backend, "recent_search", 0, corpus, "plan", expected)
             status, _, data = backend.client.request("GET", "/v1/metrics")
             if status != 200:
                 raise RuntimeError(f"query metrics failed with HTTP {status}")
             out["audit_counters_after"] = json.loads(data)["audit"]
+            if args.minute_summary_pilot:
+                out["audit_blocks"]["representative_plans"] = {
+                    key: out["audit_counters_after"][key] - previous[key]
+                    for key in ("ackedTotal", "failedTotal", "saturatedTotal", "timedOutTotal")
+                }
             if args.minute_summary_pilot:
                 body = json.dumps({"sql": MINUTE_AGGREGATE_SQL, "tiers": []}).encode()
                 status, _, data = backend.client.request(
