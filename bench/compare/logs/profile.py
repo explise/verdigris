@@ -8,12 +8,15 @@ import statistics
 import time
 from pathlib import Path
 
-from compare import BASE_TS, CROSS_TRACE, RECENT_SEARCH_SQL, Vdg, expected_search, validate_search
+from compare import (
+    BASE_TS, CROSS_TRACE, RECENT_SEARCH_SQL, Vdg, expected_buckets, expected_search,
+    validate_aggregation, validate_search, validate_trace,
+)
 
 SHAPES = ("trace_hit", "trace_miss", "trace_cross_tier", "recent_search", "minute_aggregation")
 
 
-def run_one(backend, shape, index, corpus, mode, expected_recent):
+def run_one(backend, shape, index, corpus, mode, expected):
     backend.profile_mode = mode
     trace = None
     if shape == "trace_hit":
@@ -32,14 +35,15 @@ def run_one(backend, shape, index, corpus, mode, expected_recent):
         rows = backend.aggregate_minute()
     elapsed_ms = (time.perf_counter_ns() - start) / 1e6
 
-    if shape in ("trace_hit", "trace_miss", "trace_cross_tier"):
-        expected = {"trace_hit": 1, "trace_miss": 0, "trace_cross_tier": 3}[shape]
-        if len(rows) != expected or any(row["trace_id"] != trace for row in rows):
-            raise RuntimeError(f"{shape} returned {len(rows)} rows for {trace}, expected {expected}")
+    if shape == "trace_miss":
+        if rows:
+            raise RuntimeError(f"missing trace {trace} returned {len(rows)} rows")
+    elif trace is not None:
+        validate_trace(trace, rows, corpus["rows"])
     elif shape == "recent_search":
-        validate_search(rows, expected_recent)
-    elif sum(row["total"] for row in rows) != corpus["rows"]:
-        raise RuntimeError("aggregate did not cover the corpus")
+        validate_search(rows, expected[shape])
+    else:
+        validate_aggregation(rows, expected[shape])
 
     return {
         "query_index": index,
@@ -146,33 +150,35 @@ def main():
     corpus = json.loads(args.seed_report.read_text())["corpus"]
     if corpus["base_ts_ms"] != BASE_TS:
         parser.error("CORPUS_TS_MS must match the seed report's corpus timestamp")
-    expected_recent = expected_search(corpus["rows"])
+    expected = {"recent_search": expected_search(corpus["rows"])}
+    if not args.compare_search and args.first in (None, "minute_aggregation"):
+        expected["minute_aggregation"] = expected_buckets(corpus["rows"])
     backend = Vdg(args)
     out = {"corpus": corpus, "mode": "first_after_restart" if args.first else "warm", "queries": {}}
     try:
         if args.compare_search:
             out.pop("queries")
             out["mode"] = "search_comparison"
-            out["comparison"] = compare_search(backend, expected_recent, args.iterations, args.warmup)
+            out["comparison"] = compare_search(backend, expected["recent_search"], args.iterations, args.warmup)
         elif args.first:
-            out["queries"][args.first] = run_one(backend, args.first, 0, corpus, "1", expected_recent)
+            out["queries"][args.first] = run_one(backend, args.first, 0, corpus, "1", expected)
         else:
             for shape in SHAPES:
                 for index in range(args.warmup):
-                    run_one(backend, shape, index, corpus, "1", expected_recent)
+                    run_one(backend, shape, index, corpus, "1", expected)
                 samples = {"on": [], "off": []}
                 for index in range(args.iterations):
                     modes = ("on", "off") if index % 2 == 0 else ("off", "on")
                     for mode in modes:
                         samples[mode].append(
                             run_one(
-                                backend, shape, index, corpus, "1" if mode == "on" else None, expected_recent
+                                backend, shape, index, corpus, "1" if mode == "on" else None, expected
                             )
                         )
                 out["queries"][shape] = {mode: summarize(samples[mode]) for mode in samples}
 
-            out["representative_plan"] = run_one(backend, "trace_hit", 0, corpus, "plan", expected_recent)["profile"]
-            out["recent_search_plan"] = run_one(backend, "recent_search", 0, corpus, "plan", expected_recent)
+            out["representative_plan"] = run_one(backend, "trace_hit", 0, corpus, "plan", expected)["profile"]
+            out["recent_search_plan"] = run_one(backend, "recent_search", 0, corpus, "plan", expected)
             status, _, data = backend.client.request("GET", "/v1/metrics")
             if status != 200:
                 raise RuntimeError(f"query metrics failed with HTTP {status}")
@@ -180,6 +186,7 @@ def main():
     finally:
         backend.close()
 
+    out["validated_exact_results"] = True
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(out, indent=2) + "\n")
 
