@@ -70,6 +70,10 @@ fn content_hash(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
+#[cfg(test)]
+type BeforeCompactionCommit =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
 /// Writes a single logical table's data + manifest to an object store.
 pub struct Ingestor {
     store: Arc<dyn ObjectStore>,
@@ -81,6 +85,8 @@ pub struct Ingestor {
     phase_metrics: Option<Arc<IngestPhaseMetrics>>,
     /// Grace period between retiring a compacted-away file and deleting it.
     retired_grace_ms: u64,
+    #[cfg(test)]
+    before_compaction_commit: std::sync::Mutex<Option<BeforeCompactionCommit>>,
 }
 
 impl Ingestor {
@@ -91,6 +97,8 @@ impl Ingestor {
             clock: Arc::new(SimClock::default()),
             phase_metrics: None,
             retired_grace_ms: DEFAULT_RETIRED_GRACE_MS,
+            #[cfg(test)]
+            before_compaction_commit: std::sync::Mutex::new(None),
         }
     }
 
@@ -568,181 +576,213 @@ impl Ingestor {
             tracing::warn!(error = %e, "retired-file reclamation before compaction failed");
         }
 
-        // Whole-operation optimistic retry: snapshot the manifest, rewrite the
-        // layout, and commit under compare-and-swap. If a concurrent writer
-        // committed in between, our freshly written compacted files become harmless
-        // orphans (the manifest is the source of truth) and we redo against the new
-        // state. Compaction is a periodic maintenance op, so conflicts are rare.
         for _ in 0..MAX_COMMIT_RETRIES {
-            let (mut manifest, base) = self.load_manifest_versioned().await?;
-            let generation = manifest.compaction_gen;
-
-            let mut new_files: Vec<DataFile> = Vec::new();
-            let mut to_retire: Vec<String> = Vec::new();
-            let mut reports: Vec<CompactionReport> = Vec::new();
-            // Per-pass merge budget: once reached, remaining mergeable bins are
-            // deferred (kept as-is) and `more` signals the scheduler to run again.
-            let mut merged_this_pass = 0usize;
-            let mut more = false;
-
-            for tier in Tier::ALL {
-                let tier_files: Vec<DataFile> = manifest
-                    .files
-                    .iter()
-                    .filter(|f| f.tier == tier)
-                    .cloned()
-                    .collect();
-                if tier_files.is_empty() {
-                    continue;
-                }
-                let before = tier_files.len();
-                let mut after = 0usize;
-                let mut merged = 0usize;
-                let mut seq = 0usize;
-
-                for bin in bin_by_bytes(&tier_files, target_bytes) {
-                    if bin.len() <= 1 {
-                        // Already big enough on its own — leave it untouched.
-                        new_files.push(bin[0].clone());
-                        after += 1;
-                        continue;
-                    }
-                    // Budget reached: defer this (and every subsequent) mergeable
-                    // bin to a later pass so one pass can't hold the lock too long.
-                    // Always merge at least one bin so every pass makes progress.
-                    if merged_this_pass > 0 && merged_this_pass + bin.len() > max_merge_files {
-                        more = true;
-                        for f in &bin {
-                            new_files.push(f.clone());
-                        }
-                        after += bin.len();
-                        continue;
-                    }
-                    // Stream the bin through one Parquet writer: fetch → decode →
-                    // encode, a batch at a time, folding the manifest stats as we
-                    // go. Peak memory is one batch plus the encoder's in-progress
-                    // row group, NOT the bin's whole decompressed size — see
-                    // `MergeWriter` (issue #13).
-                    let mut w = encode::MergeWriter::new(schema::log_schema())?;
-                    for f in &bin {
-                        let bytes = self
-                            .store
-                            .get(&ObjPath::from(f.path.clone()))
-                            .await
-                            .with_context(|| format!("reading {} for compaction", f.path))?
-                            .bytes()
-                            .await?;
-                        encode::stream_parquet_into(bytes, &mut w)?;
-                    }
-                    let in_progress = w.in_progress_size();
-                    let (data, stats) = w.finish()?;
-                    // The output key includes a digest of the bytes, not just the
-                    // generation and bin sequence. Two concurrent compaction
-                    // attempts can observe the same generation and write the same
-                    // bin index; if their input sets differ, a generation-only key
-                    // would let the loser overwrite the file the winning manifest
-                    // references. Content-addressing makes each output immutable:
-                    // identical bytes reuse the same key (idempotent), different
-                    // bytes cannot collide.
-                    let digest = content_hash(&data);
-                    let path = format!(
-                        "{}/{}/c{generation}-{seq:05}-{digest}.parquet",
-                        self.table,
-                        tier.as_str()
-                    );
-                    seq += 1;
-                    let len = data.len() as u64;
-                    self.store
-                        .put(&ObjPath::from(path.clone()), data.into())
-                        .await
-                        .with_context(|| format!("writing compacted {path}"))?;
-
-                    tracing::debug!(
-                        tier = tier.as_str(),
-                        files = bin.len(),
-                        out_bytes = len,
-                        rows = stats.rows,
-                        writer_in_progress_bytes = in_progress,
-                        "compacted bin"
-                    );
-
-                    // Stats are recomputed from the merged rows by `MergeWriter`
-                    // (authoritative even if some input files predate value stats),
-                    // so the compacted file still prunes by service/level/trigram.
-                    new_files.push(DataFile {
-                        path,
-                        bytes: len,
-                        rows: stats.rows,
-                        min_ts: stats.min_ts,
-                        max_ts: stats.max_ts,
-                        tier,
-                        services: stats.services,
-                        levels: stats.levels,
-                        message_trigrams: Some(stats.message_trigrams),
-                        row_groups: stats.row_groups,
-                        row_group_trigrams: Some(stats.row_group_trigrams),
-                    });
-                    for f in &bin {
-                        to_retire.push(f.path.clone());
-                    }
-                    after += 1;
-                    merged += bin.len();
-                    merged_this_pass += bin.len();
-                }
-
-                reports.push(CompactionReport {
-                    tier,
-                    files_before: before,
-                    files_after: after,
-                    files_merged: merged,
-                });
-            }
-
-            // Sidecar for the newly written files, before the manifest points at
-            // them. Retired paths are left in place: they are cleaned up on the
-            // next successful commit, and an orphan entry is never consulted.
-            let mut incoming = TrigramIndex::default();
-            for f in &new_files {
-                if let Some(t) = &f.message_trigrams {
-                    incoming.insert(f.path.clone(), t.clone());
-                }
-                if let Some(rgs) = &f.row_group_trigrams {
-                    incoming.insert_row_groups(f.path.clone(), rgs.clone());
-                }
-            }
-            self.merge_trigrams(&incoming).await?;
-
-            // Point the manifest at the new layout and commit under CAS. Retired
-            // paths are recorded in the same commit so a reader holding the old
-            // manifest still finds its files on disk; they become reclaimable only
-            // after the grace period.
-            manifest.files = new_files;
-            manifest.compaction_gen = generation + 1;
-            manifest.retire(to_retire, self.clock.now_millis());
-            if self.commit_manifest(&manifest, base).await? == CommitOutcome::Committed {
-                // Drop sidecar entries for the paths just retired, so it does not
-                // grow without bound as compaction rewrites files.
-                //
-                // Strictly AFTER the commit: pruning first could delete an entry
-                // the still-live manifest references, and a lost entry means a
-                // text query stops pruning that file. Best-effort — a failure
-                // leaves orphans, which are never consulted. An old reader that
-                // loads this sidecar after the prune simply loses text pruning
-                // for its retired files, never a real match.
-                let _ = self.prune_trigrams(&manifest).await;
-                // Opportunistically drain tombstones that were already expired;
-                // the ones just added are far inside the grace window.
+            let prepared = self
+                .prepare_compaction(target_bytes, max_merge_files)
+                .await?;
+            if let Some(outcome) = self.publish_compaction(prepared).await? {
                 if let Err(e) = self.reclaim_retired(self.retired_grace_ms).await {
                     tracing::warn!(error = %e, "post-compaction reclamation failed");
                 }
-                return Ok((reports, more));
+                return Ok(outcome);
             }
-            // Conflict: reload and redo against the fresh manifest.
         }
-        anyhow::bail!(
-            "compaction commit failed after {MAX_COMMIT_RETRIES} retries under contention"
-        )
+        anyhow::bail!("compaction inputs changed after {MAX_COMMIT_RETRIES} attempts")
     }
+
+    /// Build immutable outputs before acquiring the writer lock.
+    pub async fn prepare_compaction(
+        &self,
+        target_bytes: u64,
+        max_merge_files: usize,
+    ) -> anyhow::Result<PreparedCompaction> {
+        let manifest = self.load_manifest().await?;
+        let generation = manifest.compaction_gen;
+        let mut new_files: Vec<DataFile> = Vec::new();
+        let mut to_retire: Vec<String> = Vec::new();
+        let mut reports: Vec<CompactionReport> = Vec::new();
+        // Per-pass merge budget: once reached, remaining mergeable bins are
+        // deferred (kept as-is) and `more` signals the scheduler to run again.
+        let mut merged_this_pass = 0usize;
+        let mut more = false;
+
+        for tier in Tier::ALL {
+            let tier_files: Vec<DataFile> = manifest
+                .files
+                .iter()
+                .filter(|f| f.tier == tier)
+                .cloned()
+                .collect();
+            if tier_files.is_empty() {
+                continue;
+            }
+            let before = tier_files.len();
+            let mut after = 0usize;
+            let mut merged = 0usize;
+            let mut seq = 0usize;
+
+            for bin in bin_by_bytes(&tier_files, target_bytes) {
+                if bin.len() <= 1 {
+                    // Already big enough on its own — leave it untouched.
+                    new_files.push(bin[0].clone());
+                    after += 1;
+                    continue;
+                }
+                // Budget reached: defer this (and every subsequent) mergeable
+                // bin to a later pass so one pass can't hold the lock too long.
+                // Always merge at least one bin so every pass makes progress.
+                if merged_this_pass > 0 && merged_this_pass + bin.len() > max_merge_files {
+                    more = true;
+                    for f in &bin {
+                        new_files.push(f.clone());
+                    }
+                    after += bin.len();
+                    continue;
+                }
+                // Stream the bin through one Parquet writer: fetch → decode →
+                // encode, a batch at a time, folding the manifest stats as we
+                // go. Peak memory is one batch plus the encoder's in-progress
+                // row group, NOT the bin's whole decompressed size — see
+                // `MergeWriter` (issue #13).
+                let mut w = encode::MergeWriter::new(schema::log_schema())?;
+                for f in &bin {
+                    let bytes = self
+                        .store
+                        .get(&ObjPath::from(f.path.clone()))
+                        .await
+                        .with_context(|| format!("reading {} for compaction", f.path))?
+                        .bytes()
+                        .await?;
+                    encode::stream_parquet_into(bytes, &mut w)?;
+                }
+                let in_progress = w.in_progress_size();
+                let (data, stats) = w.finish()?;
+                // The output key includes a digest of the bytes, not just the
+                // generation and bin sequence. Two concurrent compaction
+                // attempts can observe the same generation and write the same
+                // bin index; if their input sets differ, a generation-only key
+                // would let the loser overwrite the file the winning manifest
+                // references. Content-addressing makes each output immutable:
+                // identical bytes reuse the same key (idempotent), different
+                // bytes cannot collide.
+                let digest = content_hash(&data);
+                let path = format!(
+                    "{}/{}/c{generation}-{seq:05}-{digest}.parquet",
+                    self.table,
+                    tier.as_str()
+                );
+                seq += 1;
+                let len = data.len() as u64;
+                self.store
+                    .put(&ObjPath::from(path.clone()), data.into())
+                    .await
+                    .with_context(|| format!("writing compacted {path}"))?;
+
+                tracing::debug!(
+                    tier = tier.as_str(),
+                    files = bin.len(),
+                    out_bytes = len,
+                    rows = stats.rows,
+                    writer_in_progress_bytes = in_progress,
+                    "compacted bin"
+                );
+
+                // Stats are recomputed from the merged rows by `MergeWriter`
+                // (authoritative even if some input files predate value stats),
+                // so the compacted file still prunes by service/level/trigram.
+                new_files.push(DataFile {
+                    path,
+                    bytes: len,
+                    rows: stats.rows,
+                    min_ts: stats.min_ts,
+                    max_ts: stats.max_ts,
+                    tier,
+                    services: stats.services,
+                    levels: stats.levels,
+                    message_trigrams: Some(stats.message_trigrams),
+                    row_groups: stats.row_groups,
+                    row_group_trigrams: Some(stats.row_group_trigrams),
+                });
+                for f in &bin {
+                    to_retire.push(f.path.clone());
+                }
+                after += 1;
+                merged += bin.len();
+                merged_this_pass += bin.len();
+            }
+
+            reports.push(CompactionReport {
+                tier,
+                files_before: before,
+                files_after: after,
+                files_merged: merged,
+            });
+        }
+
+        Ok(PreparedCompaction {
+            generation,
+            original_files: manifest.files,
+            new_files,
+            to_retire,
+            reports,
+            more,
+        })
+    }
+
+    /// Publish prepared outputs while serialized with local ingest sidecar writes.
+    /// Returns None when a fresh preparation is required.
+    pub async fn publish_compaction(
+        &self,
+        prepared: PreparedCompaction,
+    ) -> anyhow::Result<Option<(Vec<CompactionReport>, bool)>> {
+        let mut incoming = TrigramIndex::default();
+        for f in &prepared.new_files {
+            if let Some(t) = &f.message_trigrams {
+                incoming.insert(f.path.clone(), t.clone());
+            }
+            if let Some(rgs) = &f.row_group_trigrams {
+                incoming.insert_row_groups(f.path.clone(), rgs.clone());
+            }
+        }
+        for _ in 0..MAX_COMMIT_RETRIES {
+            let (mut manifest, base) = self.load_manifest_versioned().await?;
+            if manifest.compaction_gen != prepared.generation
+                || !manifest.files.starts_with(&prepared.original_files)
+            {
+                return Ok(None);
+            }
+            // Appends keep existing descriptors in order. Retain their suffix
+            // and the current tombstones so a CAS retry can reuse the output.
+            self.merge_trigrams(&incoming).await?;
+            let appended = manifest.files.split_off(prepared.original_files.len());
+            manifest.files.clone_from(&prepared.new_files);
+            manifest.files.extend(appended);
+            manifest.compaction_gen = prepared.generation + 1;
+            manifest.retire(prepared.to_retire.iter().cloned(), self.clock.now_millis());
+            #[cfg(test)]
+            {
+                let hook = self.before_compaction_commit.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook().await;
+                }
+            }
+            if self.commit_manifest(&manifest, base).await? == CommitOutcome::Committed {
+                let _ = self.prune_trigrams(&manifest).await;
+                return Ok(Some((prepared.reports, prepared.more)));
+            }
+        }
+        anyhow::bail!("compaction commit failed after {MAX_COMMIT_RETRIES} retries")
+    }
+}
+
+/// Immutable compaction outputs and the snapshot they were built from.
+pub struct PreparedCompaction {
+    generation: u64,
+    original_files: Vec<DataFile>,
+    new_files: Vec<DataFile>,
+    to_retire: Vec<String>,
+    reports: Vec<CompactionReport>,
+    more: bool,
 }
 
 /// Per-tier outcome of a compaction run.
@@ -1026,6 +1066,122 @@ mod tests {
             predicted, merged,
             "pending estimate must equal files actually merged"
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_compaction_preserves_appends_and_rejects_stale_publish() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let ing = Ingestor::new(store, "logs");
+        let routing = RoutingConfig::default();
+        let policy = BatchPolicy {
+            max_rows: 100,
+            max_bytes: usize::MAX,
+        };
+        let target = 10 * 1024 * 1024;
+        for i in 0u64..4 {
+            ing.ingest(
+                generate::generate(100, i, i as i64 * 1_000_000),
+                &routing,
+                policy,
+            )
+            .await
+            .unwrap();
+        }
+        let prepared = ing.prepare_compaction(target, usize::MAX).await.unwrap();
+        assert!(!prepared.to_retire.is_empty());
+        let stale = ing.prepare_compaction(target, usize::MAX).await.unwrap();
+        let appended = ing
+            .ingest(generate::generate(100, 4, 4_000_000), &routing, policy)
+            .await
+            .unwrap();
+        assert!(!appended.is_empty());
+        let appended_manifest = ing.load_manifest().await.unwrap();
+        let appended_files = &appended_manifest.files[prepared.original_files.len()..];
+        assert_eq!(appended_files.len(), appended.len());
+        let retired = prepared.to_retire.clone();
+        assert!(ing.publish_compaction(prepared).await.unwrap().is_some());
+        let committed = ing.load_manifest().await.unwrap();
+        assert!(committed.files.ends_with(appended_files));
+        assert_eq!(committed.files.iter().map(|f| f.rows).sum::<u64>(), 500);
+        assert!(retired
+            .iter()
+            .all(|path| committed.retired.iter().any(|f| f.path == *path)));
+        assert!(ing.publish_compaction(stale).await.unwrap().is_none());
+        let after = ing.load_manifest().await.unwrap();
+        assert_eq!(after.compaction_gen, committed.compaction_gen);
+        assert_eq!(after.files, committed.files);
+    }
+
+    #[tokio::test]
+    async fn prepared_compaction_retries_after_manifest_etag_conflict() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ing = Ingestor::new(store.clone(), "logs");
+        let routing = RoutingConfig::default();
+        let policy = BatchPolicy {
+            max_rows: 100,
+            max_bytes: usize::MAX,
+        };
+        for i in 0u64..4 {
+            ing.ingest(
+                generate::generate(100, i, i as i64 * 1_000_000),
+                &routing,
+                policy,
+            )
+            .await
+            .unwrap();
+        }
+
+        let (before, _) = ing.load_manifest_versioned().await.unwrap();
+        let target = 10 * 1024 * 1024;
+        let discarded = ing.prepare_compaction(target, usize::MAX).await.unwrap();
+        assert!(!discarded.to_retire.is_empty());
+        drop(discarded);
+        let (after_drop, _) = ing.load_manifest_versioned().await.unwrap();
+        assert_eq!(
+            serde_json::to_vec(&after_drop).unwrap(),
+            serde_json::to_vec(&before).unwrap()
+        );
+
+        let prepared = ing.prepare_compaction(target, usize::MAX).await.unwrap();
+        let new_files = prepared.new_files.clone();
+        let to_retire = prepared.to_retire.clone();
+        let writer = Ingestor::new(store, "logs");
+        let appended = writer
+            .write_batches(generate::generate(100, 4, 4_000_000), &routing, policy)
+            .await
+            .unwrap();
+        assert!(!appended.is_empty());
+        let concurrent_files = appended.clone();
+        let tombstone = "logs/hot/concurrently-retired.parquet";
+
+        // Commit over the ETag that publish has already read. Its first PUT
+        // must conflict before the next attempt can preserve this suffix.
+        *ing.before_compaction_commit.lock().unwrap() = Some(Box::new(move || {
+            Box::pin(async move {
+                let (mut manifest, base) = writer.load_manifest_versioned().await.unwrap();
+                for file in concurrent_files {
+                    manifest.add(file);
+                }
+                manifest.retire([tombstone.to_owned()], writer.clock.now_millis());
+                assert_eq!(
+                    writer.commit_manifest(&manifest, base).await.unwrap(),
+                    CommitOutcome::Committed
+                );
+            })
+        }));
+        assert!(ing.publish_compaction(prepared).await.unwrap().is_some());
+        let after = ing.load_manifest().await.unwrap();
+        assert_eq!(after.compaction_gen, before.compaction_gen + 1);
+        assert!(after
+            .files
+            .iter()
+            .map(|file| &file.path)
+            .eq(new_files.iter().chain(&appended).map(|file| &file.path)));
+        assert_eq!(after.files.iter().map(|f| f.rows).sum::<u64>(), 500);
+        assert!(to_retire
+            .iter()
+            .all(|path| after.retired.iter().any(|file| file.path == *path)));
+        assert!(after.retired.iter().any(|file| file.path == tombstone));
     }
 
     #[tokio::test]

@@ -1359,29 +1359,32 @@ async fn maybe_compact(
         return Ok(()); // not enough small files yet to be worth a rewrite
     }
 
-    // Drain the backlog with bounded passes. Each pass holds the ingest lock only
-    // for its capped merge, then releases it (yield) so ingest can interleave —
-    // a large backlog no longer stalls ingest in one long pass. The 10k-pass cap
-    // is a runaway backstop; file count strictly drops per pass, so it terminates.
+    // Encode and upload immutable outputs without blocking foreground commits.
     let mut total_merged = 0usize;
     let mut passes = 0usize;
-    loop {
+    for _ in 0..10_000 {
+        let prepared = ingestor
+            .prepare_compaction(target_bytes, max_merge_files)
+            .await?;
         let guard = {
             let _timer =
                 phases.map(|metrics| metrics.timer(clock.as_ref(), IngestPhase::CompactLockWait));
             ingest_lock.lock().await
         };
-        let (reports, more) = {
+        let outcome = {
             let _timer =
                 phases.map(|metrics| metrics.timer(clock.as_ref(), IngestPhase::CompactPass));
-            ingestor
-                .compact_bounded(target_bytes, max_merge_files)
-                .await?
+            ingestor.publish_compaction(prepared).await?
         };
         drop(guard);
-        total_merged += reports.iter().map(|r| r.files_merged).sum::<usize>();
+        // An overlapping compaction invalidated this snapshot. Try again on
+        // the next scheduled tick with a fresh snapshot.
+        let Some((reports, more)) = outcome else {
+            break;
+        };
         passes += 1;
-        if !more || passes >= 10_000 {
+        total_merged += reports.iter().map(|r| r.files_merged).sum::<usize>();
+        if !more {
             break;
         }
         tokio::task::yield_now().await;
