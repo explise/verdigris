@@ -1,0 +1,44 @@
+name: Verdigris recent-search timestamp cutoff control
+
+on:
+  push:
+    branches: [codex/perf-search-cutoff]
+
+permissions:
+  contents: read
+
+jobs:
+  profiles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the integrated release image
+        run: docker build -f bench/Dockerfile.vdg -t verdigris-search-cutoff:local .
+      - name: Pull the pinned benchmark fixture images
+        run: |
+          set -o pipefail
+          sed -nE 's/^(MINIO|MC|BUSYBOX)=//p' bench/compare/logs/run-profile.sh |
+            while IFS= read -r image; do docker pull "$image" || exit; done
+      - name: Compare complete, staged and known-cutoff search at 1M and 20M
+        env:
+          VDG_IMAGE: verdigris-search-cutoff:local
+          SERVICE_CPUS: '2'
+          SEARCH_CUTOFF: '1'
+          ITERATIONS: '100'
+          WARMUP: '10'
+          CORPUS_TS_MS: '1795764240000'
+          RAW: ${{ runner.temp }}/verdigris-search-cutoff
+        run: |
+          mkdir -p "$RAW"
+          ROWS=1000000 OUT="$RAW/one-million" bench/compare/logs/run-profile.sh
+          ROWS=20000000 BATCH_ROWS=50000 OUT="$RAW/twenty-million" bench/compare/logs/run-profile.sh
+      - name: Upload raw timings and physical plans
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-search-cutoff
+          path: ${{ runner.temp }}/verdigris-search-cutoff
+          retention-days: 7

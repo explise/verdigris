@@ -86,6 +86,10 @@ cp "$scratch/config.toml" "$OUT/config.toml"
 python3 -B bench/compare/logs/compare.py --system vdg --port "$port" --rows "$ROWS" --batch-rows "$BATCH_ROWS" \
   --iterations 1 --warmup 0 --out "$OUT/seed.json"
 profile=(python3 -B bench/compare/logs/profile.py --seed-report "$OUT/seed.json")
+if [[ "${SEARCH_CUTOFF:-0}" == 1 ]]; then
+  "${profile[@]}" --port "$port" --compare-cutoff --iterations "$ITERATIONS" --warmup "$WARMUP" --out "$OUT/cutoff.json"
+  exit 0
+fi
 "${profile[@]}" --port "$port" --iterations "$ITERATIONS" --warmup "$WARMUP" --out "$OUT/warm.json"
 if [[ "${SEARCH_CONTROL:-0}" == 1 ]]; then
   "${profile[@]}" --port "$port" --compare-search --iterations 20 --warmup 5 --out "$OUT/search-comparison.json"
