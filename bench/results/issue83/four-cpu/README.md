@@ -32,3 +32,5 @@ from **5.33 MB to 7.19 MB**. This supports an experiment on file selection
 and execution work, with the 75 ms p95 target still open.
 
 [Raw measurements, config and physical plans](sizing.json.gz).
+
+[Three fresh 1M reference profiles](reference-profiles/README.md).
