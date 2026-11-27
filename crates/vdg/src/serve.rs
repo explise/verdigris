@@ -50,7 +50,7 @@ use verdigris_core::batch::LogRecord;
 use verdigris_core::clock::Clock;
 use verdigris_core::config::{Config, StorageConfig};
 use verdigris_core::cost::{self, RetrievalMode};
-use verdigris_core::manifest::Manifest;
+use verdigris_core::manifest::{DataFile, Manifest};
 use verdigris_core::model::Tier;
 use verdigris_ingest::phases::{IngestPhase, IngestPhaseMetrics, PhaseTimer};
 use verdigris_ingest::wire::JsonLog;
@@ -100,6 +100,7 @@ struct AppState {
     /// concurrency still needs Iceberg commits — a known, documented gap.
     ingest_lock: Arc<tokio::sync::Mutex<()>>,
     ingest_phases: Option<Arc<IngestPhaseMetrics>>,
+    ingest_commit_tx: Option<tokio::sync::mpsc::Sender<IngestCommitJob>>,
     /// Serializes writes to the alerts doc — a scheduler tick and a concurrent
     /// create/delete must not clobber each other's read-modify-write.
     alerts_lock: Arc<tokio::sync::Mutex<()>>,
@@ -226,6 +227,55 @@ struct AuditMetrics {
 struct AuditJob {
     rec: QueryRecord,
     ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
+struct IngestCommitJob {
+    files: Vec<DataFile>,
+    // Keep this job within the existing in-flight cap even if its client
+    // disconnects after enqueue.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    queued_at_us: Option<u64>,
+    ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
+async fn ingest_commit_worker(
+    ingestor: verdigris_ingest::Ingestor,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    clock: Arc<dyn Clock>,
+    phases: Option<Arc<IngestPhaseMetrics>>,
+    mut jobs: tokio::sync::mpsc::Receiver<IngestCommitJob>,
+    max_group: usize,
+) {
+    while let Some(first) = jobs.recv().await {
+        let mut group = vec![first];
+        let guard = lock.lock().await;
+        // Drain requests that became ready under contention. There is no
+        // batching delay, and a compaction pass can still run between groups.
+        while group.len() < max_group {
+            match jobs.try_recv() {
+                Ok(job) => group.push(job),
+                Err(_) => break,
+            }
+        }
+        if let Some(phases) = &phases {
+            let acquired = clock.monotonic_micros();
+            for queued in group.iter().filter_map(|job| job.queued_at_us) {
+                phases.observe(IngestPhase::LockWait, acquired.saturating_sub(queued));
+            }
+        }
+        let files: Vec<_> = group
+            .iter_mut()
+            .flat_map(|job| job.files.drain(..))
+            .collect();
+        let result = ingestor
+            .commit_files(&files)
+            .await
+            .map_err(|err| err.to_string());
+        drop(guard);
+        for job in group {
+            let _ = job.ack.send(result.clone());
+        }
+    }
 }
 
 /// Counters for query admission (issue #29).
@@ -1579,14 +1629,38 @@ pub async fn serve_with_clock(
         None => VecDeque::new(),
     };
 
+    let ingest_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let ingest_phases = cfg
+        .ingest
+        .profile_phases
+        .then(|| Arc::new(IngestPhaseMetrics::default()));
+    let max_group = cfg.ingest.commit_group_size.min(8).min(max_inflight);
+    let (ingest_commit_tx, ingest_handle) = if role.serves_writes() && max_group > 1 {
+        let (tx, rx) = tokio::sync::mpsc::channel(max_inflight);
+        let mut ingestor = verdigris_ingest::Ingestor::new(query_store.clone(), table.as_str())
+            .with_clock(clock.clone());
+        if let Some(phases) = &ingest_phases {
+            ingestor = ingestor.with_phase_metrics(phases.clone());
+        }
+        let handle = tokio::spawn(ingest_commit_worker(
+            ingestor,
+            ingest_lock.clone(),
+            clock.clone(),
+            ingest_phases.clone(),
+            rx,
+            max_group,
+        ));
+        (Some(tx), Some(handle))
+    } else {
+        (None, None)
+    };
+
     let state = AppState {
-        ingest_phases: cfg
-            .ingest
-            .profile_phases
-            .then(|| Arc::new(IngestPhaseMetrics::default())),
+        ingest_phases,
+        ingest_commit_tx,
         cfg: Arc::new(cfg),
         table: Arc::new(table),
-        ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
+        ingest_lock,
         alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
         alert_seq: Arc::new(AtomicU64::new(0)),
         audit_replica,
@@ -1796,6 +1870,18 @@ pub async fn serve_with_clock(
     println!("  remember to set USE_MOCKS = false in frontend/api.js");
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
     server.await.context("http server")?;
+
+    // Handler senders are gone. Remaining jobs can only belong to cancelled
+    // requests, so no acknowledged data depends on this drain finishing.
+    if let Some(handle) = ingest_handle {
+        match tokio::time::timeout(AUDIT_DRAIN_TIMEOUT, handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "ingest commit worker failed during shutdown")
+            }
+            Err(_) => tracing::warn!("ingest commit drain deadline exceeded at shutdown"),
+        }
+    }
 
     // Every handler has returned; drop the last sender so the audit worker sees
     // the channel close, then give it a bounded deadline to flush what is queued.
@@ -2612,7 +2698,8 @@ fn ingest_permit(st: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, App
 async fn ingest_write_then_commit(
     st: &AppState,
     records: Vec<LogRecord>,
-) -> Result<Vec<verdigris_core::manifest::DataFile>, AppError> {
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<(usize, u64), AppError> {
     let mut ingestor = verdigris_ingest::Ingestor::new(store(st)?, st.table.as_str());
     if let Some(metrics) = &st.ingest_phases {
         ingestor = ingestor
@@ -2622,19 +2709,40 @@ async fn ingest_write_then_commit(
     let written = ingestor
         .write_batches(records, &st.cfg.routing, st.cfg.ingest.batch_policy())
         .await?;
-
-    if !written.is_empty() {
+    let summary = (written.len(), written.iter().map(|file| file.bytes).sum());
+    if written.is_empty() {
+        return Ok(summary);
+    }
+    if let Some(tx) = &st.ingest_commit_tx {
+        let (ack, reply) = tokio::sync::oneshot::channel();
+        let queued_at_us = st
+            .ingest_phases
+            .as_ref()
+            .map(|_| st.clock.monotonic_micros());
+        tx.send(IngestCommitJob {
+            files: written,
+            _permit: permit,
+            queued_at_us,
+            ack,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("ingest commit worker is unavailable"))?;
+        reply
+            .await
+            .map_err(|_| anyhow::anyhow!("ingest commit worker returned no result"))?
+            .map_err(anyhow::Error::msg)?;
+    } else {
         let _guard = {
             let _timer = st.ingest_phase_timer(IngestPhase::LockWait);
             st.ingest_lock.lock().await
         };
         ingestor.commit_files(&written).await?;
     }
-    Ok(written)
+    Ok(summary)
 }
 
 async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
-    let _permit = ingest_permit(&st)?;
+    let permit = ingest_permit(&st)?;
     let (records, skipped, first_err) = {
         let _timer = st.ingest_phase_timer(IngestPhase::Parse);
         parse_ingest_body(&body)
@@ -2647,8 +2755,7 @@ async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
     }
     let ingested = records.len();
 
-    let written = ingest_write_then_commit(&st, records).await?;
-    let bytes: u64 = written.iter().map(|f| f.bytes).sum();
+    let (files, bytes) = ingest_write_then_commit(&st, records, permit).await?;
     st.metrics
         .ingest_records
         .fetch_add(ingested as u64, Ordering::Relaxed);
@@ -2656,7 +2763,7 @@ async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
     Ok(Json(json!({
         "ingested": ingested,
         "skipped": skipped,
-        "filesWritten": written.len(),
+        "filesWritten": files,
         "bytesWritten": bytes,
     })))
 }
@@ -2666,7 +2773,7 @@ async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
 /// ingest write path (routing + BatchPolicy) and per-process `ingest_lock` as
 /// `/v1/ingest`. OTLP/JSON only (no protobuf/gRPC) to keep deps light.
 async fn h_otlp(State(st): State<AppState>, body: String) -> ApiResult {
-    let _permit = ingest_permit(&st)?;
+    let permit = ingest_permit(&st)?;
     let records = {
         let _timer = st.ingest_phase_timer(IngestPhase::Parse);
         verdigris_ingest::otlp::parse_otlp_json(&body).map_err(AppError::bad_request)?
@@ -2678,15 +2785,14 @@ async fn h_otlp(State(st): State<AppState>, body: String) -> ApiResult {
     }
     let ingested = records.len();
 
-    let written = ingest_write_then_commit(&st, records).await?;
-    let bytes: u64 = written.iter().map(|f| f.bytes).sum();
+    let (files, bytes) = ingest_write_then_commit(&st, records, permit).await?;
     st.metrics
         .ingest_records
         .fetch_add(ingested as u64, Ordering::Relaxed);
 
     Ok(Json(json!({
         "ingested": ingested,
-        "filesWritten": written.len(),
+        "filesWritten": files,
         "bytesWritten": bytes,
     })))
 }
@@ -3913,6 +4019,7 @@ mod tests {
             table: Arc::new("t".into()),
             ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
             ingest_phases: None,
+            ingest_commit_tx: None,
             alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
             alert_seq: Arc::new(AtomicU64::new(0)),
             audit_replica: Arc::from("test-replica"),
@@ -3932,6 +4039,77 @@ mod tests {
             query_cache: Arc::new(QueryCache::new(1024 * 1024)),
             audit_tx: tx,
         }
+    }
+
+    #[tokio::test]
+    async fn ingest_group_waits_for_shared_commit_and_deduplicates_files() {
+        let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
+        let phases = Arc::new(IngestPhaseMetrics::default());
+        let ingestor = verdigris_ingest::Ingestor::new(store.clone(), "logs")
+            .with_clock(clock.clone())
+            .with_phase_metrics(phases.clone());
+        let routing = verdigris_core::config::RoutingConfig::default();
+        let write = |seed, count| {
+            ingestor.write_batches(
+                verdigris_ingest::generate::generate(count, seed, 0),
+                &routing,
+                verdigris_core::batch::BatchPolicy::default(),
+            )
+        };
+        let first = write(0, 4).await.unwrap();
+        let mut second = first.clone();
+        second.extend(write(1, 5).await.unwrap());
+
+        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let mut acknowledgements = Vec::new();
+        for files in [first, second] {
+            let (ack, reply) = tokio::sync::oneshot::channel();
+            let sent = tx
+                .send(IngestCommitJob {
+                    files,
+                    _permit: permits.clone().try_acquire_owned().unwrap(),
+                    queued_at_us: Some(clock.monotonic_micros()),
+                    ack,
+                })
+                .await;
+            assert!(sent.is_ok());
+            acknowledgements.push(reply);
+        }
+        drop(tx);
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let held = lock.lock().await;
+        let worker = tokio::spawn(ingest_commit_worker(
+            ingestor,
+            lock.clone(),
+            clock,
+            Some(phases.clone()),
+            rx,
+            2,
+        ));
+        tokio::task::yield_now().await;
+        for reply in &mut acknowledgements {
+            assert!(matches!(
+                reply.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        assert_eq!(permits.available_permits(), 0);
+        drop(held);
+        for reply in acknowledgements {
+            reply.await.unwrap().unwrap();
+        }
+        worker.await.unwrap();
+        assert_eq!(permits.available_permits(), 2);
+        assert_eq!(phases.totals(IngestPhase::LockWait).2, 2);
+        assert_eq!(phases.totals(IngestPhase::ManifestCas).2, 1);
+        let manifest = verdigris_ingest::Ingestor::new(store, "logs")
+            .load_manifest_with_trigrams()
+            .await
+            .unwrap();
+        assert_eq!(manifest.total_rows(), 9);
+        assert!(manifest.files.iter().all(|f| f.message_trigrams.is_some()));
     }
 
     #[tokio::test]

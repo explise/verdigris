@@ -50,6 +50,8 @@ pub struct IngestConfig {
     pub max_batch_bytes: usize,
     /// Collect fixed-cardinality timing counters for ingest and compaction.
     pub profile_phases: bool,
+    /// Maximum prepared HTTP writes to publish together. Capped at eight.
+    pub commit_group_size: usize,
 }
 
 impl Default for IngestConfig {
@@ -61,6 +63,7 @@ impl Default for IngestConfig {
             max_batch_rows: batch.max_rows,
             max_batch_bytes: batch.max_bytes,
             profile_phases: false,
+            commit_group_size: 1,
         }
     }
 }

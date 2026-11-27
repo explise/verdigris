@@ -59,6 +59,9 @@ sed "s/^cores = .*/cores = $query_cores/" bench/config/loadtest.toml > "$out/con
 if [[ "${PROFILE_INGEST_PHASES:-0}" == 1 ]]; then
   sed -i '/^\[ingest\]$/a profile_phases = true' "$out/config.toml"
 fi
+if [[ -n "${INGEST_GROUP_SIZE:-}" ]]; then
+  sed -i "/^\[ingest\]$/a commit_group_size = $INGEST_GROUP_SIZE" "$out/config.toml"
+fi
 chmod 644 "$out/config.toml"
 vdg=$(docker run -d --pull never --network "$net" --cpus="$vdg_cpus" --memory=4g -p 127.0.0.1::8080 \
   -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS="$vdg_cpus" -e RUST_LOG=warn \
@@ -91,7 +94,11 @@ capture_phases
   uname -srm
   lscpu
 } > "$out/machine.txt"
-"$LOADGEN" --url "$url" --table logs --sustain-rows-per-sec "${ROWS_PER_S:-220000}" \
+corpus_args=()
+if [[ -n "${INGEST_CORPUS_TS_MS:-}" ]]; then
+  corpus_args=(--corpus-start-ms "$INGEST_CORPUS_TS_MS")
+fi
+"$LOADGEN" --url "$url" --table logs "${corpus_args[@]}" --sustain-rows-per-sec "${ROWS_PER_S:-220000}" \
   --duration-secs "${DURATION_SECS:-600}" --batch-rows "${BATCH_ROWS:-10000}" \
   --concurrency "${LOADGEN_CONCURRENCY:-16}" --out "$out/run.json" > "$out/loadgen.log" 2>&1 &
 load_pid=$!

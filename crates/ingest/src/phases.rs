@@ -50,6 +50,14 @@ struct PhaseTotals {
     max_us: AtomicU64,
 }
 
+impl PhaseTotals {
+    fn observe(&self, elapsed: u64) {
+        self.total_us.fetch_add(elapsed, Ordering::Relaxed);
+        self.max_us.fetch_max(elapsed, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Default)]
 pub struct IngestPhaseMetrics {
     phases: [PhaseTotals; IngestPhase::ALL.len()],
@@ -62,6 +70,10 @@ impl IngestPhaseMetrics {
             clock,
             start_us: clock.monotonic_micros(),
         }
+    }
+
+    pub fn observe(&self, phase: IngestPhase, elapsed_us: u64) {
+        self.phases[phase as usize].observe(elapsed_us);
     }
 
     /// Returns elapsed microseconds (total and max) and the observation count.
@@ -85,9 +97,7 @@ pub struct PhaseTimer<'a> {
 impl Drop for PhaseTimer<'_> {
     fn drop(&mut self) {
         let elapsed = self.clock.monotonic_micros().saturating_sub(self.start_us);
-        self.totals.total_us.fetch_add(elapsed, Ordering::Relaxed);
-        self.totals.max_us.fetch_max(elapsed, Ordering::Relaxed);
-        self.totals.count.fetch_add(1, Ordering::Relaxed);
+        self.totals.observe(elapsed);
     }
 }
 

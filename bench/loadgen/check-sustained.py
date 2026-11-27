@@ -8,7 +8,21 @@ from pathlib import Path
 
 
 def snapshot(url, table):
-    sql = f"SELECT substr(trace_id, 1, 22) AS batch_id, count(*) AS n FROM {table} GROUP BY 1"
+    sql = f"""
+        WITH fixture AS (
+            SELECT trace_id, substr(trace_id, 1, 22) AS batch_id,
+                   try_cast(substr(trace_id, 24) AS bigint) AS row_index
+            FROM {table}
+        )
+        SELECT batch_id, count(*) AS n, count(DISTINCT row_index) AS unique_offsets,
+               min(row_index) AS first_offset, max(row_index) AS last_offset,
+               count(*) FILTER (
+                   WHERE trace_id = concat(batch_id, '-',
+                       lpad(cast(row_index AS varchar),
+                            greatest(6, character_length(cast(row_index AS varchar))), '0'))
+               ) AS canonical_ids
+        FROM fixture GROUP BY batch_id
+    """
     request = urllib.request.Request(url.rstrip("/") + "/v1/query",
                                      data=json.dumps({"sql": sql, "histogram": False}).encode(),
                                      headers={"Content-Type": "application/json"})
@@ -19,7 +33,12 @@ def snapshot(url, table):
         marker = row["batch_id"]
         if not isinstance(marker, str) or not re.fullmatch(r"sustained-[0-9]{12}", marker) or marker in stored:
             raise ValueError("expected only unique sustained batch markers in the fixture")
-        stored[marker] = int(row["n"])
+        count = int(row["n"])
+        if (row["unique_offsets"], row["first_offset"], row["last_offset"], row["canonical_ids"]) != (
+            count, 0, count - 1, count
+        ):
+            raise ValueError(f"missing, duplicated, or invalid record IDs in {marker}")
+        stored[marker] = count
     return stored
 
 

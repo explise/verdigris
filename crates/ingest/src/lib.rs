@@ -313,10 +313,11 @@ impl Ingestor {
                 let _timer = self.phase_timer(IngestPhase::ManifestLoad);
                 self.load_manifest_versioned().await?
             };
-            let existing: HashSet<String> = manifest.files.iter().map(|f| f.path.clone()).collect();
+            let mut existing: HashSet<String> =
+                manifest.files.iter().map(|f| f.path.clone()).collect();
             let mut added = false;
             for f in files {
-                if !existing.contains(&f.path) {
+                if existing.insert(f.path.clone()) {
                     manifest.add(f.clone());
                     added = true;
                 }

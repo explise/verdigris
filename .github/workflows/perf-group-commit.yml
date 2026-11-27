@@ -1,0 +1,52 @@
+name: Verdigris sustained ingest group-commit control
+
+on:
+  push:
+    branches: [codex/perf-group-commit]
+
+permissions:
+  contents: read
+
+jobs:
+  group-test:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify shared acknowledgement and duplicate-file handling
+        run: cargo test --locked -p vdg --features serve --bin vdg ingest_group_waits_for_shared_commit
+  sustained:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the release node and sustained driver
+        run: |
+          docker build -f bench/Dockerfile.vdg -t verdigris-group-commit:local .
+          cargo build --locked --release --manifest-path bench/loadgen/Cargo.toml
+          df -h
+      - name: Compare individual and grouped manifest commits for ten minutes each
+        env:
+          VDG_IMAGE: verdigris-group-commit:local
+          VDG_CPUS: '3'
+          PROFILE_INGEST_PHASES: '1'
+          MINIO_CPUS: '1'
+          ROOT: ${{ runner.temp }}/verdigris-group-commit
+          INGEST_CORPUS_TS_MS: '1795764240000'
+        run: |
+          for size in 1 8; do
+            LOADGEN="$PWD/bench/loadgen/target/release/verdigris-loadgen" OUT="$ROOT/group-$size" \
+              INGEST_GROUP_SIZE="$size" bench/loadgen/run-sustained.sh
+          done
+      - name: Upload the offered-arrival ledger and recovery evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-group-commit
+          path: ${{ runner.temp }}/verdigris-group-commit
+          retention-days: 7
