@@ -168,6 +168,15 @@ check_rust() {
   have cargo || { note_skip "cargo not installed; the entire rust group was not run"; return; }
   run "fmt"               cargo fmt --all -- --check
   run "test (default)"    cargo test --workspace
+  run "loadgen tests"     cargo test --locked --manifest-path bench/loadgen/Cargo.toml
+  if have python3; then
+    run "loadgen recovery fixture" python3 -B bench/loadgen/check-sustained.py verify \
+      --run bench/results/issue21/sustained-smoke/run.json \
+      --before bench/results/issue21/sustained-smoke/before.json \
+      --after bench/results/issue21/sustained-smoke/after.json --out /dev/null
+  else
+    note_skip "python3 not installed; sustained ingest recovery fixture not run"
+  fi
   # The default lane runs the DST suite at seed 0 only. A seed sweep only proves
   # anything with faults injected (the harness does that), so this is the
   # per-PR batch from issue #10 — keep the seed count in sync with

@@ -12,12 +12,18 @@ on:
     branches: [main]
     paths:
       - "crates/**"
+      - "bench/loadgen/**"
+      - "bench/results/issue21/sustained-smoke/**"
+      - "scripts/verify.sh"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/rust.yml"
   pull_request:
     paths:
       - "crates/**"
+      - "bench/loadgen/**"
+      - "bench/results/issue21/sustained-smoke/**"
+      - "scripts/verify.sh"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/rust.yml"
@@ -58,6 +64,23 @@ jobs:
         with:
           key: ${{ matrix.lane }}
       - run: cargo test --workspace ${{ matrix.args }}
+
+  loadgen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench/loadgen
+          key: loadgen
+      - run: cargo test --locked --manifest-path bench/loadgen/Cargo.toml
+      - name: Verify archived ingest recovery fixture
+        run: |
+          python3 -B bench/loadgen/check-sustained.py verify \
+            --run bench/results/issue21/sustained-smoke/run.json \
+            --before bench/results/issue21/sustained-smoke/before.json \
+            --after bench/results/issue21/sustained-smoke/after.json --out /dev/null
 
   clippy:
     strategy:
