@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Browser regression fixture for the Logs rows-first UI.
 
-Covers the four states that matter for #74/#77:
+Covers the states that matter for #74/#77:
   * rows render while the activity request is held open;
   * rows stay rendered when activity fails;
   * a late activity response for an older query is discarded;
+  * switching workspaces starts new rows and activity, with its own cold approval;
   * cold-tier confirmation gates both the rows and activity requests.
 
 The app is the production build (`web/dist`); API calls are served by a local
@@ -24,8 +25,9 @@ DEFAULT_SQL = "service:auth status>=500 | last 1h"
 LOCK = threading.Lock()
 STATE = {
     "fail_activity": False,
-    "hold": {},          # sql -> threading.Event
-    "requests": [],      # (kind, sql)
+    "cloud": False,
+    "hold": {},          # (workspace, sql) -> threading.Event
+    "requests": [],      # (kind, sql, workspace, tiers)
 }
 TOTALS = {DEFAULT_SQL: 3, "STALE_A": 3, "STALE_B": 7, "COLD_QUERY": 5}
 
@@ -43,24 +45,25 @@ CONFIG = {
 }
 
 
-def reset(fail_activity=False):
+def reset(fail_activity=False, cloud=False):
     with LOCK:
         STATE["fail_activity"] = fail_activity
+        STATE["cloud"] = cloud
         STATE["hold"] = {}
         STATE["requests"] = []
 
 
-def record(kind, sql):
+def record(kind, sql, workspace, tiers):
     with LOCK:
-        STATE["requests"].append((kind, sql))
+        STATE["requests"].append((kind, sql, workspace, tuple(tiers)))
 
 
-def request_count(kind, sql=None):
+def request_count(kind, sql=None, workspace=None, tier=None):
     with LOCK:
         return sum(
-            1
-            for k, s in STATE["requests"]
+            1 for k, s, w, tiers in STATE["requests"]
             if k == kind and (sql is None or s == sql)
+            and (workspace is None or w == workspace) and (tier is None or tier in tiers)
         )
 
 
@@ -90,7 +93,17 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/config.json":
-            return self._json(200, CONFIG)
+            with LOCK:
+                cloud = STATE["cloud"]
+            config = CONFIG
+            if cloud:
+                config = {
+                    **CONFIG, "mode": "cloud",
+                    "environments": [*CONFIG["environments"], {
+                        "id": "staging", "label": "Staging", "region": "local", "bucket": "s3://staging",
+                    }],
+                }
+            return self._json(200, config)
         if self.path == "/" or not (ROOT / self.path.lstrip("/")).exists():
             self.path = "/index.html"
         return super().do_GET()
@@ -102,18 +115,21 @@ class Handler(SimpleHTTPRequestHandler):
         except json.JSONDecodeError:
             body = {}
         sql = str(body.get("sql", DEFAULT_SQL))
+        tiers = body.get("tiers", ())
+        parts = self.path.split("/")
+        workspace = parts[5] if len(parts) > 6 and parts[:5] == ["", "v1", "org", "acme", "env"] else None
 
-        if self.path.endswith("/v1/query/activity"):
-            record("activity", sql)
+        if self.path.endswith("/query/activity"):
+            record("activity", sql, workspace, tiers)
             with LOCK:
                 fail = STATE["fail_activity"]
-                held = STATE["hold"].get(sql)
+                held = STATE["hold"].get((workspace, sql))
             if held is not None:
                 # A held response is deliberately released by the caller.
                 held.wait(timeout=30)
             if fail:
                 return self._json(500, {"error": "activity unavailable"})
-            total = TOTALS.get(sql, 3)
+            total = 11 if workspace == "staging" else TOTALS.get(sql, 3)
             return self._json(
                 200,
                 {
@@ -126,19 +142,22 @@ class Handler(SimpleHTTPRequestHandler):
                     },
                 },
             )
-        if self.path.endswith("/v1/query/estimate"):
+        if self.path.endswith("/query/estimate"):
             return self._json(
                 200, {"scanGB": 0.5, "costUsd": 0.2, "coldRestore": True}
             )
-        if self.path.endswith("/v1/query"):
-            record("rows", sql)
+        if self.path.endswith("/query"):
+            record("rows", sql, workspace, tiers)
+            if body.get("histogram") is not False:
+                return self._json(400, {"error": "expected rows-only request"})
+            marker = f"{workspace} {sql}" if workspace else sql
             rows = [
                 {
                     "ts": "2026-11-27T00:00:01.000Z",
                     "level": "ERROR",
                     "service": "checkout",
                     "status": 500,
-                    "message": f"{sql} failed 1",
+                    "message": f"{marker} failed 1",
                     "trace_id": "a1",
                     "attrs_json": '{"region":"us-east-1","host":"node-01"}',
                 },
@@ -147,7 +166,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "level": "ERROR",
                     "service": "checkout",
                     "status": 500,
-                    "message": f"{sql} failed 2",
+                    "message": f"{marker} failed 2",
                     "trace_id": "a2",
                     "attrs_json": '{"region":"us-east-1","host":"node-02"}',
                 },
@@ -194,7 +213,7 @@ def test_held(browser, port):
     reset()
     with LOCK:
         ev = threading.Event()
-        STATE["hold"][DEFAULT_SQL] = ev
+        STATE["hold"][None, DEFAULT_SQL] = ev
     page = open_app(browser, port)
     try:
         assert "2 rows" in page.locator(".logs-foot").inner_text()
@@ -227,7 +246,7 @@ def test_stale(browser, port):
     reset()
     with LOCK:
         ev = threading.Event()
-        STATE["hold"]["STALE_A"] = ev
+        STATE["hold"][None, "STALE_A"] = ev
     page = open_app(browser, port)
     try:
         page.fill(".query-input input", "STALE_A")
@@ -279,6 +298,49 @@ def test_cold_gate(browser, port):
         page.close()
 
 
+def test_workspace_switch(browser, port):
+    reset(cloud=True)
+    held = threading.Event()
+    with LOCK:
+        STATE["hold"]["prod", "COLD_QUERY"] = held
+    page = open_app(browser, port)
+    try:
+        page.locator("[data-tier=cold]").click()
+        page.fill(".query-input input", "COLD_QUERY")
+        page.locator(".querybar button.primary").click()
+        page.get_by_role("button", name="Restore & run").click()
+        wait_rows(page, "prod COLD_QUERY")
+        wait_for(
+            lambda: request_count("activity", "COLD_QUERY", workspace="prod", tier="cold") == 1,
+            what="approved cold activity in the first workspace",
+        )
+
+        page.locator(".switcher button.env").click()
+        page.locator(".switch-menu .switch-item").filter(has_text="Staging").click()
+        page.wait_for_url("**/acme/staging/logs")
+        wait_for(lambda: request_count("rows", workspace="staging") > 0, what="first staging request")
+        assert request_count("rows", workspace="staging", tier="cold") == 0, "approval leaked across workspaces"
+        assert request_count("activity", workspace="staging", tier="cold") == 0
+        wait_rows(page, "staging " + DEFAULT_SQL)
+        page.wait_for_function(
+            "() => document.querySelector('.histo')?.innerText.includes('11 events in chart range')",
+            timeout=10000,
+        )
+        with page.expect_response(
+            lambda response: response.url.endswith("/v1/org/acme/env/prod/query/activity")
+            and response.request.post_data_json["sql"] == "COLD_QUERY"
+        ):
+            held.set()
+
+        assert "11 events in chart range" in chart_text(page)
+        assert "staging " + DEFAULT_SQL in page.locator(".vrow").first.inner_text()
+        assert request_count("rows", workspace="staging", tier="cold") == 0
+        assert request_count("activity", workspace="staging", tier="cold") == 0
+    finally:
+        held.set()
+        page.close()
+
+
 def main():
     if not (ROOT / "index.html").exists():
         raise SystemExit("build the web app first: npm --prefix web run build")
@@ -297,11 +359,12 @@ def main():
                 test_failure(browser, port)
                 test_stale(browser, port)
                 test_cold_gate(browser, port)
+                test_workspace_switch(browser, port)
             finally:
                 browser.close()
     finally:
         server.shutdown()
-    print("logs rows-first browser fixture: held/failed/stale/cold OK")
+    print("logs rows-first browser fixture: held/failed/stale/cold/workspace OK")
 
 
 if __name__ == "__main__":
