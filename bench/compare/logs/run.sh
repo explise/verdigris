@@ -201,6 +201,7 @@ run_vdg() {
   storage=$(curl -fsS --max-time 5 "http://127.0.0.1:$port/v1/storage/tiers" 2>/dev/null || echo '{}')
   bucket_bytes=$(docker exec "$MINIO_C" du -sb /data/verdigris 2>/dev/null | awk '{print $1}' || echo 0)
   internal_bytes=$(docker exec "$MINIO_C" du -sb /data/.minio.sys 2>/dev/null | awk '{print $1}' || echo 0)
+  docker exec "$MINIO_C" du -b -d 2 /data/.minio.sys > "$OUT/minio-internal.txt"
   python3 - "$OUT/vdg.meta.json" "$mem" "$storage" "$bucket_bytes" "$internal_bytes" <<'PY'
 import json, sys
 p, mem, raw, bucket, internal = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]

@@ -1,0 +1,11 @@
+153520598	/data/.minio.sys
+153508466	/data/.minio.sys/tmp/.trash
+153508466	/data/.minio.sys/tmp
+10237	/data/.minio.sys/config
+9807	/data/.minio.sys/config/config.json
+1188	/data/.minio.sys/buckets/verdigris
+1188	/data/.minio.sys/buckets
+475	/data/.minio.sys/pool.bin
+430	/data/.minio.sys/config/iam
+0	/data/.minio.sys/multipart
+19565257	/data/verdigris

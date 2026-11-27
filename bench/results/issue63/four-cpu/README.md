@@ -43,6 +43,13 @@ internal footprint separate from bucket bytes and from the active file
 count. ClickHouse and VictoriaLogs figures describe their data directory
 with the test server running.
 
+A separate 1M-row RAM-backed reproduction used the same MinIO digest and
+2 CPU / 3 GiB per container. Its internal directory totaled 153,520,598 bytes,
+of which 153,508,466 bytes were under `.minio.sys/tmp/.trash`. The hosted
+reference run did not sample those subdirectories, so use this diagnostic
+as a lead when interpreting its internal volume total. The benchmark now
+records the subdirectory breakdown. [Reproduction snapshot](minio-internal-tmpfs.txt)
+
 Raw values, machine/config data and all restart samples are in
 [trial 1](trial-1.json.gz), [trial 2](trial-2.json.gz), and [trial 3](trial-3.json.gz).
 Run `TOTAL_CPUS=4 WARMUP=10 ITERATIONS=100 RESTART=1 bench/compare/logs/run.sh`
