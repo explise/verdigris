@@ -56,6 +56,9 @@ done
 printf 'fixture preflight\n' | mc_run pipe local/verdigris/_benchmark_probe
 mc_run rm local/verdigris/_benchmark_probe
 sed "s/^cores = .*/cores = $query_cores/" bench/config/loadtest.toml > "$out/config.toml"
+if [[ "${PROFILE_INGEST_PHASES:-0}" == 1 ]]; then
+  sed -i '/^\[ingest\]$/a profile_phases = true' "$out/config.toml"
+fi
 chmod 644 "$out/config.toml"
 vdg=$(docker run -d --pull never --network "$net" --cpus="$vdg_cpus" --memory=4g -p 127.0.0.1::8080 \
   -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS="$vdg_cpus" -e RUST_LOG=warn \
@@ -71,6 +74,14 @@ wait_ready() {
   return 1
 }
 wait_ready
+capture_phases() {
+  if [[ "${PROFILE_INGEST_PHASES:-0}" == 1 ]]; then
+    local stamp
+    stamp=$(date -u +%s)
+    curl -fsS --max-time 2 "$url/metrics" > "$out/phases-$stamp.prom" || true
+  fi
+}
+capture_phases
 {
   echo "source_commit=$(git rev-parse HEAD)"
   echo "vdg_image=$(docker image inspect "$VDG_IMAGE" --format '{{.Id}}')"
@@ -85,12 +96,17 @@ wait_ready
   --concurrency "${LOADGEN_CONCURRENCY:-16}" --out "$out/run.json" > "$out/loadgen.log" 2>&1 &
 load_pid=$!
 while kill -0 "$load_pid" 2>/dev/null; do
+  capture_phases
   date -u +%FT%TZ >> "$out/containers.txt"
   docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' "$vdg" "$minio" \
     >> "$out/containers.txt" || true
   sleep 10
 done
 wait "$load_pid"
+if [[ "${PROFILE_INGEST_PHASES:-0}" == 1 ]]; then
+  curl -fsS --max-time 5 "$url/metrics" > "$out/phases-final.prom"
+  grep -qE '^verdigris_ingest_phase_observations_total\{phase="manifest_cas"\} [1-9][0-9]*$' "$out/phases-final.prom"
+fi
 python3 -B bench/loadgen/check-sustained.py snapshot --url "$url" --table logs --out "$out/before.json"
 docker kill --signal KILL "$vdg" >/dev/null
 docker start "$vdg" >/dev/null

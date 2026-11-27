@@ -16,6 +16,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +52,7 @@ use verdigris_core::config::{Config, StorageConfig};
 use verdigris_core::cost::{self, RetrievalMode};
 use verdigris_core::manifest::Manifest;
 use verdigris_core::model::Tier;
+use verdigris_ingest::phases::{IngestPhase, IngestPhaseMetrics, PhaseTimer};
 use verdigris_ingest::wire::JsonLog;
 use verdigris_query::engine::{QueryCache, QueryLimits, ResultTooLarge};
 use verdigris_query::index::IndexedFile;
@@ -97,6 +99,7 @@ struct AppState {
     /// DaemonSet fanning in) must not interleave. Cross-process/replica
     /// concurrency still needs Iceberg commits — a known, documented gap.
     ingest_lock: Arc<tokio::sync::Mutex<()>>,
+    ingest_phases: Option<Arc<IngestPhaseMetrics>>,
     /// Serializes writes to the alerts doc — a scheduler tick and a concurrent
     /// create/delete must not clobber each other's read-modify-write.
     alerts_lock: Arc<tokio::sync::Mutex<()>>,
@@ -146,6 +149,14 @@ struct AppState {
     /// the record durable before the response is released. The queue bounds
     /// memory; a full queue falls back to a direct append.
     audit_tx: tokio::sync::mpsc::Sender<AuditJob>,
+}
+
+impl AppState {
+    fn ingest_phase_timer(&self, phase: IngestPhase) -> Option<PhaseTimer<'_>> {
+        self.ingest_phases
+            .as_ref()
+            .map(|metrics| metrics.timer(self.clock.as_ref(), phase))
+    }
 }
 
 /// Counters for background auto-compaction. The live "pending files" figure is
@@ -840,11 +851,28 @@ async fn track_metrics(
 /// `GET /metrics` — Prometheus text exposition for the service itself. Open (no
 /// auth), like `/healthz`, so a scraper can always reach it.
 async fn h_prometheus(State(st): State<AppState>) -> Response {
-    (
-        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
-        st.metrics.render(),
-    )
-        .into_response()
+    let mut body = st.metrics.render();
+    if let Some(metrics) = &st.ingest_phases {
+        body.push_str(concat!(
+            "# TYPE verdigris_ingest_phase_observations_total counter\n",
+            "# TYPE verdigris_ingest_phase_microseconds_total counter\n",
+            "# TYPE verdigris_ingest_phase_microseconds_max gauge\n",
+        ));
+        for phase in IngestPhase::ALL {
+            let (total_us, max_us, count) = metrics.totals(phase);
+            let phase = phase.label();
+            let _ = write!(
+                body,
+                concat!(
+                    "verdigris_ingest_phase_observations_total{{phase=\"{0}\"}} {1}\n",
+                    "verdigris_ingest_phase_microseconds_total{{phase=\"{0}\"}} {2}\n",
+                    "verdigris_ingest_phase_microseconds_max{{phase=\"{0}\"}} {3}\n",
+                ),
+                phase, count, total_us, max_us,
+            );
+        }
+    }
+    ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
 /// An error response: a status code + a JSON `{ "error": ... }` body. Defaults to
@@ -1299,6 +1327,7 @@ async fn maybe_compact(
     max_merge_files: usize,
     retired_grace_ms: u64,
     metrics: &CompactionMetrics,
+    phases: Option<&IngestPhaseMetrics>,
 ) -> anyhow::Result<()> {
     let ingestor = verdigris_ingest::Ingestor::new(s.clone(), table)
         .with_clock(clock.clone())
@@ -1326,11 +1355,19 @@ async fn maybe_compact(
     let mut total_merged = 0usize;
     let mut passes = 0usize;
     loop {
-        let _g = ingest_lock.lock().await;
-        let (reports, more) = ingestor
-            .compact_bounded(target_bytes, max_merge_files)
-            .await?;
-        drop(_g);
+        let guard = {
+            let _timer =
+                phases.map(|metrics| metrics.timer(clock.as_ref(), IngestPhase::CompactLockWait));
+            ingest_lock.lock().await
+        };
+        let (reports, more) = {
+            let _timer =
+                phases.map(|metrics| metrics.timer(clock.as_ref(), IngestPhase::CompactPass));
+            ingestor
+                .compact_bounded(target_bytes, max_merge_files)
+                .await?
+        };
+        drop(guard);
         total_merged += reports.iter().map(|r| r.files_merged).sum::<usize>();
         passes += 1;
         if !more || passes >= 10_000 {
@@ -1543,6 +1580,10 @@ pub async fn serve_with_clock(
     };
 
     let state = AppState {
+        ingest_phases: cfg
+            .ingest
+            .profile_phases
+            .then(|| Arc::new(IngestPhaseMetrics::default())),
         cfg: Arc::new(cfg),
         table: Arc::new(table),
         ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1600,6 +1641,7 @@ pub async fn serve_with_clock(
         if let Ok(s) = store(&state) {
             let table = state.table.clone();
             let cm = state.compaction.clone();
+            let phases = state.ingest_phases.clone();
             let lock = state.ingest_lock.clone();
             let ccfg = state.cfg.compaction.clone();
             let clock = state.clock.clone();
@@ -1618,6 +1660,7 @@ pub async fn serve_with_clock(
                         ccfg.max_merge_files_per_pass,
                         ccfg.retired_grace_ms(),
                         &cm,
+                        phases.as_deref(),
                     )
                     .await
                     {
@@ -2568,15 +2611,23 @@ fn ingest_permit(st: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, App
 /// which is what keeps in-flight bodies from piling up in memory.
 async fn ingest_write_then_commit(
     st: &AppState,
-    ingestor: &verdigris_ingest::Ingestor,
     records: Vec<LogRecord>,
 ) -> Result<Vec<verdigris_core::manifest::DataFile>, AppError> {
+    let mut ingestor = verdigris_ingest::Ingestor::new(store(st)?, st.table.as_str());
+    if let Some(metrics) = &st.ingest_phases {
+        ingestor = ingestor
+            .with_clock(st.clock.clone())
+            .with_phase_metrics(metrics.clone());
+    }
     let written = ingestor
         .write_batches(records, &st.cfg.routing, st.cfg.ingest.batch_policy())
         .await?;
 
     if !written.is_empty() {
-        let _guard = st.ingest_lock.lock().await;
+        let _guard = {
+            let _timer = st.ingest_phase_timer(IngestPhase::LockWait);
+            st.ingest_lock.lock().await
+        };
         ingestor.commit_files(&written).await?;
     }
     Ok(written)
@@ -2584,7 +2635,10 @@ async fn ingest_write_then_commit(
 
 async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
     let _permit = ingest_permit(&st)?;
-    let (records, skipped, first_err) = parse_ingest_body(&body);
+    let (records, skipped, first_err) = {
+        let _timer = st.ingest_phase_timer(IngestPhase::Parse);
+        parse_ingest_body(&body)
+    };
     if records.is_empty() {
         return Err(AppError::bad_request(first_err.unwrap_or_else(|| {
             "no valid log records in request body (expected NDJSON, a JSON object, or a JSON array)"
@@ -2593,9 +2647,7 @@ async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
     }
     let ingested = records.len();
 
-    let s = store(&st)?;
-    let ingestor = verdigris_ingest::Ingestor::new(s, st.table.as_str());
-    let written = ingest_write_then_commit(&st, &ingestor, records).await?;
+    let written = ingest_write_then_commit(&st, records).await?;
     let bytes: u64 = written.iter().map(|f| f.bytes).sum();
     st.metrics
         .ingest_records
@@ -2615,7 +2667,10 @@ async fn h_ingest(State(st): State<AppState>, body: String) -> ApiResult {
 /// `/v1/ingest`. OTLP/JSON only (no protobuf/gRPC) to keep deps light.
 async fn h_otlp(State(st): State<AppState>, body: String) -> ApiResult {
     let _permit = ingest_permit(&st)?;
-    let records = verdigris_ingest::otlp::parse_otlp_json(&body).map_err(AppError::bad_request)?;
+    let records = {
+        let _timer = st.ingest_phase_timer(IngestPhase::Parse);
+        verdigris_ingest::otlp::parse_otlp_json(&body).map_err(AppError::bad_request)?
+    };
     if records.is_empty() {
         return Err(AppError::bad_request(
             "no log records in OTLP request (expected resourceLogs[].scopeLogs[].logRecords[])",
@@ -2623,9 +2678,7 @@ async fn h_otlp(State(st): State<AppState>, body: String) -> ApiResult {
     }
     let ingested = records.len();
 
-    let s = store(&st)?;
-    let ingestor = verdigris_ingest::Ingestor::new(s, st.table.as_str());
-    let written = ingest_write_then_commit(&st, &ingestor, records).await?;
+    let written = ingest_write_then_commit(&st, records).await?;
     let bytes: u64 = written.iter().map(|f| f.bytes).sum();
     st.metrics
         .ingest_records
@@ -3578,6 +3631,7 @@ mod tests {
             128,
             verdigris_ingest::DEFAULT_RETIRED_GRACE_MS,
             &metrics,
+            None,
         )
         .await
         .unwrap();
@@ -3600,6 +3654,7 @@ mod tests {
             2,
             verdigris_ingest::DEFAULT_RETIRED_GRACE_MS,
             &metrics,
+            None,
         )
         .await
         .unwrap();
@@ -3857,6 +3912,7 @@ mod tests {
             cfg: Arc::new(Config::default()),
             table: Arc::new("t".into()),
             ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
+            ingest_phases: None,
             alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
             alert_seq: Arc::new(AtomicU64::new(0)),
             audit_replica: Arc::from("test-replica"),
