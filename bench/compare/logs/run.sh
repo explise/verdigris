@@ -93,13 +93,18 @@ cleanup_vdg() {
   fi
 }
 restart_first_queries() {
-  local system=$1 port=$2 container=$3 url=$4 shape
+  local system=$1 service_port=$2 container=$3 health_path=$4 shape port
   for shape in trace trace-miss trace-cross-tier search aggregate; do
     docker restart "$container" >/dev/null
-    wait_ready "$system restart" "$url"
+    port=$(local_port "$container" "$service_port")
+    wait_ready "$system restart" "http://127.0.0.1:$port$health_path"
     python3 -B bench/compare/logs/first_query.py --system "$system" --port "$port" \
       --rows "$ROWS" --shape "$shape" --out "$OUT/$system-restart-$shape.json"
   done
+}
+
+local_port() {
+  docker port "$1" "$2/tcp" | awk -F: '{print $NF}'
 }
 
 wait_ready() {
@@ -141,30 +146,32 @@ run_vdg() {
   vol_created=1
   docker run --rm -v "$VOL:/data" "$BUSYBOX" chown -R 65532:65532 /data
 
-  local minio
+  local minio minio_port
   minio=$(docker run -d --rm --name "$MINIO_C" --network "$NET" \
     --network-alias vdgbench-minio \
-    --cpus=4 --memory=3g -p 127.0.0.1:9000:9000 \
+    --cpus=4 --memory=3g -p 127.0.0.1::9000 \
     -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
     -e MINIO_UPDATE=off -v "$VOL:/data" "$MINIO" server /data)
   ids+=("$minio")
-  wait_ready MinIO http://127.0.0.1:9000/minio/health/ready
+  minio_port=$(local_port "$minio" 9000)
+  wait_ready MinIO "http://127.0.0.1:$minio_port/minio/health/ready"
   docker run --rm --network "$NET" \
     -e MC_HOST_local=http://minioadmin:minioadmin@$MINIO_C:9000 \
     "$MC" mb --ignore-existing local/verdigris >/dev/null 2>&1
 
-  local vdg
+  local vdg port
   vdg=$(docker run -d --rm --name "$VDG_C" --network "$NET" \
-    --cpus=4 --memory=3g -p 127.0.0.1:8080:8080 \
+    --cpus=4 --memory=3g -p 127.0.0.1::8080 \
     -e VERDIGRIS_CONFIG=/app/config/bench.toml \
     -e TOKIO_WORKER_THREADS=4 -e RUST_LOG=warn \
     -v "$repo/bench/compare/logs/vdg.toml:/app/config/bench.toml:ro" \
     "$VDG_IMAGE" serve --port 8080 --table bench --role all)
   ids+=("$vdg")
-  wait_ready vdg http://127.0.0.1:8080/healthz
+  port=$(local_port "$vdg" 8080)
+  wait_ready vdg "http://127.0.0.1:$port/healthz"
 
   python3 bench/compare/logs/compare.py \
-    --system vdg --port 8080 --rows "$ROWS" --batch-rows "$BATCH_ROWS" \
+    --system vdg --port "$port" --rows "$ROWS" --batch-rows "$BATCH_ROWS" \
     --threads "$THREADS" --iterations "$ITERATIONS" --warmup "$WARMUP" \
     --out "$OUT/vdg.json"
 
@@ -172,11 +179,12 @@ run_vdg() {
   bytes=$(docker exec "$MINIO_C" du -sb /data 2>/dev/null | awk '{print $1}' || echo 0)
   mem=$(container_mem "$VDG_C" "$MINIO_C")
   if [[ "${RESTART:-1}" == "1" ]]; then
-    restart_first_queries vdg 8080 "$vdg" http://127.0.0.1:8080/healthz
+    restart_first_queries vdg 8080 "$vdg" /healthz
+    port=$(local_port "$vdg" 8080)
   fi
 
   write_meta vdg "$VDG_IMAGE" 8 "vdg 3g + minio 3g" "$bytes"
-  storage=$(curl -fsS --max-time 5 http://127.0.0.1:8080/v1/storage/tiers 2>/dev/null || echo '{}')
+  storage=$(curl -fsS --max-time 5 "http://127.0.0.1:$port/v1/storage/tiers" 2>/dev/null || echo '{}')
   bucket_bytes=$(docker exec "$MINIO_C" du -sb /data/verdigris 2>/dev/null | awk '{print $1}' || echo 0)
   internal_bytes=$(docker exec "$MINIO_C" du -sb /data/.minio.sys 2>/dev/null | awk '{print $1}' || echo 0)
   python3 - "$OUT/vdg.meta.json" "$mem" "$storage" "$bucket_bytes" "$internal_bytes" <<'PY'
@@ -201,16 +209,17 @@ PY
 
 run_clickhouse() {
   echo "==> ClickHouse (8 CPU / 6 GiB)"
-  local ch
+  local ch port
   ch=$(docker run -d --rm --name "$CH_C" --cpus=8 --memory=6g \
-    -p 127.0.0.1:8123:8123 \
+    -p 127.0.0.1::8123 \
     -e CLICKHOUSE_USER=default -e CLICKHOUSE_PASSWORD=benchpass \
     -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 "$CH")
   ids+=("$ch")
-  wait_ready ClickHouse http://127.0.0.1:8123/ping
+  port=$(local_port "$ch" 8123)
+  wait_ready ClickHouse "http://127.0.0.1:$port/ping"
 
   python3 bench/compare/logs/compare.py \
-    --system clickhouse --port 8123 --rows "$ROWS" --batch-rows "$BATCH_ROWS" \
+    --system clickhouse --port "$port" --rows "$ROWS" --batch-rows "$BATCH_ROWS" \
     --threads "$THREADS" --iterations "$ITERATIONS" --warmup "$WARMUP" \
     --out "$OUT/clickhouse.json"
 
@@ -218,7 +227,7 @@ run_clickhouse() {
   bytes=$(docker exec "$CH_C" du -sb /var/lib/clickhouse 2>/dev/null | awk '{print $1}' || echo 0)
   mem=$(container_mem "$CH_C")
   if [[ "${RESTART:-1}" == "1" ]]; then
-    restart_first_queries clickhouse 8123 "$ch" http://127.0.0.1:8123/ping
+    restart_first_queries clickhouse 8123 "$ch" /ping
   fi
 
   write_meta clickhouse "$CH" 8 "6g" "$bytes"
@@ -232,20 +241,21 @@ PY
 
 run_victorialogs() {
   echo "==> VictoriaLogs (8 CPU / 6 GiB)"
-  local vl data_dir
+  local vl data_dir port
   # The VictoriaLogs image is a single static binary with no shell/du, so bind
   # its data path to the host and measure retained bytes from here.
   data_dir=$(mktemp -d "${TMPDIR:-/tmp}/vl-bench.XXXXXX")
   vl_data_dir=$data_dir
   vl=$(docker run -d --rm --name "$VL_C" --cpus=8 --memory=6g \
-    -p 127.0.0.1:9428:9428 \
+    -p 127.0.0.1::9428 \
     -v "$data_dir:/victoria-logs-data" \
     "$VL" -storageDataPath=/victoria-logs-data)
   ids+=("$vl")
-  wait_ready VictoriaLogs http://127.0.0.1:9428/health
+  port=$(local_port "$vl" 9428)
+  wait_ready VictoriaLogs "http://127.0.0.1:$port/health"
 
   python3 bench/compare/logs/compare.py \
-    --system victorialogs --port 9428 --rows "$ROWS" --batch-rows "$BATCH_ROWS" \
+    --system victorialogs --port "$port" --rows "$ROWS" --batch-rows "$BATCH_ROWS" \
     --threads "$THREADS" --iterations "$ITERATIONS" --warmup "$WARMUP" \
     --out "$OUT/victorialogs.json"
 
@@ -256,7 +266,7 @@ run_victorialogs() {
   bytes=$(du -sb "$data_dir" 2>/dev/null | awk '{print $1}' || echo 0)
   mem=$(container_mem "$VL_C")
   if [[ "${RESTART:-1}" == "1" ]]; then
-    restart_first_queries victorialogs 9428 "$vl" http://127.0.0.1:9428/health
+    restart_first_queries victorialogs 9428 "$vl" /health
   fi
 
   write_meta victorialogs "$VL" 8 "6g" "$bytes"
