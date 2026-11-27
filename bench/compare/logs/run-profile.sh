@@ -33,9 +33,13 @@ trap cleanup EXIT
 net=$(docker network create "$nonce")
 volume=$(docker volume create "$nonce")
 docker run --rm --pull never -v "$volume:/data" "$BUSYBOX" chown 65532:65532 /data
-minio=$(docker run -d --pull never --network "$net" --network-alias minio   --cpus=4 --memory=3g -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin   -e MINIO_UPDATE=off -v "$volume:/data" "$MINIO" server /data)
+minio=$(docker run -d --pull never --network "$net" --network-alias minio \
+  --cpus=4 --memory=3g -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+  -e MINIO_UPDATE=off -v "$volume:/data" "$MINIO" server /data)
 for attempt in {1..30}; do
-  if docker run --rm --pull never --network "$net"     -e MC_HOST_local=http://minioadmin:minioadmin@minio:9000     "$MC" mb --ignore-existing local/verdigris; then
+  if docker run --rm --pull never --network "$net" \
+    -e MC_HOST_local=http://minioadmin:minioadmin@minio:9000 \
+    "$MC" mb --ignore-existing local/verdigris; then
     break
   fi
   if [[ "$attempt" == 30 ]]; then exit 1; fi
@@ -44,7 +48,10 @@ done
 sed 's/vdgbench-minio/minio/g' bench/compare/logs/vdg.toml > "$scratch/config.toml"
 chmod 644 "$scratch/config.toml"
 
-vdg=$(docker run -d --pull never --network "$net" --cpus=4 --memory=3g   -p 127.0.0.1::8080 -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS=4   -e RUST_LOG=warn -v "$scratch/config.toml:/app/config/bench.toml:ro"   "$VDG_IMAGE" serve --port 8080 --table bench --role all)
+vdg=$(docker run -d --pull never --network "$net" --cpus=4 --memory=3g \
+  -p 127.0.0.1::8080 -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS=4 \
+  -e RUST_LOG=warn -v "$scratch/config.toml:/app/config/bench.toml:ro" \
+  "$VDG_IMAGE" serve --port 8080 --table bench --role all)
 wait_ready() {
   port=$(docker port "$vdg" 8080/tcp)
   port=${port##*:}
@@ -68,7 +75,8 @@ wait_ready
 } > "$OUT/machine.txt"
 cp "$scratch/config.toml" "$OUT/config.toml"
 
-python3 -B bench/compare/logs/compare.py --system vdg --port "$port" --rows "$ROWS" --batch-rows "$BATCH_ROWS" --iterations 1 --warmup 0 --out "$OUT/seed.json"
+python3 -B bench/compare/logs/compare.py --system vdg --port "$port" --rows "$ROWS" --batch-rows "$BATCH_ROWS" \
+  --iterations 1 --warmup 0 --out "$OUT/seed.json"
 profile=(python3 -B bench/compare/logs/profile.py --seed-report "$OUT/seed.json")
 "${profile[@]}" --port "$port" --iterations "$ITERATIONS" --warmup "$WARMUP" --out "$OUT/warm.json"
 
