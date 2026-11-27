@@ -28,7 +28,10 @@ volume=
 minio=
 vdg=
 cleanup() {
-  if [[ -n "$vdg" ]]; then docker rm -f "$vdg" >/dev/null || true; fi
+  if [[ -n "$vdg" ]]; then
+    docker logs --timestamps "$vdg" > "$OUT/vdg-warnings.log" 2>&1 || true
+    docker rm -f "$vdg" >/dev/null || true
+  fi
   if [[ -n "$minio" ]]; then docker rm -f "$minio" >/dev/null || true; fi
   if [[ -n "$volume" ]]; then docker volume rm "$volume" >/dev/null || true; fi
   if [[ -n "$net" ]]; then docker network rm "$net" >/dev/null || true; fi

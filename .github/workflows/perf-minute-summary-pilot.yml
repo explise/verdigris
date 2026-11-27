@@ -1,46 +1,22 @@
-name: Verdigris manifest-backed minute-summary pilot
+name: Verdigris minute-summary audit diagnostic
 
 on:
   push:
-    branches: [codex/perf-minute-summary-pilot]
+    branches: [codex/perf-minute-summary-audit]
 
 permissions:
   contents: read
 
 jobs:
-  correctness:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 55
-    env:
-      CARGO_PROFILE_DEV_DEBUG: '0'
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - run: cargo test --locked -p verdigris-core --lib minute::tests
-      - run: cargo test --locked -p verdigris-query --features datafusion --test engine minute_summary_matches_raw_across_late_write_and_compaction
-      - run: scripts/verify.sh --all rust
   compare:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - trial: 2
-            rows: 1000000
-            batch: 10000
-            order: summary raw
-          - trial: 2
+          - trial: audit
             rows: 20000000
             batch: 50000
             order: raw summary
-          - trial: 3
-            rows: 1000000
-            batch: 10000
-            order: raw summary
-          - trial: 3
-            rows: 20000000
-            batch: 50000
-            order: summary raw
     runs-on: ubuntu-24.04
     timeout-minutes: 80
     steps:
