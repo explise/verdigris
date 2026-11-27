@@ -1,0 +1,8 @@
+b43938b3171148cc843f1dd8a7db4ac24e81d350
+sha256:4a2db38a6384cd267555f0f262cd5e7adc5ad09565b1ea16d7f21ed92977a4e0
+MIXED_BASE_TS_MS=1795752540000
+Budget: vdg 4 CPU / 2 GiB + MinIO 2 CPU / 2 GiB
+MinIO: cgr.dev/chainguard/minio@sha256:634c989a2f1029162fc2676c263caa181213b9410449968532f750a6fb77532d (4 GiB tmpfs backing, within the 2 GiB container memory limit)
+Linux 7.0.0-38-generic x86_64
+CPU(s):                                  16
+Model name:                              AMD Ryzen 7 6800H with Radeon Graphics

@@ -4,7 +4,7 @@
 
 Three fresh 1M-row MinIO deployments were measured on the corrected integrated
 head `cfe5146` (image `sha256:861a0f09…`). With durable audit enabled and
-diagnostics off, trace-hit latency was **18.7–19.7 ms p50 / 21.3–25.7 ms p95**.
+diagnostics off, trace-hit latency was **18.7–19.7 ms p50 / 22.2–25.7 ms p95**.
 The request phases were stable:
 
 | Phase | 1M trace-hit p50 / p95 (three runs) |
@@ -16,20 +16,15 @@ The request phases were stable:
 | audit wait | 4.44–4.59 / 4.93–5.44 ms |
 | encode rows | 0.25–0.27 / 0.45–0.50 ms |
 
-The profiler records each ObjectStore read interval and reports both the sum of
-per-read waits and the **merged critical-path wait**. Concurrent I/O overlaps, so
-the merged number is comparable to request wall time; the sum is diagnostic only.
+The profiler records each ObjectStore read interval. The sum counts overlapping
+requests multiple times. The interval union (the historical
+`read_critical_wait_us` field) measures elapsed time with any read in flight.
+Execution may make progress during those intervals, so their duration alone
+cannot establish how much latency a cache could remove.
 
-For trace hits, critical-path read wait was **5.25 / 5.42 / 5.03 ms p50** across
-the three runs (p95 7.06–7.75 ms). Summed per-read waits were 7.4–8.3 ms p50,
-which double-counts overlapping reads. The ~5.2 ms p50 is ~45% of the 11.0–11.9 ms
-execute phase and is separate from decode/operator time.
-
-At 20M rows the same measurement gave **5.33 ms p50 / 6.46 ms p95** critical
-read wait for a trace hit, inside a 9.82 ms execute phase. A 1M trace hit reads a
-median 1.15 MiB of logical Parquet; a miss reads zero data and has zero read
-wait. This is the evidence the #84/#85 range-cache experiment needs: there is at
-least 3 ms p50 of object-read wait on the critical path, not merely a small tail.
+Trace-hit read-in-flight time was **5.25 / 5.42 / 5.03 ms p50** across the three
+1M runs (p95 7.06–7.75 ms), and **5.33 ms p50 / 6.46 ms p95** at 20M. A 1M
+trace hit reads a median 1.15 MiB of logical Parquet. A miss reads no data.
 
 ## Warm client latency
 
@@ -61,17 +56,12 @@ The exact-hit restart target (≤40 ms) is met in every run.
 
 ## Decision evidence
 
-The #84/#85 gate asks whether the corrected baseline has at least **3 ms p50**
-of realistically removable read wait. It does: merged critical read wait is
-**5.03–5.42 ms p50** on a 1M trace hit and **5.33 ms p50** at 20M, while decode
-and operators (execute minus read wait) remain ~5.7–6.6 ms. A bounded immutable
-range cache can plausibly remove the object-store portion; it cannot remove the
-audit wait (4.4–4.6 ms) or the remaining decode/operator work. This is enough to
-justify the single #85 range-cache experiment, not a production cache.
-
-The same run also shows the cache must be evaluated under the #29 mixed load:
-trace p95 under sustained heavy load was ~190–203 ms, above the 120 ms target, so
-single-query p50 alone is not sufficient evidence for shipping it.
+Keep #85 parked. The #84/#85 gate requires evidence that at least **3 ms p50**
+of read wait can be removed from the critical path. The in-flight intervals are
+insufficient to meet that gate. Even a uniform 3 ms reduction from the warm
+client latencies in the table would leave all three diagnostics-off p50 values
+above 15 ms. Prioritize the #29 mixed-load blocker; #86 is the next workload in
+#82 after the integrated baseline and trace decision.
 
 ## Reproduction
 

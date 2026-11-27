@@ -1,0 +1,4 @@
+06a8c56f6d87d5bf7c4749b6016faa3f93586c631c86850f2e5b8ebf2967770f memory=2147483648 cpus-nano=4000000000 OOMKilled=false restart=0
+max 0
+oom 0
+oom_kill 0

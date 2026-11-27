@@ -1,5 +1,9 @@
 # Issue #29 · Query admission under sustained mixed load
 
+See the [fixed-rate follow-up](fixed-rate/README.md) for the evaluated arrival
+mix, queue timings, and dashboard and alert outcomes. The trials below are the
+original closed-loop baseline.
+
 Image `verdigris-bench:perf81-cfe5146`
 (`sha256:861a0f0974ea6fab517059789880a038186be777099fb2b3c68bc380575e4ce2`).
 Budget: **vdg 4 CPU / 2 GiB + MinIO 2 CPU / 2 GiB**. Corpus: 20,000,000 rows
