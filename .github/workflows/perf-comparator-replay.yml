@@ -1,0 +1,41 @@
+name: Verdigris equivalent query baseline replay
+
+on:
+  push:
+    branches: [codex/perf-comparator-replay]
+
+permissions:
+  contents: read
+
+jobs:
+  comparison:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the release benchmark image
+        run: docker build -f bench/Dockerfile.vdg -t verdigris-comparator-replay:local .
+      - name: Run the three-engine comparison in three fresh fixtures
+        env:
+          VDG_SKIP_BUILD: '1'
+          VDG_IMAGE: verdigris-comparator-replay:local
+          ITERATIONS: '100'
+          WARMUP: '10'
+          RESTART: '1'
+          RESULT_ROOT: ${{ runner.temp }}/verdigris-comparator-replay
+        run: |
+          set -o pipefail
+          export CORPUS_TS_MS=$(python3 -c 'import time; print((int(time.time()*1000)-55*60_000)//60_000*60_000)')
+          mkdir -p "$RESULT_ROOT"
+          for trial in 1 2 3; do
+            OUT="$RESULT_ROOT/trial-$trial" bench/compare/logs/run.sh | tee "$RESULT_ROOT/trial-$trial.log"
+          done
+      - name: Upload all raw results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-comparator-replay
+          path: ${{ runner.temp }}/verdigris-comparator-replay
+          retention-days: 7
