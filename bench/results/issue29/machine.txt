@@ -1,0 +1,7 @@
+date_utc=2026-11-27T07:06:55Z
+image=verdigris-bench:perf81-cfe5146
+image_id=sha256:861a0f0974ea6fab517059789880a038186be777099fb2b3c68bc380575e4ce2
+budget=vdg 4cpu/2GiB + minio 2cpu/2GiB
+rows=20000000
+trial_duration_s=60
+base_ts_ms=1795750740000

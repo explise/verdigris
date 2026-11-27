@@ -311,6 +311,23 @@ pub struct QueryConfig {
     /// bloom filters, page index), in MiB. Shared across requests; execution
     /// memory stays per query. Set to 0 to disable cross-request reuse.
     pub metadata_cache_mib: u64,
+
+    // ── Query admission (issue #29) ────────────────────────────────────────
+    /// Total concurrent query executions admitted by this node. One permit is
+    /// reserved for cheap queries so a dashboard LIMIT query cannot starve
+    /// behind full-scan aggregates.
+    pub max_concurrent: usize,
+    /// How long a heavy query waits for a permit before 429.
+    pub admission_wait_ms: u64,
+    /// A query with `LIMIT <= this` uses the cheap lane. `0` disables the
+    /// LIMIT-based classification.
+    pub cheap_limit_rows: u64,
+    /// A plan whose selected files are at or below this many MiB uses the cheap
+    /// lane. `0` disables the size-based classification.
+    pub cheap_scan_mib: u64,
+    /// Refuse a query whose plan selects more than this many GiB before any
+    /// data is read. `0` disables the budget check.
+    pub max_scan_gib: f64,
 }
 
 impl Default for QueryConfig {
@@ -324,6 +341,13 @@ impl Default for QueryConfig {
             max_result_rows: 1_000_000,
             max_result_mib: 256,
             metadata_cache_mib: 64,
+            max_concurrent: 4,
+            admission_wait_ms: 250,
+            cheap_limit_rows: 1_000,
+            cheap_scan_mib: 8,
+            // Deliberately high: a guard against a pathological accidental scan,
+            // not a pricing decision. Operators running a tight box lower it.
+            max_scan_gib: 100.0,
         }
     }
 }
