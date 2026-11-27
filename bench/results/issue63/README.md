@@ -1,5 +1,8 @@
 # Issue #63 · Normalized three-engine log comparison
 
+The [four-CPU baseline](four-cpu/README.md) has three fresh, independently validated
+trials and all five restart shapes. The older run below used a different budget.
+
 One fresh 1M-row deployment per engine, same corpus timestamp and query schedule,
 100 measured warm samples per shape. Verdigris runs with durable audit enabled.
 Budget: **8 CPU / 6 GiB per complete deployment**; Verdigris is 4 CPU / 3 GiB for

@@ -1,5 +1,8 @@
 # Issue #83 · Trace-query profiling on the integrated stack
 
+See the [four-CPU disk-backed sizing run](four-cpu/README.md) for the latest
+20M profile and paired search control. The older run below used a different budget.
+
 ## Finding
 
 Three fresh 1M-row MinIO deployments were measured on the corrected integrated
