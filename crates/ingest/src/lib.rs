@@ -71,6 +71,10 @@ fn content_hash(bytes: &[u8]) -> String {
 }
 
 /// Writes a single logical table's data + manifest to an object store.
+#[cfg(test)]
+type BeforeCompactionCommit =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
 pub struct Ingestor {
     store: Arc<dyn ObjectStore>,
     table: String,
@@ -81,6 +85,8 @@ pub struct Ingestor {
     phase_metrics: Option<Arc<IngestPhaseMetrics>>,
     /// Grace period between retiring a compacted-away file and deleting it.
     retired_grace_ms: u64,
+    #[cfg(test)]
+    before_compaction_commit: std::sync::Mutex<Option<BeforeCompactionCommit>>,
 }
 
 impl Ingestor {
@@ -91,6 +97,8 @@ impl Ingestor {
             clock: Arc::new(SimClock::default()),
             phase_metrics: None,
             retired_grace_ms: DEFAULT_RETIRED_GRACE_MS,
+            #[cfg(test)]
+            before_compaction_commit: std::sync::Mutex::new(None),
         }
     }
 
@@ -751,6 +759,13 @@ impl Ingestor {
             manifest.files.extend(appended);
             manifest.compaction_gen = prepared.generation + 1;
             manifest.retire(prepared.to_retire.iter().cloned(), self.clock.now_millis());
+            #[cfg(test)]
+            {
+                let hook = self.before_compaction_commit.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook().await;
+                }
+            }
             if self.commit_manifest(&manifest, base).await? == CommitOutcome::Committed {
                 let _ = self.prune_trigrams(&manifest).await;
                 return Ok(Some((prepared.reports, prepared.more)));
@@ -1095,6 +1110,75 @@ mod tests {
         let after = ing.load_manifest().await.unwrap();
         assert_eq!(after.compaction_gen, committed.compaction_gen);
         assert_eq!(after.files, committed.files);
+    }
+
+    #[tokio::test]
+    async fn prepared_compaction_retries_after_manifest_etag_conflict() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ing = Ingestor::new(store.clone(), "logs");
+        let routing = RoutingConfig::default();
+        let policy = BatchPolicy {
+            max_rows: 100,
+            max_bytes: usize::MAX,
+        };
+        for i in 0u64..4 {
+            ing.ingest(
+                generate::generate(100, i, i as i64 * 1_000_000),
+                &routing,
+                policy,
+            )
+            .await
+            .unwrap();
+        }
+
+        let (before, _) = ing.load_manifest_versioned().await.unwrap();
+        let target = 10 * 1024 * 1024;
+        let discarded = ing.prepare_compaction(target, usize::MAX).await.unwrap();
+        assert!(!discarded.to_retire.is_empty());
+        drop(discarded);
+        let (after_drop, _) = ing.load_manifest_versioned().await.unwrap();
+        assert_eq!(
+            serde_json::to_vec(&after_drop).unwrap(),
+            serde_json::to_vec(&before).unwrap()
+        );
+
+        let prepared = ing.prepare_compaction(target, usize::MAX).await.unwrap();
+        let new_files = prepared.new_files.clone();
+        let to_retire = prepared.to_retire.clone();
+        let writer = Ingestor::new(store, "logs");
+        let appended = writer
+            .write_batches(generate::generate(100, 4, 4_000_000), &routing, policy)
+            .await
+            .unwrap();
+        assert!(!appended.is_empty());
+        let concurrent_files = appended.clone();
+        let tombstone = "logs/hot/concurrently-retired.parquet";
+
+        // Commit over the ETag that publish has already read. Its first PUT
+        // must conflict before the next attempt can preserve this suffix.
+        *ing.before_compaction_commit.lock().unwrap() = Some(Box::new(move || {
+            Box::pin(async move {
+                let (mut manifest, base) = writer.load_manifest_versioned().await.unwrap();
+                for file in concurrent_files {
+                    manifest.add(file);
+                }
+                manifest.retire([tombstone.to_owned()], writer.clock.now_millis());
+                assert_eq!(
+                    writer.commit_manifest(&manifest, base).await.unwrap(),
+                    CommitOutcome::Committed
+                );
+            })
+        }));
+        assert!(ing.publish_compaction(prepared).await.unwrap().is_some());
+        let after = ing.load_manifest().await.unwrap();
+        assert_eq!(after.compaction_gen, before.compaction_gen + 1);
+        assert!(after.files.starts_with(&new_files));
+        assert!(after.files.ends_with(&appended));
+        assert_eq!(after.files.iter().map(|f| f.rows).sum::<u64>(), 500);
+        assert!(to_retire
+            .iter()
+            .all(|path| after.retired.iter().any(|file| file.path == *path)));
+        assert!(after.retired.iter().any(|file| file.path == tombstone));
     }
 
     #[tokio::test]
