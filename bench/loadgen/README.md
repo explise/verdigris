@@ -27,8 +27,8 @@ poll interval. Missing visibility samples count above measured latencies when
 calculating nearest-rank p95. Storage samples record small, compacted and
 retired files and the compaction generation without a data scan.
 
-The recovery check verifies contiguous, unique synthetic row IDs within
-each batch and compares the count of every acknowledged batch before and
+The recovery check verifies contiguous, unique synthetic row IDs in
+bounded batches and compares the count of every acknowledged batch before and
 after an intentional process kill and restart. MinIO stays running.
 Ambiguous transport or acknowledgement batches are reported separately. Report the 600-second
 committed rate, ≤1 second visibility threshold, recovery outcome, and storage
