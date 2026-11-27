@@ -1,0 +1,56 @@
+name: Paired compaction lock diagnostic
+on:
+  push:
+    branches: [codex/perf-compaction-prepare]
+permissions:
+  contents: read
+jobs:
+  preload:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Build benchmark binaries
+        run: |
+          docker build -f bench/Dockerfile.vdg -t verdigris-preload:local .
+          git restore --source=e6e0779d7b422cce3334ec251aae4cfc127324af -- crates/ingest/src/lib.rs crates/vdg/src/serve.rs
+          docker build -f bench/Dockerfile.vdg -t verdigris-preload:control .
+          git restore -- crates/ingest/src/lib.rs crates/vdg/src/serve.rs
+          cargo build --locked --release --manifest-path bench/loadgen/Cargo.toml
+      - name: Verify preload isolation and restart recovery
+        env:
+          VDG_IMAGE: verdigris-preload:local
+          VDG_CPUS: '3'
+          MINIO_CPUS: '1'
+          VDG_BENCH_ALLOW_PRELOAD: '1'
+          PROFILE_INGEST_PHASES: "1"
+          VDG_BENCH_PRELOAD_ROWS: '12000000'
+          ROWS_PER_S: '10000'
+          DURATION_SECS: '120'
+          OUT: ${{ runner.temp }}/verdigris-preload
+        run: |
+          export CORPUS_START_MS=$(date +%s%3N)
+          root="$OUT"
+          export LOADGEN="$PWD/bench/loadgen/target/release/verdigris-loadgen"
+          for arm in control-first optimized-first; do
+            export OUT="$root/$arm"
+            image=verdigris-preload:local
+            case "$arm" in
+              control-*) image=verdigris-preload:control ;;
+            esac
+            VDG_IMAGE="$image" PRELOAD_COMPACT_MIB=0 bench/loadgen/run-sustained.sh
+            jq -e '.passed and .acked_rows == 1200000' "$OUT/recovery.json"
+            grep -Fx 'preloaded 12000000 rows' "$OUT/preload.log"
+            jq -e '[.visibility[] | select(.visible_ms != null)] | length > 0 and all(.[]; .ack_to_visible_ms >= 0 and .ack_to_visible_ms <= .visible_ms)' "$OUT/run.json"
+            jq . "$OUT/preload-storage.json"
+          done
+          head -n 1 "$root/"*/preload-manifest.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: verdigris-compaction-pair
+          path: ${{ runner.temp }}/verdigris-preload
+          retention-days: 7
