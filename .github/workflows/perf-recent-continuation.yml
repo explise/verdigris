@@ -1,0 +1,59 @@
+name: Verdigris single-request recent-search continuation
+
+on:
+  push:
+    branches: [codex/perf-recent-continuation]
+
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check dense, partial, empty and tied timestamp windows against full SQL
+        run: cargo test --locked -p verdigris-query --features datafusion --test engine recent_window_preserves_rows_across_sparse_continuation_and_ties
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rows: 1000000
+            batch_rows: 10000
+          - rows: 20000000
+            batch_rows: 50000
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the release image and pull pinned fixture services
+        run: |
+          docker build -f bench/Dockerfile.vdg -t verdigris-recent-continuation:local .
+          docker pull cgr.dev/chainguard/minio@sha256:634c989a2f1029162fc2676c263caa181213b9410449968532f750a6fb77532d
+          docker pull cgr.dev/chainguard/minio-client@sha256:36ac7ab6d181f259ab62defe0bb55ad1dbf89b152f0b8f49b1c63049374d812f
+          docker pull busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+      - name: Compare full SQL and disjoint time slices with exact audited rows
+        env:
+          RECENT_CONTINUATION: '1'
+          VDG_IMAGE: verdigris-recent-continuation:local
+          SERVICE_CPUS: '2'
+          ROWS: ${{ matrix.rows }}
+          BATCH_ROWS: ${{ matrix.batch_rows }}
+          ITERATIONS: '100'
+          WARMUP: '10'
+          CORPUS_TS_MS: '1795764240000'
+          OUT: ${{ runner.temp }}/verdigris-recent-continuation
+        run: bench/compare/logs/run-profile.sh
+      - name: Upload recent-search profiles
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-recent-continuation-${{ matrix.rows }}
+          path: ${{ runner.temp }}/verdigris-recent-continuation
+          retention-days: 7

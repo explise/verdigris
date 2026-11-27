@@ -13,6 +13,8 @@ from compare import (
     validate_aggregation, validate_search, validate_trace,
 )
 
+from recent_continuation import compare as compare_recent_continuation
+
 SHAPES = ("trace_hit", "trace_miss", "trace_cross_tier", "recent_search", "minute_aggregation")
 
 
@@ -143,6 +145,7 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--first", choices=SHAPES)
     mode.add_argument("--compare-search", action="store_true")
+    mode.add_argument("--recent-continuation", action="store_true")
     args = parser.parse_args()
     if args.iterations < 1 or args.warmup < 0:
         parser.error("iterations must be positive and warmup cannot be negative")
@@ -151,7 +154,7 @@ def main():
     if corpus["base_ts_ms"] != BASE_TS:
         parser.error("CORPUS_TS_MS must match the seed report's corpus timestamp")
     expected = {"recent_search": expected_search(corpus["rows"])}
-    if not args.compare_search and args.first in (None, "minute_aggregation"):
+    if not (args.compare_search or args.recent_continuation) and args.first in (None, "minute_aggregation"):
         expected["minute_aggregation"] = expected_buckets(corpus["rows"])
     backend = Vdg(args)
     out = {"corpus": corpus, "mode": "first_after_restart" if args.first else "warm", "queries": {}}
@@ -160,6 +163,13 @@ def main():
             out.pop("queries")
             out["mode"] = "search_comparison"
             out["comparison"] = compare_search(backend, expected["recent_search"], args.iterations, args.warmup)
+        elif args.recent_continuation:
+            out.pop("queries")
+            out["mode"] = "recent_continuation"
+            out["comparison"] = compare_recent_continuation(
+                backend, corpus["rows"], expected["recent_search"],
+                args.iterations, args.warmup, percentiles,
+            )
         elif args.first:
             out["queries"][args.first] = run_one(backend, args.first, 0, corpus, "1", expected)
         else:

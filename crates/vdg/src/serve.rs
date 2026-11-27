@@ -2189,7 +2189,22 @@ async fn h_query(
     // tell a broken query from zero matches. The plan already compiled it.
     let sql = plan.sql.clone();
 
-    // Run the query once, in the negotiated wire (never both).
+    let mut execution_limits = limits(&st);
+    // Isolated benchmark only. Keep the quoted scope, snapshot and one audit
+    // unchanged while testing the disjoint continuation in either row wire.
+    if !req.histogram
+        && headers
+            .get("x-vdg-bench-recent-window")
+            .is_some_and(|v| v == "1")
+    {
+        execution_limits.recent_window_cutoff_ms = selected
+            .iter()
+            .map(|f| f.max_ts)
+            .max()
+            .map(|max_ts| max_ts.saturating_sub(120_000));
+    }
+
+    // Run the query in the negotiated wire (never both).
     let t0 = st.clock.monotonic_micros();
     let (arrow_body, json_rows, rows_returned) = if arrow {
         let out = verdigris_query::engine::query_table_arrow_with_rows_profiled(
@@ -2197,7 +2212,7 @@ async fn h_query(
             st.table.as_str(),
             &files,
             &sql,
-            &limits(&st),
+            &execution_limits,
             Some(&st.query_cache),
             profile.as_mut(),
         )
@@ -2210,7 +2225,7 @@ async fn h_query(
             st.table.as_str(),
             &files,
             &sql,
-            &limits(&st),
+            &execution_limits,
             Some(&st.query_cache),
             profile.as_mut(),
         )

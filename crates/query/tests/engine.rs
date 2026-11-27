@@ -15,6 +15,7 @@ use datafusion::arrow::ipc::reader::StreamReader;
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 use verdigris_core::batch::{BatchPolicy, LogRecord};
+use verdigris_core::clock::SimClock;
 use verdigris_core::config::RoutingConfig;
 use verdigris_core::estimate::select_files;
 use verdigris_core::manifest::Manifest;
@@ -22,6 +23,7 @@ use verdigris_core::model::{Level, Tier};
 use verdigris_ingest::Ingestor;
 use verdigris_query::engine::{self, QueryCache, QueryLimits, ResultTooLarge};
 use verdigris_query::index::IndexedFile;
+use verdigris_query::profile::QueryProfile;
 
 const BASE_TS: i64 = 1_700_000_000_000;
 const TRACE: &str = "traceme-123";
@@ -602,4 +604,54 @@ async fn legacy_key_replacement_bypasses_shared_caches() {
             .count(),
         200
     );
+}
+
+#[tokio::test]
+async fn recent_window_preserves_rows_across_sparse_continuation_and_ties() {
+    let (store, manifest) = seeded_table().await;
+    let files = all_paths(&manifest);
+    let original = QueryLimits {
+        target_partitions: 1,
+        ..limits()
+    };
+    let exact =
+        "SELECT ts, service, message FROM logs WHERE service = 'auth' ORDER BY ts DESC LIMIT 5";
+    let tied = "SELECT ts, service, message FROM logs ORDER BY ts DESC LIMIT 5";
+    for (sql, offset_secs, expect_tail, expect_candidate) in [
+        (exact, 10, false, true),
+        (exact, 18, true, true),
+        (exact, 25, true, true),
+        (tied, 10, false, false),
+    ] {
+        let reference = engine::query_table_json(store.clone(), "logs", &files, sql, &original)
+            .await
+            .expect("original scan");
+        let pilot = QueryLimits {
+            recent_window_cutoff_ms: Some(BASE_TS + offset_secs * 1_000),
+            ..original.clone()
+        };
+        let mut profile = QueryProfile::new(Arc::new(SimClock::new(0)), 0, false);
+        let result = engine::query_table_json_profiled(
+            store.clone(),
+            "logs",
+            &files,
+            sql,
+            &pilot,
+            None,
+            Some(&mut profile),
+        )
+        .await
+        .expect("experimental scan");
+        assert_eq!(result, reference, "{sql}, cutoff offset {offset_secs}");
+        let phases = profile.finish()["phases_us"].clone();
+        assert!(phases.get("recent_window_probe").is_some());
+        assert_eq!(
+            phases.get("recent_window_continuation").is_some(),
+            expect_tail
+        );
+        assert_eq!(
+            phases.get("recent_window_result").is_some(),
+            expect_candidate
+        );
+    }
 }

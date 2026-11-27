@@ -15,13 +15,15 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{Array, RecordBatch, TimestampMillisecondArray};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::json::ArrayWriter;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::catalog::TableProvider;
+use datafusion::common::ScalarValue;
+use datafusion::dataframe::DataFrame;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
@@ -31,8 +33,9 @@ use datafusion::execution::cache::DefaultFilesMetadataCache;
 use datafusion::execution::memory_pool::{FairSpillPool, TrackConsumersPool};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::logical_expr::{FetchType, LogicalPlan, LogicalPlanBuilder, Operator, SkipType};
 use datafusion::physical_plan::execute_stream;
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::{lit, Expr, SessionConfig, SessionContext};
 use futures::StreamExt;
 use object_store::ObjectStore;
 use verdigris_core::config::QueryConfig;
@@ -169,6 +172,9 @@ pub struct QueryLimits {
     pub max_result_bytes: u64,
     /// Target partitions for execution; each carries its own buffers.
     pub target_partitions: usize,
+    /// Optional request-local pilot. This rewrites eligible timestamp TopK
+    /// queries over the registered snapshot only.
+    pub recent_window_cutoff_ms: Option<i64>,
 }
 
 impl QueryLimits {
@@ -178,6 +184,7 @@ impl QueryLimits {
             max_result_rows: q.max_result_rows,
             max_result_bytes: q.max_result_mib.saturating_mul(1024 * 1024),
             target_partitions: (q.cores as usize).max(1),
+            recent_window_cutoff_ms: None,
         }
     }
 }
@@ -337,6 +344,24 @@ async fn collect_batches(
         profile.mark("table_setup");
     }
     let df = ctx.sql(sql).await.context("planning sql")?;
+    if let Some(cutoff) = limits
+        .recent_window_cutoff_ms
+        .filter(|_| files.iter().all(|file| file.immutable))
+    {
+        if let Some(batches) =
+            recent_window(&ctx, &df, limits, cutoff, profile.as_deref_mut()).await?
+        {
+            return Ok(batches);
+        }
+    }
+    execute_dataframe(df, limits, profile).await
+}
+
+async fn execute_dataframe(
+    df: DataFrame,
+    limits: &QueryLimits,
+    profile: Option<&mut QueryProfile>,
+) -> anyhow::Result<Vec<RecordBatch>> {
     if let Some(profile) = profile {
         profile.mark("logical_plan");
         let task = Arc::new(df.task_ctx());
@@ -354,6 +379,184 @@ async fn collect_batches(
     } else {
         let stream = df.execute_stream().await.context("executing sql")?;
         collect_bounded(stream, limits).await
+    }
+}
+
+/// Try both disjoint timestamp slices in one session over one pinned provider.
+async fn recent_window(
+    ctx: &SessionContext,
+    df: &DataFrame,
+    limits: &QueryLimits,
+    cutoff: i64,
+    mut profile: Option<&mut QueryProfile>,
+) -> anyhow::Result<Option<Vec<RecordBatch>>> {
+    let LogicalPlan::Limit(limit) = df.logical_plan() else {
+        return Ok(None);
+    };
+    let (Ok(SkipType::Literal(0)), Ok(FetchType::Literal(Some(fetch)))) =
+        (limit.get_skip_type(), limit.get_fetch_type())
+    else {
+        return Ok(None);
+    };
+    let LogicalPlan::Sort(sort) = limit.input.as_ref() else {
+        return Ok(None);
+    };
+    let [key] = sort.expr.as_slice() else {
+        return Ok(None);
+    };
+    let Expr::Column(column) = &key.expr else {
+        return Ok(None);
+    };
+    if key.asc
+        || column.name != "ts"
+        || !(1..=200).contains(&fetch)
+        || (fetch + 1) as u64 > limits.max_result_rows
+        || !recent_input(&sort.input)
+    {
+        return Ok(None);
+    }
+    let schema = sort.input.schema();
+    let Ok(index) = schema.index_of_column(column) else {
+        return Ok(None);
+    };
+    let field = schema.field(index);
+    if field.is_nullable() || field.data_type() != &DataType::Timestamp(TimeUnit::Millisecond, None)
+    {
+        return Ok(None);
+    }
+
+    let threshold = lit(ScalarValue::TimestampMillisecond(Some(cutoff), None));
+    let slice = |predicate, cap| {
+        LogicalPlanBuilder::from(sort.input.as_ref().clone())
+            .filter(predicate)?
+            .sort(sort.expr.clone())?
+            .limit(0, Some(cap))?
+            .build()
+    };
+    let probe = slice(key.expr.clone().gt_eq(threshold.clone()), fetch + 1)?;
+    let planned = ctx.execute_logical_plan(probe).await?;
+    let Some(mut batches) = try_window_slice(planned, limits, profile.as_deref_mut()).await? else {
+        return Ok(None);
+    };
+    if let Some(profile) = &mut profile {
+        profile.mark("recent_window_probe");
+    }
+    let count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    if count < fetch {
+        let older = slice(key.expr.clone().lt(threshold), fetch - count + 1)?;
+        let planned = ctx.execute_logical_plan(older).await?;
+        let retained_bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+        let remaining = QueryLimits {
+            max_result_bytes: limits.max_result_bytes - retained_bytes as u64,
+            max_result_rows: limits.max_result_rows - count as u64,
+            ..limits.clone()
+        };
+        let Some(older) = try_window_slice(planned, &remaining, profile.as_deref_mut()).await?
+        else {
+            return Ok(None);
+        };
+        if let Some(profile) = &mut profile {
+            profile.mark("recent_window_continuation");
+        }
+        batches.extend(older);
+    }
+    // The extra row detects a tie at the output boundary. For a ts-only SQL
+    // order, preserve the original engine's behavior whenever any emitted or
+    // boundary timestamps tie.
+    if !strictly_descending(&batches, index) {
+        return Ok(None);
+    }
+    let mut remaining = fetch;
+    batches.retain_mut(|batch| {
+        if remaining == 0 || batch.num_rows() == 0 {
+            return false;
+        }
+        if batch.num_rows() > remaining {
+            *batch = batch.slice(0, remaining);
+        }
+        remaining -= batch.num_rows();
+        true
+    });
+    if let Some(profile) = &mut profile {
+        profile.mark("recent_window_result");
+    }
+    Ok(Some(batches))
+}
+
+/// Admit only the single-table, plain-column query shape with deterministic,
+/// row-local predicate expressions used in the paired benchmark.
+fn recent_input(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Projection(projection) => {
+            projection.expr.iter().all(|e| matches!(e, Expr::Column(_)))
+                && recent_input(&projection.input)
+        }
+        LogicalPlan::Filter(filter) => {
+            recent_predicate(&filter.predicate) && recent_input(&filter.input)
+        }
+        LogicalPlan::TableScan(scan) => scan.fetch.is_none() && scan.filters.is_empty(),
+        _ => false,
+    }
+}
+
+fn recent_predicate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(_) | Expr::Literal(..) => true,
+        Expr::BinaryExpr(expr) => {
+            matches!(
+                expr.op,
+                Operator::And
+                    | Operator::Or
+                    | Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Gt
+                    | Operator::GtEq
+            ) && recent_predicate(&expr.left)
+                && recent_predicate(&expr.right)
+        }
+        Expr::Cast(expr) => recent_predicate(&expr.expr),
+        Expr::ScalarFunction(function) => {
+            function.name() == "to_timestamp_millis"
+                && matches!(function.args.as_slice(), [Expr::Literal(..)])
+        }
+        _ => false,
+    }
+}
+
+fn strictly_descending(batches: &[RecordBatch], index: usize) -> bool {
+    let mut prev = None;
+    for batch in batches {
+        let Some(ts) = batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+        else {
+            return false;
+        };
+        for value in ts.iter() {
+            let Some(value) = value else { return false };
+            if prev.is_some_and(|last| last <= value) {
+                return false;
+            }
+            prev = Some(value);
+        }
+    }
+    true
+}
+
+async fn try_window_slice(
+    df: DataFrame,
+    limits: &QueryLimits,
+    profile: Option<&mut QueryProfile>,
+) -> anyhow::Result<Option<Vec<RecordBatch>>> {
+    // The speculative extra row can exceed the real result cap. Let the
+    // original plan decide that case using the actual requested limit.
+    match execute_dataframe(df, limits, profile).await {
+        Ok(batches) => Ok(Some(batches)),
+        Err(err) if err.downcast_ref::<ResultTooLarge>().is_some() => Ok(None),
+        Err(err) => Err(err),
     }
 }
 

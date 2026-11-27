@@ -348,6 +348,7 @@ class Vdg(Backend):
         return int(json.loads(data)["ingested"])
 
     profile_mode = None
+    recent_window = False
     last_profile = None
 
     def _query(self, sql: str, tiers=()):
@@ -355,6 +356,8 @@ class Vdg(Backend):
         request_headers = {"content-type": "application/json"}
         if self.profile_mode:
             request_headers["x-vdg-query-profile"] = self.profile_mode
+        if self.recent_window:
+            request_headers["x-vdg-bench-recent-window"] = "1"
         status, headers, data = self.client.request("POST", "/v1/query", body, request_headers)
         if status != 200:
             raise RuntimeError(f"vdg query {status}: {data[:300]!r}")
