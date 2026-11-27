@@ -23,6 +23,7 @@ import argparse
 import concurrent.futures
 import datetime
 import http.client
+import itertools
 import json
 import math
 import os
@@ -89,7 +90,7 @@ def bucket_ms(value) -> int:
     dt = datetime.datetime.fromisoformat(text)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=datetime.timezone.utc)
-    return int(dt.timestamp() * 1000)
+    return round(dt.timestamp() * 1000)
 
 
 def row_ts_ms(row):
@@ -99,41 +100,55 @@ def row_ts_ms(row):
     return bucket_ms(value)
 
 
-def expected_trace(trace_id: str, rows: int):
-    index = int(trace_id, 16)
-    if not 0 <= index < rows:
-        return None
-    level = level_for(index)
-    service = service_for(index)
-    return {
-        "level": level,
-        "service": service,
-        "message": message_for(index, level, service),
-        "trace_id": CROSS_TRACE if index in CROSS_TRACE_ROWS else f"{index:016x}",
-        "attrs": {
-            "region": REGIONS[index % len(REGIONS)],
-            "host": f"node-{index % 50:02d}",
-        },
-    }
+MISSING_TRACE = "ffffffffffffffff"
+
+
+def trace_schedule(rows):
+    return [f"{i:016x}" for i in sorted({max(4, k * rows // 16) for k in range(16)}) if i < rows]
+
+
+def expected_row(index, rows):
+    payload = record(index, rows, "vdg")
+    return (payload["ts_millis"], payload["level"], payload["service"],
+            payload["status"], payload["message"], payload["trace_id"], payload["attrs"])
+
+
+def canonical_row(row):
+    row = normalize_rows([row])[0]
+    return (row_ts_ms(row), row["level"], row["service"], int(row["status"]),
+            row["message"], row["trace_id"], json.loads(row["attrs_json"]))
+
+
+def expected_search(rows):
+    indices = (i for i in range(rows - 1, -1, -1)
+               if level_for(i) == "ERROR" and service_for(i) == "checkout")
+    return [expected_row(i, rows) for i in itertools.islice(indices, 200)]
+
+
+def validate_search(got, expected):
+    if [canonical_row(r) for r in got] != expected:
+        raise SystemExit("search returned different fields, rows, or order")
 
 
 def validate_trace(trace_id: str, got, rows: int):
-    expected = expected_trace(trace_id, rows)
-    if expected is None:
-        return
-    if len(got) != 1:
-        raise SystemExit(f"trace {trace_id} returned {len(got)} rows, expected 1")
-    row = got[0]
-    for field in ("level", "service", "message", "trace_id"):
-        if str(row.get(field)) != str(expected.get(field)):
-            raise SystemExit(
-                f"trace {trace_id} field {field}={row.get(field)!r}, "
-                f"expected {expected.get(field)!r}"
-            )
-    attrs = json.loads(row.get("attrs_json") or "{}")
-    want_attrs = expected["attrs"]
-    if attrs != want_attrs:
-        raise SystemExit(f"trace {trace_id} attrs={attrs}, expected {want_attrs}")
+    if trace_id == CROSS_TRACE:
+        indices = CROSS_TRACE_ROWS
+    elif trace_id == MISSING_TRACE:
+        indices = ()
+    else:
+        indices = (int(trace_id, 16),)
+    actual = sorted((canonical_row(r) for r in got), key=lambda r: (r[0], r[4]))
+    expected = [expected_row(i, rows) for i in indices]
+    if actual != expected:
+        raise SystemExit(f"trace {trace_id} returned {len(actual)} rows with different fields or identities (expected {len(expected)})")
+
+
+def validate_aggregation(got, expected):
+    actual = [(bucket_ms(r.get("bucket") or r["_time"]), int(r["total"]), int(r["errors"]))
+              for r in got]
+    want = [(bucket, *counts) for bucket, counts in expected.items()]
+    if actual != want:
+        raise SystemExit(f"aggregate returned different ordered buckets (got {len(actual)}, expected {len(want)})")
 
 
 def expected_buckets(rows: int):
@@ -550,7 +565,7 @@ class VictoriaLogs(Backend):
 
     def aggregate_minute(self):
         return self._query_rows(
-            "* | stats by (_time:1m) count() total, count() if (level:ERROR) errors"
+            "* | stats by (_time:1m) count() total, count() if (level:ERROR) errors | sort by (_time)"
         )
 
 
@@ -564,15 +579,16 @@ def make_backend(system: str, args) -> Backend:
     raise SystemExit(f"unknown system {system}")
 
 
-def timed(fn, iterations: int, warmup: int):
+def timed(fn, iterations: int, warmup: int, validate):
     for _ in range(warmup):
-        fn()
+        validate(fn())
     samples = []
     last = None
     for _ in range(iterations):
         t0 = time.perf_counter()
         last = fn()
         samples.append((time.perf_counter() - t0) * 1000.0)
+        validate(last)
     samples.sort()
     return {
         "samples": len(samples),
@@ -602,10 +618,11 @@ def main():
     rows = args.rows
     # Spread hit lookups across the corpus instead of timing one convenient id.
     # Every id is a real row; keep away from the cross-tier sentinel rows.
-    indices = sorted({max(4, (k * rows) // 16) for k in range(16)})
-    args.trace_ids = [f"{i:016x}" for i in indices]
+    if rows < 5:
+        ap.error("--rows requires at least five fixture rows")
+    args.trace_ids = trace_schedule(rows)
     args.trace_id = args.trace_ids[len(args.trace_ids) // 2]
-    args.missing_trace_id = "ffffffffffffffff"
+    args.missing_trace_id = MISSING_TRACE
     expected_errors = sum(1 for i in range(rows) if level_for(i) == "ERROR")
     expected_recent = sum(
         1 for i in range(rows) if service_for(i) == "checkout" and level_for(i) == "ERROR"
@@ -674,39 +691,15 @@ def main():
         raise SystemExit(
             f"{args.system}: recent count {recent_count}, expected {expected_recent}"
         )
-    search_rows = normalize_rows(backend.search_recent())
-    if len(search_rows) != min(200, expected_recent):
-        raise SystemExit(
-            f"{args.system}: search returned {len(search_rows)}, expected {min(200, expected_recent)}"
-        )
-    for r in search_rows:
-        attrs = json.loads(r.get("attrs_json") or "{}")
-        if (
-            r.get("level") != "ERROR"
-            or r.get("service") != "checkout"
-            or "checkout" not in str(r.get("message", ""))
-            or attrs.get("region") not in REGIONS
-            or not str(attrs.get("host", "")).startswith("node-")
-        ):
-            raise SystemExit(f"{args.system}: unexpected search row: {r}")
-    search_ts = [row_ts_ms(r) for r in search_rows]
-    if search_ts != sorted(search_ts, reverse=True):
-        raise SystemExit(f"{args.system}: search rows are not newest-first")
-    trace_rows = normalize_rows(backend.trace_lookup(args.trace_id))
-    if len(trace_rows) != 1:
-        raise SystemExit(f"{args.system}: trace lookup returned {len(trace_rows)}, expected 1")
+    search_expected = expected_search(rows)
+    search_rows = backend.search_recent()
+    validate_search(search_rows, search_expected)
+    trace_rows = backend.trace_lookup(args.trace_id)
     validate_trace(args.trace_id, trace_rows, rows)
-    cross_rows = normalize_rows(backend.trace_lookup(CROSS_TRACE))
-    if len(cross_rows) != len(CROSS_TRACE_ROWS):
-        raise SystemExit(
-            f"{args.system}: cross-tier trace returned {len(cross_rows)}, "
-            f"expected {len(CROSS_TRACE_ROWS)}"
-        )
-    missing_rows = normalize_rows(backend.trace_lookup(args.missing_trace_id))
-    if missing_rows:
-        raise SystemExit(
-            f"{args.system}: missing trace returned {len(missing_rows)} rows, expected 0"
-        )
+    cross_rows = backend.trace_lookup(CROSS_TRACE)
+    validate_trace(CROSS_TRACE, cross_rows, rows)
+    missing_rows = backend.trace_lookup(args.missing_trace_id)
+    validate_trace(args.missing_trace_id, missing_rows, rows)
     tier_rows = {}
     if args.system == "vdg":
         for tier in ("hot", "warm", "cold"):
@@ -726,24 +719,8 @@ def main():
             f"{args.system}: aggregate total={total} errors={errors}, "
             f"expected {rows}/{expected_errors}"
         )
-    want = expected_buckets(rows)
-    got = {
-        bucket_ms(r.get("bucket") or r.get("_time")): (
-            int(r["total"]),
-            int(r.get("errors", 0) or 0),
-        )
-        for r in buckets
-    }
-    # Backends return bucket groups in different orders; normalize the order
-    # before the value check so the comparison is about values, not engine
-    # group-ordering quirks.
-    got = dict(sorted(got.items()))
-    if got != want:
-        bad = [(k, got.get(k), v) for k, v in want.items() if got.get(k) != v][:3]
-        raise SystemExit(
-            f"{args.system}: per-bucket mismatch (bucket, got, want): {bad}; "
-            f"got keys={list(got)[:2]} want keys={list(want)[:2]}"
-        )
+    bucket_expected = expected_buckets(rows)
+    validate_aggregation(buckets, bucket_expected)
     print(
         f"{args.system}: equivalence OK (recent={recent_count}, "
         f"buckets={len(buckets)}, total={total}, errors={errors})",
@@ -758,8 +735,7 @@ def main():
     def next_trace():
         tid = args.trace_ids[trace_cursor[0] % len(args.trace_ids)]
         trace_cursor[0] += 1
-        rows = normalize_rows(backend.trace_lookup(tid))
-        validate_trace(tid, rows, args.rows)
+        rows = backend.trace_lookup(tid)
         if args.system == "vdg":
             trace_engine_ms.append(backend.last_stats.get("elapsedMs"))
             trace_manifest_ms.append(backend.last_stats.get("manifestMs"))
@@ -767,15 +743,20 @@ def main():
         return rows
 
     cache_before = backend.cache_stats() if args.system == "vdg" else {}
-    q_search = timed(backend.search_recent, args.iterations, args.warmup)
-    q_trace = timed(next_trace, args.iterations, args.warmup)
+    q_search = timed(backend.search_recent, args.iterations, args.warmup,
+                     lambda got: validate_search(got, search_expected))
+    q_trace = timed(next_trace, args.iterations, args.warmup,
+                    lambda got: validate_trace(args.trace_ids[(trace_cursor[0] - 1) % len(args.trace_ids)], got, rows))
     q_trace_miss = timed(
-        lambda: backend.trace_lookup(args.missing_trace_id), args.iterations, args.warmup
+        lambda: backend.trace_lookup(args.missing_trace_id), args.iterations, args.warmup,
+        lambda got: validate_trace(args.missing_trace_id, got, rows),
     )
     q_trace_cross = timed(
-        lambda: backend.trace_lookup(CROSS_TRACE), args.iterations, args.warmup
+        lambda: backend.trace_lookup(CROSS_TRACE), args.iterations, args.warmup,
+        lambda got: validate_trace(CROSS_TRACE, got, rows),
     )
-    q_aggregate = timed(backend.aggregate_minute, args.iterations, args.warmup)
+    q_aggregate = timed(backend.aggregate_minute, args.iterations, args.warmup,
+                        lambda got: validate_aggregation(got, bucket_expected))
     cache_after = backend.cache_stats() if args.system == "vdg" else {}
 
     results = {

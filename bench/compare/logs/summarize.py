@@ -76,6 +76,24 @@ for key, label in names:
         )
     lines.append("")
 
+restart_shapes = ("trace", "trace-miss", "trace-cross-tier", "search", "aggregate")
+if any(glob.glob(os.path.join(out_dir, f"{s['system']}-restart-*.json")) for s in systems):
+    lines.append("## First query after a separate process restart (ms)\n")
+    lines.append("| System | Trace hit | Trace miss | Cross-tier trace | Search | Aggregation |")
+    lines.append("|---|---:|---:|---:|---:|---:|")
+    for system in (s["system"] for s in systems):
+        values = []
+        for shape in restart_shapes:
+            path = os.path.join(out_dir, f"{system}-restart-{shape}.json")
+            if os.path.isfile(path):
+                with open(path) as f:
+                    sample = json.load(f)[shape]
+                values.append(f"{sample['ms']:.2f}" if sample["status"] == 200 else "failed")
+            else:
+                values.append("n/a")
+        lines.append(f"| {labels.get(system, system)} | {' | '.join(values)} |")
+    lines.append("")
+
 lines.append("## Equivalence gate\n")
 lines.append("| System | Recent count | Search rows | Trace rows | Cross-tier | Missing | Buckets | Total | Errors |")
 lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")

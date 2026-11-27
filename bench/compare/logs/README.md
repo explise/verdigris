@@ -40,13 +40,14 @@ exit.
 - **Merges/compaction settle before queries.** ClickHouse runs `OPTIMIZE TABLE
   … FINAL`; Verdigris runs its background compaction until `/v1/metrics`
   reports `pendingFiles == 0`; VictoriaLogs is given a fixed settle window.
-- **Equivalence is a gate, not a hope.** Before timing, each system must return
-  the same exact recent-match count, the same 200-row search page in newest-first
-  order, exactly one row for the trace id with the same field/attribute values,
-  exactly three cross-tier rows, zero rows for the missing id, and the same
-  total/error count for every one-minute bucket. A mismatch exits nonzero.
-- **Latency** is one warm connection per backend, `WARMUP` warmups then
-  `ITERATIONS` measured requests; p50/p95/p99 use nearest-rank percentiles.
+- **Result validation.** Every warmup, timed query, and first query after a restart
+  is checked against the fixture. Search rows are checked in newest-first order.
+  Trace hits, misses, and cross-tier traces are checked for exact row values.
+  Every minute bucket is checked for timestamp, total, and error count in order.
+- **Latency** is one warm connection per backend, with `WARMUP` warmups and
+  `ITERATIONS` measured requests. Validation runs outside the measured interval.
+  p50 is the median, with nearest rank for p95 and p99. The restart run makes a
+  fresh connection and restarts the engine separately for each of the five shapes.
 
 ## Query shapes
 
@@ -54,11 +55,11 @@ exit.
 |---|---|---|---|
 | Recent service search | `WHERE service='checkout' AND level='ERROR' ORDER BY ts DESC LIMIT 200` | same predicate/order | `service:checkout level:ERROR \| sort by (_time) desc \| limit 200` |
 | Trace lookup | `trace_id:<id>` | `WHERE trace_id='<id>'` | `trace_id:="<id>"` |
-| Minute aggregation | `date_bin(INTERVAL '60 seconds', …)` + `count(*) FILTER` | `toStartOfInterval(ts, INTERVAL 60 SECOND)` + `countIf` | `stats by (_time:1m) count() total, count() if (level:ERROR) errors` |
+| Minute aggregation | `date_bin(INTERVAL '60 seconds', …)` + `count(*) FILTER` | `toStartOfInterval(ts, INTERVAL 60 SECOND)` + `countIf` | `stats by (_time:1m) count() total, count() if (level:ERROR) errors \| sort by (_time)` |
 
 All three search queries use the same predicate and newest-first order. Verdigris
 uses SQL for this comparison so a relative `last 1h` cannot drift between
-separately started engine processes; the aggregation is SQL on all three.
+separately started engine processes; VictoriaLogs uses LogsQL for aggregation.
 
 The trace workload rotates through a fixed set of real IDs spread across the
 corpus, and also checks a missing ID and one ID deliberately written to a row in

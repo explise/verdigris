@@ -94,7 +94,7 @@ cleanup_vdg() {
 }
 restart_first_queries() {
   local system=$1 port=$2 container=$3 url=$4 shape
-  for shape in trace search aggregate; do
+  for shape in trace trace-miss trace-cross-tier search aggregate; do
     docker restart "$container" >/dev/null
     wait_ready "$system restart" "$url"
     python3 bench/compare/logs/first_query.py --system "$system" --port "$port" \
