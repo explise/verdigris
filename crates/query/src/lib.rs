@@ -95,6 +95,8 @@ impl ScanExecutor for ModeledExecutor {
 /// Real query execution via DataFusion: reads Parquet in place from the object
 /// store and runs SQL. Feature-gated behind `datafusion`.
 #[cfg(feature = "datafusion")]
+pub mod admission;
+#[cfg(feature = "datafusion")]
 pub mod engine;
 #[cfg(feature = "datafusion")]
 pub mod index;

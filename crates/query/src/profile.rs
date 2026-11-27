@@ -146,9 +146,8 @@ impl ReadCounters {
             .push((start, end));
     }
 
-    /// Critical-path read wait: merge overlapping intervals. This is the part
-    /// of request wall time that was blocked on storage; it is deliberately not
-    /// the sum of per-read waits, which double-counts concurrent I/O.
+    /// Union of in-flight I/O intervals. Operators can run while I/O is in
+    /// flight, so this does not establish removable critical-path wait.
     pub(crate) fn critical_wait_us(&self) -> u64 {
         let mut spans = self.timeline.lock().expect("read timeline").clone();
         spans.sort_unstable();

@@ -336,50 +336,6 @@ impl Admission {
     }
 }
 
-/// A `LIMIT n` with `n <= max` is cheap enough to bypass heavy queueing.
-fn has_small_limit(sql: &str, max: u64) -> bool {
-    if max == 0 {
-        return false;
-    }
-    let upper = sql.to_ascii_uppercase();
-    let Some(pos) = upper.rfind("LIMIT") else {
-        return false;
-    };
-    let tail = upper[pos + "LIMIT".len()..].trim_start();
-    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse::<u64>().is_ok_and(|n| n <= max)
-}
-
-fn has_any_limit(sql: &str) -> bool {
-    sql.to_ascii_uppercase().contains("LIMIT")
-}
-
-/// A high-cardinality equality is the one shape where a small LIMIT can be
-/// trusted even when file-level plan bytes are large: Parquet bloom filters prune
-/// almost all row groups. A plain full-scan LIMIT has no such predicate and must
-/// stay heavy.
-fn has_selective_equality(sql: &str) -> bool {
-    let upper = sql.to_ascii_uppercase();
-    upper.contains("TRACE_ID =") || upper.contains("TRACE_ID:")
-}
-
-/// Cheap means the *planned scan* is small. A small LIMIT over a large scan is
-/// still expensive and must queue with heavy work. When the scan threshold is
-/// disabled, no query can prove cheapness from SQL alone.
-fn is_cheap_query(sql: &str, scan_bytes: u64, cheap_limit_rows: u64, cheap_scan_mib: u64) -> bool {
-    if cheap_scan_mib == 0 {
-        return false;
-    }
-    let small_scan = scan_bytes <= cheap_scan_mib.saturating_mul(1024 * 1024);
-    let small_limit = cheap_limit_rows > 0 && has_small_limit(sql, cheap_limit_rows);
-    if small_scan {
-        return cheap_limit_rows == 0 || !has_any_limit(sql) || small_limit;
-    }
-    // Large file-level plan: only a selective equality plus a small LIMIT is
-    // credible as a cheap point lookup (bloom filters prune its row groups).
-    small_limit && has_selective_equality(sql)
-}
-
 const QUERY_HISTORY_CAP: usize = 500;
 
 /// Bounded audit queue. A full queue triggers a short wait, then a direct
@@ -986,7 +942,7 @@ async fn admit_scan_with(
     admission: &Admission,
     cfg: &verdigris_core::config::QueryConfig,
     scan_bytes: u64,
-    sql: &str,
+    cheap: bool,
     wait: Duration,
 ) -> Result<AdmissionPermit, AppError> {
     let max_scan_gib = cfg.max_scan_gib;
@@ -1008,7 +964,6 @@ async fn admit_scan_with(
             return Err(AppError::scan_over_budget(&est, max_scan_gib));
         }
     }
-    let cheap = is_cheap_query(sql, scan_bytes, cfg.cheap_limit_rows, cfg.cheap_scan_mib);
     admission
         .admit(cheap, wait)
         .await
@@ -1018,7 +973,7 @@ async fn admit_scan_with(
 async fn admit_query(
     st: &AppState,
     plan: &verdigris_core::scan::ScanPlan<'_>,
-    sql: &str,
+    allow_point_lookup: bool,
 ) -> Result<AdmissionPermit, AppError> {
     let scan_bytes = plan.scanned_bytes();
     let max_scan_gib = st.cfg.query.max_scan_gib;
@@ -1032,11 +987,18 @@ async fn admit_query(
             return Err(AppError::scan_over_budget(&est, max_scan_gib));
         }
     }
+    let cheap = verdigris_query::admission::is_cheap_query(
+        &plan.sql,
+        st.table.as_str(),
+        scan_bytes,
+        &st.cfg.query,
+        allow_point_lookup,
+    );
     admit_scan_with(
         &st.admission,
         &st.cfg.query,
         scan_bytes,
-        sql,
+        cheap,
         Duration::from_millis(st.cfg.query.admission_wait_ms),
     )
     .await
@@ -1148,13 +1110,13 @@ async fn measure(
     limits: &QueryLimits,
     admission: &Admission,
     cfg: &verdigris_core::config::QueryConfig,
-) -> anyhow::Result<f64> {
+) -> Result<f64, AppError> {
     let scan_bytes: u64 = files.iter().map(|f| f.bytes).sum();
-    let _permit = admit_scan_with(admission, cfg, scan_bytes, sql, Duration::from_millis(50))
+    let _permit =
+        admit_scan_with(admission, cfg, scan_bytes, false, Duration::from_millis(50)).await?;
+    let rows = verdigris_query::engine::query_table_json(s.clone(), table, files, sql, limits)
         .await
-        .map_err(|e| anyhow::anyhow!("alert query admission rejected: {}", e.message))?;
-    let rows =
-        verdigris_query::engine::query_table_json(s.clone(), table, files, sql, limits).await?;
+        .map_err(AppError::from_query)?;
     let Some(Value::Object(row)) = rows.into_iter().next() else {
         return Ok(0.0);
     };
@@ -1203,7 +1165,7 @@ async fn evaluate_all(
             let value = match measure(s, table, &files, &a.rule.sql, limits, admission, cfg).await {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(rule = %a.rule.name, error = %e, "alert eval failed");
+                    tracing::warn!(rule = %a.rule.name, error = %e.message, "alert eval failed");
                     continue;
                 }
             };
@@ -2149,7 +2111,7 @@ async fn h_query(
             profile,
         ));
     }
-    let _admission = admit_query(&st, &plan, &req.sql).await?;
+    let _admission = admit_query(&st, &plan, !req.histogram).await?;
     if let Some(profile) = &mut profile {
         profile.mark("admission");
     }
@@ -2365,7 +2327,7 @@ async fn h_activity(State(st): State<AppState>, Json(req): Json<ActivityReq>) ->
     let _admission = if files.is_empty() {
         None
     } else {
-        Some(admit_query(&st, &plan, &req.sql).await?)
+        Some(admit_query(&st, &plan, false).await?)
     };
     let histogram = if files.is_empty() {
         Vec::new()
@@ -2817,7 +2779,7 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
                 &st.admission,
                 &st.cfg.query,
                 scan_bytes,
-                "",
+                false,
                 Duration::from_millis(st.cfg.query.admission_wait_ms),
             )
             .await?,
@@ -3097,8 +3059,7 @@ async fn h_alert_create(
         &st.admission,
         &st.cfg.query,
     )
-    .await
-    .map_err(AppError::bad_request)?;
+    .await?;
     let (status, _t) = alert::evaluate(&rule, &AlertStatus::initial(now), value, now);
     let id = rule.id.clone();
     for _ in 0..ALERTS_CAS_RETRIES {
@@ -3982,15 +3943,6 @@ mod tests {
         assert_eq!(st.audit.failed.load(Ordering::Relaxed), 1);
     }
 
-    #[test]
-    fn small_limit_detection_is_conservative() {
-        assert!(has_small_limit("SELECT * FROM logs LIMIT 10", 1000));
-        assert!(has_small_limit("select * from logs limit 1000", 1000));
-        assert!(!has_small_limit("SELECT * FROM logs LIMIT 5000", 1000));
-        assert!(!has_small_limit("SELECT count(*) FROM logs", 1000));
-        assert!(!has_small_limit("SELECT * FROM logs LIMIT 10", 0));
-    }
-
     #[tokio::test]
     async fn admission_sheds_heavy_but_reserves_cheap_lane() {
         let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
@@ -4038,54 +3990,6 @@ mod tests {
             .admit(true, Duration::from_millis(5))
             .await
             .is_err());
-    }
-
-    #[test]
-    fn expensive_limit_is_not_admitted_to_the_cheap_lane() {
-        // A small LIMIT over a large planned scan is still expensive.
-        assert!(!is_cheap_query(
-            "SELECT * FROM logs LIMIT 10",
-            9 * 1024 * 1024,
-            1_000,
-            8
-        ));
-        // A small LIMIT over a small scan is cheap.
-        assert!(is_cheap_query(
-            "SELECT * FROM logs LIMIT 10",
-            1024 * 1024,
-            1_000,
-            8
-        ));
-        // A large LIMIT is not cheap even when the scan is small.
-        assert!(!is_cheap_query(
-            "SELECT * FROM logs LIMIT 5000",
-            1024 * 1024,
-            1_000,
-            8
-        ));
-        // No LIMIT: scan size alone decides.
-        assert!(is_cheap_query(
-            "SELECT count(*) FROM logs",
-            1024 * 1024,
-            1_000,
-            8
-        ));
-        // Disabling the scan threshold disables the lane entirely.
-        assert!(!is_cheap_query("SELECT * FROM logs LIMIT 1", 1, 1_000, 0));
-        // A selective point lookup with a small LIMIT is cheap despite large
-        // file-level bytes; a full-scan LIMIT is not.
-        assert!(is_cheap_query(
-            "SELECT * FROM logs WHERE trace_id = 'abc' LIMIT 10",
-            100 * 1024 * 1024,
-            1_000,
-            8
-        ));
-        assert!(!is_cheap_query(
-            "SELECT * FROM logs LIMIT 10",
-            100 * 1024 * 1024,
-            1_000,
-            8
-        ));
     }
 
     #[tokio::test]

@@ -104,9 +104,10 @@ string the JSON wire sends.
 
 **Admission.** Queries run under a node-wide admission limit. Heavy queries
 queue for up to `query.admission_wait_ms`; if no slot frees they return **429**
-with `Retry-After: 1` and `queueDepth` in the body. Cheap queries (`LIMIT` at or
-below `query.cheap_limit_rows` with a pruned plan or selective equality, or a plan below `query.cheap_scan_mib`) use a
-reserved lane. A plan larger than `query.max_scan_gib` is refused **before
+with `Retry-After: 1` and `queueDepth` in the body. Small planned scans
+can use a reserved lane. On larger scans, only a parsed single-table
+exact trace lookup with a bounded top-level limit and no histogram qualifies.
+A plan larger than `query.max_scan_gib` is refused **before
 execution** with **413** and the scan estimate attached (`scanBytes`, `scanGB`,
 `costUsd`, `maxScanGB`).
 
