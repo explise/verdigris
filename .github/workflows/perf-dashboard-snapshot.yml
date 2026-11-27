@@ -1,0 +1,46 @@
+name: Verdigris dashboard snapshot reuse experiment
+
+on:
+  push:
+    branches: [codex/perf-dashboard-snapshot]
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot-test:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check dashboard snapshot freshness and compaction
+        run: cargo test --locked -p vdg --features serve --bin vdg dashboard_snapshot_refreshes_after_ingest_and_compaction
+  experiment:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the experiment image
+        run: docker build -f bench/Dockerfile.vdg -t verdigris-dashboard-snapshot:local .
+      - name: Compare dashboard scans with and without snapshot reuse
+        env:
+          VDG_IMAGE: verdigris-dashboard-snapshot:local
+          RESULT_ROOT: ${{ runner.temp }}/verdigris-dashboard-snapshot
+        run: |
+          mkdir -p "$RESULT_ROOT"
+          for cache in false true; do
+            CHEAP_PERMITS=2 SCHEDULED_ALERT_WAIT_MS=1000 RUN_MUTATING_TRIAL=1 DASHBOARD_SNAPSHOT_CACHE="$cache" \
+              OUT="$RESULT_ROOT/cache-$cache" bench/admission/run-fixed.sh
+          done
+      - name: Upload both treatment arms
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-dashboard-snapshot
+          path: ${{ runner.temp }}/verdigris-dashboard-snapshot
+          retention-days: 7

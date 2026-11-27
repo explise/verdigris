@@ -100,11 +100,15 @@ def main():
     ap.add_argument("--seed-only", action="store_true", help="ingest and verify visibility, then exit")
     ap.add_argument("--stats-container", action="append", default=[], help="container to sample for peak RSS")
     ap.add_argument("--reuse", action="store_true", help="reuse an already-ingested corpus")
+    ap.add_argument("--ingest-probe-every", type=int, default=0,
+                    help="append one identified row at this interval during a fixed-rate run")
     ap.add_argument("--out", required=True)
     ap.add_argument("--trial", default="")
     args = ap.parse_args()
     if args.fixed_rates and (args.duration <= 0 or args.max_inflight < 1):
         ap.error("--fixed-rates needs positive --duration and --max-inflight")
+    if args.ingest_probe_every and (not args.fixed_rates or args.ingest_probe_every < 1):
+        ap.error("--ingest-probe-every needs a positive interval and --fixed-rates")
     per = max(1, math.ceil(args.rows / args.batches))
 
     def send(b):
@@ -193,7 +197,13 @@ def main():
                 phases = json.loads(reply_headers["x-vdg-query-profile"])["phases_us"]
             if kind == "alert" and status == 201:
                 alert_id = json.loads(data)["id"]
-            if status not in (200, 201, 429):
+            if kind == "dashboard" and status == 200:
+                payload = json.loads(data)
+                if (len(payload.get("volumeByService", [])) != len(SERVICES)
+                    or not payload.get("ingestRate")
+                    or len(payload["ingestRate"]) != len(payload.get("errorRate", []))):
+                    status, detail = 0, "dashboard_incomplete"
+            if detail is None and status not in (200, 201, 429):
                 detail = data[:200].decode(errors="replace")
         except (OSError, http.client.HTTPException) as exc:
             status, detail = 0, type(exc).__name__
@@ -228,12 +238,34 @@ def main():
     sampler = threading.Thread(target=sample_rss, daemon=True)
     alert_start = alert_counters(args.port) if args.fixed_rates else {}
     alert_end = {}
+    probe_rows = []
+
+    def ingest_probes():
+        started = time.monotonic()
+        for offset in range(args.ingest_probe_every, int(args.duration), args.ingest_probe_every):
+            time.sleep(max(0, started + offset - time.monotonic()))
+            row = record(offset, args.rows)
+            row["message"] = f"mixed-ingest freshness probe {offset}"
+            row["trace_id"] = f"{(1 << 64) - offset:016x}"
+            row["ts_millis"] = BASE + WINDOW_MS // 2
+            status, data = post(args.port, "/v1/ingest", (json.dumps(row) + "\n").encode(),
+                                {"content-type": "application/x-ndjson"})
+            if status != 200 or json.loads(data).get("ingested") != 1:
+                raise RuntimeError(f"ingest probe failed at {offset}s: HTTP {status}")
+            probe_rows.append({"offset": offset, "trace_id": row["trace_id"]})
+
     t0 = time.perf_counter()
     if args.fixed_rates:
         sampler.start()
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_inflight) as ex:
-                fixed_mix(ex, run, overloaded, rates, args.duration, args.max_inflight)
+                if args.ingest_probe_every:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as writer:
+                        probes = writer.submit(ingest_probes)
+                        fixed_mix(ex, run, overloaded, rates, args.duration, args.max_inflight)
+                        probes.result()
+                else:
+                    fixed_mix(ex, run, overloaded, rates, args.duration, args.max_inflight)
             alert_end = alert_counters(args.port)
         finally:
             stop.set()
@@ -310,6 +342,13 @@ def main():
            "raw": {kind: [{"status": s, "scheduled_ms": round(d, 3), "service_ms": svc,
                             "phases_us": p, "error": error}
                            for s, d, svc, p, error in results[kind]] for kind in kinds}}
+    if args.ingest_probe_every:
+        for probe in probe_rows:
+            body = json.dumps({"sql": f"trace_id:{probe['trace_id']}", "histogram": False}).encode()
+            status, data = post(args.port, "/v1/query", body)
+            if status != 200 or [r["trace_id"] for r in json.loads(data)["rows"]] != [probe["trace_id"]]:
+                raise RuntimeError(f"acknowledged probe {probe['trace_id']} was not visible")
+        out["committed_probe_rows"] = probe_rows
     print(json.dumps(out, indent=2), flush=True)
     open(args.out, "w").write(json.dumps(out, indent=2))
 
