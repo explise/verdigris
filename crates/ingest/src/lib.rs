@@ -1054,6 +1054,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_compaction_preserves_appends_and_rejects_stale_publish() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let ing = Ingestor::new(store, "logs");
+        let routing = RoutingConfig::default();
+        let policy = BatchPolicy {
+            max_rows: 100,
+            max_bytes: usize::MAX,
+        };
+        let target = 10 * 1024 * 1024;
+        for i in 0u64..4 {
+            ing.ingest(
+                generate::generate(100, i, i as i64 * 1_000_000),
+                &routing,
+                policy,
+            )
+            .await
+            .unwrap();
+        }
+        let prepared = ing.prepare_compaction(target, usize::MAX).await.unwrap();
+        assert!(!prepared.to_retire.is_empty());
+        let stale = ing.prepare_compaction(target, usize::MAX).await.unwrap();
+        let appended = ing
+            .ingest(generate::generate(100, 4, 4_000_000), &routing, policy)
+            .await
+            .unwrap();
+        assert!(!appended.is_empty());
+        let retired = prepared.to_retire.clone();
+        assert!(ing.publish_compaction(prepared).await.unwrap().is_some());
+        let committed = ing.load_manifest().await.unwrap();
+        assert!(committed.files.ends_with(&appended));
+        assert_eq!(committed.files.iter().map(|f| f.rows).sum::<u64>(), 500);
+        assert!(retired
+            .iter()
+            .all(|path| committed.retired.iter().any(|f| f.path == *path)));
+        assert!(ing.publish_compaction(stale).await.unwrap().is_none());
+        let after = ing.load_manifest().await.unwrap();
+        assert_eq!(after.compaction_gen, committed.compaction_gen);
+        assert_eq!(after.files, committed.files);
+    }
+
+    #[tokio::test]
     async fn bounded_compaction_drains_and_matches_unbounded() {
         // Invariant: draining a backlog with small bounded passes ends in the same
         // file layout as one unbounded pass — just spread over multiple commits so
