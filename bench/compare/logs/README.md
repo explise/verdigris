@@ -99,3 +99,24 @@ run](../../results/issue83/four-cpu/README.md)
 
 The [earlier eight-CPU cohort](../../results/issue63/README.md) used a different
 host and budget. Its values are retained as a separate reference.
+
+## First matched 20M sizing comparison
+
+The same four-CPU budget now has one matched 20M deployment per
+engine. Every warm query and first query after restart passed the
+same result checks as the 1M cohort.
+
+| Warm p95 (ms) | Verdigris + MinIO | ClickHouse | VictoriaLogs |
+| --- | ---: | ---: | ---: |
+| Exact trace hit | 18.68 | 119.06 | 4.61 |
+| Exact trace miss | 4.48 | 1.95 | 3.85 |
+| Cross-tier trace | 28.62 | 6.11 | 5.57 |
+| Recent service search | 104.47 | 3.99 | 30.73 |
+| Raw minute aggregation | 388.72 | 166.00 | 142.76 |
+
+ClickHouse exact hits had a 2.96 ms median, with six of 100 requests
+above 119 ms. Repeat the matched 20M run before drawing a conclusion
+from that tail. Verdigris completed all 550 expected warm audit
+acknowledgements within the configured deadline. The short ingest
+comparison reports acknowledgement, visibility and storage separately.
+[Raw samples and method](../../results/issue63/matched-20m/README.md)
