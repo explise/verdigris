@@ -24,12 +24,14 @@ struct Batch {
 struct Probe {
     id: usize,
     sent: Instant,
+    ack: Instant,
 }
 
 #[derive(Serialize)]
 struct Visibility {
     id: usize,
     visible_ms: Option<f64>,
+    ack_to_visible_ms: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -134,20 +136,21 @@ async fn visibility_worker(
             loop {
                 if let Ok(rows) = query(&client, &url, sql.clone()).await {
                     if rows.iter().any(|row| row["trace_id"] == id) {
-                        return ms(probe.sent.elapsed());
+                        return Instant::now();
                     }
                 }
                 sleep(VISIBILITY_POLL).await;
             }
         };
-        let visible_ms = if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        let observed = if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             timeout(remaining, visible).await.ok()
         } else {
             None
         };
         measurements.push(Visibility {
             id: probe.id,
-            visible_ms,
+            visible_ms: observed.map(|at| ms(at.duration_since(probe.sent))),
+            ack_to_visible_ms: observed.map(|at| ms(at.duration_since(probe.ack))),
         });
     }
     measurements
@@ -209,8 +212,17 @@ async fn submit(
                     result.error = Some("invalid_ack");
                     result.acked_rows = None;
                 } else {
-                    result.ack_ms = Some(ms(start.elapsed()));
-                    if sample && visibility.try_send(Probe { id: batch.id, sent }).is_err() {
+                    let ack = Instant::now();
+                    result.ack_ms = Some(ms(ack.duration_since(start)));
+                    if sample
+                        && visibility
+                            .try_send(Probe {
+                                id: batch.id,
+                                sent,
+                                ack,
+                            })
+                            .is_err()
+                    {
                         result.error = Some("visibility_queue_full");
                     }
                 }
