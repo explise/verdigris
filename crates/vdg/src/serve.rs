@@ -1361,6 +1361,7 @@ async fn maybe_compact(
 
     // Encode and upload immutable outputs without blocking foreground commits.
     let mut total_merged = 0usize;
+    let mut passes = 0usize;
     for _ in 0..10_000 {
         let prepared = ingestor
             .prepare_compaction(target_bytes, max_merge_files)
@@ -1381,6 +1382,7 @@ async fn maybe_compact(
         let Some((reports, more)) = outcome else {
             break;
         };
+        passes += 1;
         total_merged += reports.iter().map(|r| r.files_merged).sum::<usize>();
         if !more {
             break;

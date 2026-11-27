@@ -1080,10 +1080,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!appended.is_empty());
+        let appended_manifest = ing.load_manifest().await.unwrap();
+        let appended_files = &appended_manifest.files[prepared.original_files.len()..];
+        assert_eq!(appended_files.len(), appended.len());
         let retired = prepared.to_retire.clone();
         assert!(ing.publish_compaction(prepared).await.unwrap().is_some());
         let committed = ing.load_manifest().await.unwrap();
-        assert!(committed.files.ends_with(&appended));
+        assert!(committed.files.ends_with(appended_files));
         assert_eq!(committed.files.iter().map(|f| f.rows).sum::<u64>(), 500);
         assert!(retired
             .iter()
