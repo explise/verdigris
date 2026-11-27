@@ -97,7 +97,7 @@ restart_first_queries() {
   for shape in trace trace-miss trace-cross-tier search aggregate; do
     docker restart "$container" >/dev/null
     wait_ready "$system restart" "$url"
-    python3 bench/compare/logs/first_query.py --system "$system" --port "$port" \
+    python3 -B bench/compare/logs/first_query.py --system "$system" --port "$port" \
       --rows "$ROWS" --shape "$shape" --out "$OUT/$system-restart-$shape.json"
   done
 }
