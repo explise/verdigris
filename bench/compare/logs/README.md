@@ -15,6 +15,7 @@ Useful knobs:
 ROWS=200000 ITERATIONS=5 SYSTEMS="vdg clickhouse" bench/compare/logs/run.sh
 VDG_SKIP_BUILD=1 VDG_IMAGE=verdigris-bench:<tag> bench/compare/logs/run.sh
 RESTART=1 bench/compare/logs/run.sh             # also restart once per first-query shape
+TOTAL_CPUS=4 bench/compare/logs/run.sh          # equal budget on a 4-vCPU host
 ```
 
 Results land in `bench/results/compare-logs/` (`<system>.json`,
@@ -27,7 +28,9 @@ exit.
   budget. Verdigris is charged for its object store: `vdg` gets 4 CPU / 3 GiB
   and MinIO gets 4 CPU / 3 GiB. ClickHouse and VictoriaLogs each get 8 CPU /
   6 GiB in one container. Running them sequentially avoids one system stealing
-  the other's CPU during measurement.
+  the other's CPU during measurement. Supply `TOTAL_CPUS=4` for a 4-vCPU
+  host. Verdigris and MinIO then get 2 CPUs each, and each competitor gets
+  4 CPUs. Report each CPU budget as its own cohort.
 - **Same corpus, generated from row index**, not ingested once and copied:
   1,000,000 events over a 50-minute window, ten services, ~5.9% `ERROR`,
   unique `trace_id` per row, log-like messages and attributes. Every system
