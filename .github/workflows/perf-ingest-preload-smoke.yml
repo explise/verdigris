@@ -7,7 +7,7 @@ permissions:
 jobs:
   preload:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 65
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -23,20 +23,22 @@ jobs:
           MINIO_CPUS: '1'
           VDG_BENCH_ALLOW_PRELOAD: '1'
           PROFILE_INGEST_PHASES: "1"
-          VDG_BENCH_PRELOAD_ROWS: '100000'
+          VDG_BENCH_PRELOAD_ROWS: '12000000'
           ROWS_PER_S: '10000'
           DURATION_SECS: '30'
           OUT: ${{ runner.temp }}/verdigris-preload
         run: |
+          export CORPUS_START_MS=$(date +%s%3N)
           root="$OUT"
           export LOADGEN="$PWD/bench/loadgen/target/release/verdigris-loadgen"
           for target in 0 256; do
             export OUT="$root/$target"
             PRELOAD_COMPACT_MIB="$target" bench/loadgen/run-sustained.sh
-            grep -Fx 'preloaded 100000 rows' "$OUT/preload.log"
+            grep -Fx 'preloaded 12000000 rows' "$OUT/preload.log"
             jq -e '[.visibility[] | select(.visible_ms != null)] | length > 0 and all(.[]; .ack_to_visible_ms >= 0 and .ack_to_visible_ms <= .visible_ms)' "$OUT/run.json"
             jq . "$OUT/preload-storage.json"
           done
+          head -n 1 "$root/0/preload-manifest.txt" "$root/256/preload-manifest.txt"
           cat "$root/256/preload-compaction.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
