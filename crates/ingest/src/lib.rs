@@ -70,11 +70,11 @@ fn content_hash(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
-/// Writes a single logical table's data + manifest to an object store.
 #[cfg(test)]
 type BeforeCompactionCommit =
     Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
 
+/// Writes a single logical table's data + manifest to an object store.
 pub struct Ingestor {
     store: Arc<dyn ObjectStore>,
     table: String,
@@ -1172,8 +1172,11 @@ mod tests {
         assert!(ing.publish_compaction(prepared).await.unwrap().is_some());
         let after = ing.load_manifest().await.unwrap();
         assert_eq!(after.compaction_gen, before.compaction_gen + 1);
-        assert!(after.files.starts_with(&new_files));
-        assert!(after.files.ends_with(&appended));
+        assert!(after
+            .files
+            .iter()
+            .map(|file| &file.path)
+            .eq(new_files.iter().chain(&appended).map(|file| &file.path)));
         assert_eq!(after.files.iter().map(|f| f.rows).sum::<u64>(), 500);
         assert!(to_retire
             .iter()
