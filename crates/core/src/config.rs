@@ -48,6 +48,8 @@ pub struct IngestConfig {
     /// Roll a Parquet file once a tier's buffer reaches this many bytes
     /// (`LogRecord::approx_bytes`, so in-memory size — not the compressed size).
     pub max_batch_bytes: usize,
+    /// Collect fixed-cardinality timing counters for ingest and compaction.
+    pub profile_phases: bool,
 }
 
 impl Default for IngestConfig {
@@ -58,6 +60,7 @@ impl Default for IngestConfig {
             max_inflight: 32,
             max_batch_rows: batch.max_rows,
             max_batch_bytes: batch.max_bytes,
+            profile_phases: false,
         }
     }
 }
