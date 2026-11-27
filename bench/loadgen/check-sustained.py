@@ -2,6 +2,7 @@
 """Snapshot or verify batch-level ingest durability against a disposable fixture."""
 import argparse
 import json
+import math
 import re
 import urllib.error
 import urllib.request
@@ -110,6 +111,46 @@ def reconcile(report, before, after):
     return results
 
 
+def reference_measurements(report, before, after):
+    recovery = reconcile(report, before, after)
+    duration = report["duration_s"]
+    acked_in_window = sum(
+        row["acked_rows"] for row in report["outcomes"]
+        if row["acked_rows"] is not None and row["ack_ms"] is not None
+        and row["ack_ms"] < duration * 1000
+    )
+    offered_samples = set(report["sampled_batches"])
+    visible_by_id = {row["id"]: row["visible_ms"] for row in report["visibility"]}
+    if len(offered_samples) != len(report["sampled_batches"]) or (
+        len(visible_by_id) != len(report["visibility"]) or not visible_by_id.keys() <= offered_samples
+    ):
+        raise ValueError("inconsistent visibility sample IDs")
+    observed = sorted(value for value in visible_by_id.values() if value is not None)
+    if any(not math.isfinite(value) or value < 0 for value in observed):
+        raise ValueError("invalid receipt-to-visible measurement")
+    # Unobserved scheduled arrivals sort after every observed latency.
+    rank = (len(offered_samples) * 95 + 99) // 100
+    p95 = observed[rank - 1] if 0 < rank <= len(observed) else None
+    checks = {
+        "duration": duration >= 600,
+        "durable_rows_per_second": duration > 0 and acked_in_window >= 200_000 * duration,
+        "visibility": len(offered_samples) >= duration and p95 is not None and p95 <= 1000,
+        "exact_restart_recovery": recovery["passed"] and not any(
+            recovery["unacknowledged_batches"].values()
+        ),
+    }
+    return {
+        "passed": all(checks.values()),
+        "checks": checks,
+        "duration_s": duration,
+        "in_window_acked_rows": acked_in_window,
+        "visibility_p95_ms": p95,
+        "visibility_samples": len(offered_samples),
+        "visibility_misses": len(offered_samples) - len(observed),
+        "manual_checks": ["reference hardware", "stable storage backlog"],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_subparsers(dest="mode", required=True)
@@ -121,6 +162,9 @@ def main():
     check = modes.add_parser("verify")
     for arg in ("run", "before", "after", "out"):
         check.add_argument(f"--{arg}", type=Path, required=True)
+    reference = modes.add_parser("reference-measurements")
+    for arg in ("run", "before", "after", "out"):
+        reference.add_argument(f"--{arg}", type=Path, required=True)
     args = parser.parse_args()
     if args.mode == "snapshot":
         if not re.fullmatch(r"[a-zA-Z][a-zA-Z_0-9]*", args.table):
@@ -128,7 +172,8 @@ def main():
         result = snapshot(args.url, args.table, args.allow_preload)
         status = 0
     else:
-        result = reconcile(*(json.loads(p.read_text()) for p in (args.run, args.before, args.after)))
+        evaluate = reference_measurements if args.mode == "reference-measurements" else reconcile
+        result = evaluate(*(json.loads(p.read_text()) for p in (args.run, args.before, args.after)))
         status = 0 if result["passed"] else 1
     args.out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     return status
