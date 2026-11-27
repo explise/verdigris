@@ -9,6 +9,14 @@ permissions:
 
 jobs:
   comparison:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - trial: 2
+            engine_order: clickhouse victorialogs vdg
+          - trial: 3
+            engine_order: victorialogs vdg clickhouse
     runs-on: ubuntu-24.04
     timeout-minutes: 70
     steps:
@@ -28,12 +36,15 @@ jobs:
           WARMUP: '10'
           RESTART: '1'
           CORPUS_TS_MS: '1795764240000'
+          ENGINE_ORDER: ${{ matrix.engine_order }}
           RESULT_ROOT: ${{ runner.temp }}/verdigris-comparator-20m
         run: |
           set -o pipefail
           mkdir -p "$RESULT_ROOT"
           failures=0
-          for engine in vdg clickhouse victorialogs; do
+          printf '%s\n' "$ENGINE_ORDER" > "$RESULT_ROOT/engine-order.txt"
+          read -r -a engines <<< "$ENGINE_ORDER"
+          for engine in "${engines[@]}"; do
             if ! SYSTEMS="$engine" OUT="$RESULT_ROOT/$engine" bench/compare/logs/run.sh |
               tee "$RESULT_ROOT/$engine.log"; then
               failures=1
@@ -44,6 +55,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: verdigris-comparator-20m
+          name: verdigris-comparator-20m-${{ matrix.trial }}
           path: ${{ runner.temp }}/verdigris-comparator-20m
           retention-days: 7

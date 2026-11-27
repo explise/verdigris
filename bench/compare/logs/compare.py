@@ -590,6 +590,7 @@ def timed(fn, iterations: int, warmup: int, validate):
         last = fn()
         samples.append((time.perf_counter() - t0) * 1000.0)
         validate(last)
+    chronological = samples.copy()
     samples.sort()
     return {
         "samples": len(samples),
@@ -600,6 +601,7 @@ def timed(fn, iterations: int, warmup: int, validate):
         "max_ms": samples[-1],
         "result_rows": len(last) if hasattr(last, "__len__") else None,
         "raw_ms": samples,
+        "chronological_ms": chronological,
     }
 
 
