@@ -18,7 +18,7 @@ publish = false
 [dependencies]
 verdigris-core = { path = "../../crates/core" }
 verdigris-ingest = { path = "../../crates/ingest" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
