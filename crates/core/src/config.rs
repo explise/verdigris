@@ -30,6 +30,8 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IngestConfig {
+    /// Persist bounded, exact minute counts for newly written and compacted files.
+    pub minute_summaries: bool,
     /// Max accepted request-body size (bytes); larger payloads get 413 before
     /// being buffered, bounding per-request memory.
     pub max_body_bytes: usize,
@@ -54,6 +56,7 @@ impl Default for IngestConfig {
     fn default() -> Self {
         let batch = BatchPolicy::default();
         Self {
+            minute_summaries: false,
             max_body_bytes: 16 * 1024 * 1024, // 16 MiB
             max_inflight: 32,
             max_batch_rows: batch.max_rows,
@@ -279,6 +282,8 @@ impl Default for StorageConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct QueryConfig {
+    /// Use covered minute counts for the exact rows-only minute aggregate.
+    pub minute_summaries: bool,
     /// Modeled per-core scan throughput, in MiB of *stored Parquet* per second
     /// per core — it divides `ScanPlan::total_bytes()` in `ModeledExecutor`.
     ///
@@ -333,6 +338,7 @@ pub struct QueryConfig {
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
+            minute_summaries: false,
             modeled_mibps_per_core: 100.0,
             cores: 4,
             // Sized so the engine, the accumulated result and the rest of the

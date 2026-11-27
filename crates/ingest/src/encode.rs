@@ -15,9 +15,10 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use verdigris_core::batch::LogRecord;
+use verdigris_core::minute::{minute_start, MinuteCount, MAX_FILE_BUCKETS};
 use verdigris_core::text::TrigramSet;
 
 /// Parquet writer settings shared by ingest and compaction: zstd + **bloom
@@ -81,6 +82,7 @@ pub fn stream_parquet_into(bytes: Bytes, w: &mut MergeWriter) -> Result<()> {
 /// Per-file statistics recorded in the manifest for planning/pruning/pricing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileStats {
+    pub minute_counts: Option<Vec<MinuteCount>>,
     pub rows: u64,
     pub min_ts: i64,
     pub max_ts: i64,
@@ -118,6 +120,32 @@ fn fold_distinct(batch: &RecordBatch, column: &str, out: &mut BTreeSet<String>) 
     }
 }
 
+fn fold_minutes(batch: &RecordBatch, counts: &mut BTreeMap<i64, (u64, u64)>) -> Option<()> {
+    let ts = batch
+        .column_by_name("ts")?
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()?;
+    let level = batch
+        .column_by_name("level")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+    for i in 0..batch.num_rows() {
+        if ts.is_null(i) {
+            return None;
+        }
+        let start = minute_start(ts.value(i))?;
+        let (total, errors) = counts.entry(start).or_default();
+        *total = total.checked_add(1)?;
+        if level.is_valid(i) && level.value(i) == "ERROR" {
+            *errors = errors.checked_add(1)?;
+        }
+        if counts.len() > MAX_FILE_BUCKETS {
+            return None;
+        }
+    }
+    Some(())
+}
+
 /// A streaming merge target: compaction's replacement for "read the whole bin
 /// into `Vec<RecordBatch>`, then re-encode it".
 ///
@@ -132,6 +160,7 @@ fn fold_distinct(batch: &RecordBatch, column: &str, out: &mut BTreeSet<String>) 
 /// buffer (the encoded file, ~`target_bytes`, since `object_store::put` wants
 /// contiguous bytes). Streaming the output too would need multipart upload.
 pub struct MergeWriter {
+    minute_counts: Option<BTreeMap<i64, (u64, u64)>>,
     writer: ArrowWriter<Vec<u8>>,
     rows: u64,
     min_ts: i64,
@@ -166,6 +195,7 @@ impl MergeWriter {
         Ok(Self {
             writer: ArrowWriter::try_new(Vec::new(), schema, Some(writer_props(row_group_rows)?))
                 .context("creating parquet merge writer")?,
+            minute_counts: None,
             rows: 0,
             min_ts: i64::MAX,
             max_ts: i64::MIN,
@@ -176,6 +206,11 @@ impl MergeWriter {
             row_group_rows,
             row_group_trigrams: Vec::new(),
         })
+    }
+
+    pub(crate) fn with_minute_summaries(mut self, enabled: bool) -> Self {
+        self.minute_counts = enabled.then(BTreeMap::new);
+        self
     }
 
     /// Close the open row group and bank its trigram set.
@@ -229,6 +264,13 @@ impl MergeWriter {
                     }
                 }
             }
+            if self
+                .minute_counts
+                .as_mut()
+                .is_some_and(|counts| fold_minutes(&slice, counts).is_none())
+            {
+                self.minute_counts = None;
+            }
             fold_distinct(&slice, "service", &mut self.services);
             fold_distinct(&slice, "level", &mut self.levels);
             if let Some(col) = slice.column_by_name("message") {
@@ -266,6 +308,7 @@ impl MergeWriter {
         self.cut_row_group()?;
         let Self {
             writer,
+            minute_counts,
             rows,
             min_ts,
             max_ts,
@@ -282,6 +325,12 @@ impl MergeWriter {
             trigrams.union_with(g);
         }
         let stats = FileStats {
+            minute_counts: minute_counts.map(|counts| {
+                counts
+                    .into_iter()
+                    .map(|(ts, (total, errors))| MinuteCount(ts, total, errors))
+                    .collect()
+            }),
             rows,
             // An empty merge has no timestamps; don't leak the i64 sentinels into
             // the manifest, where they'd read as a file spanning all of time.
@@ -338,6 +387,13 @@ pub fn records_to_batch(records: &[LogRecord]) -> Result<RecordBatch> {
 /// Encode `records` to Parquet bytes (zstd-compressed). Errors on an empty batch
 /// — callers roll non-empty files only.
 pub fn encode_parquet(records: &[LogRecord]) -> Result<(Vec<u8>, FileStats)> {
+    encode_parquet_with_minute_summaries(records, false)
+}
+
+pub(crate) fn encode_parquet_with_minute_summaries(
+    records: &[LogRecord],
+    minute_summaries: bool,
+) -> Result<(Vec<u8>, FileStats)> {
     anyhow::ensure!(!records.is_empty(), "refusing to encode an empty batch");
     let batch = records_to_batch(records)?;
 
@@ -348,7 +404,7 @@ pub fn encode_parquet(records: &[LogRecord]) -> Result<(Vec<u8>, FileStats)> {
     // cannot come to disagree about what a stat means. (That mattered here: a
     // second fold would also have had to re-derive row-group boundaries, and
     // getting those subtly wrong is a false negative, not a slow query.)
-    let mut w = MergeWriter::new(log_schema())?;
+    let mut w = MergeWriter::new(log_schema())?.with_minute_summaries(minute_summaries);
     w.write(&batch)?;
     w.finish()
 }

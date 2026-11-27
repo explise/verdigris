@@ -15,7 +15,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{Int64Array, RecordBatch, TimestampMillisecondArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::ipc::writer::StreamWriter;
@@ -33,6 +33,7 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::execute_stream;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use futures::StreamExt;
 use object_store::ObjectStore;
 use verdigris_core::config::QueryConfig;
@@ -458,23 +459,85 @@ pub async fn query_table_json_profiled(
         profile.as_deref_mut(),
     )
     .await?;
-    let mut buf = Vec::new();
-    {
-        let mut writer = ArrayWriter::new(&mut buf);
-        for b in &batches {
-            writer.write(b).context("json-encoding batch")?;
-        }
-        writer.finish().context("finishing json")?;
-    }
-    let rows = if buf.is_empty() {
-        vec![]
-    } else {
-        serde_json::from_slice(&buf).context("parsing json rows")?
-    };
+    let rows = json_rows(&batches)?;
     if let Some(profile) = profile {
         profile.mark("encode_rows");
     }
     Ok(rows)
+}
+
+fn json_rows(batches: &[RecordBatch]) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = ArrayWriter::new(&mut buf);
+        for b in batches {
+            writer.write(b).context("json-encoding batch")?;
+        }
+        writer.finish().context("finishing json")?;
+    }
+    if buf.is_empty() {
+        Ok(Vec::new())
+    } else {
+        serde_json::from_slice(&buf).context("parsing json rows")
+    }
+}
+
+/// Render the one rows-only minute query covered by committed file metadata.
+/// Match the complete SQL shape and reuse the ordinary Arrow JSON encoder.
+pub fn minute_summary_json(
+    plan: &verdigris_core::scan::ScanPlan<'_>,
+    table: &str,
+    limits: &QueryLimits,
+) -> anyhow::Result<Option<(Vec<serde_json::Value>, u64)>> {
+    const PREFIX: &str = "SELECT date_bin(INTERVAL '60 seconds', ts, TIMESTAMP '1970-01-01T00:00:00') AS bucket, count(*) AS total, count(*) FILTER (WHERE level = 'ERROR') AS errors FROM ";
+    let suffix = plan
+        .sql
+        .strip_prefix(PREFIX)
+        .and_then(|sql| sql.strip_suffix(" GROUP BY bucket ORDER BY bucket"));
+    if suffix != Some(table)
+        || table.is_empty()
+        || !table
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        || Parser::parse_sql(&GenericDialect {}, &plan.sql).is_err()
+    {
+        return Ok(None);
+    }
+    let Some((minutes, metadata_bytes)) = plan.minute_summary() else {
+        return Ok(None);
+    };
+    if minutes.len() as u64 > limits.max_result_rows
+        || minutes.iter().any(|count| count.1 > i64::MAX as u64)
+    {
+        return Ok(None);
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "bucket",
+            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new("total", DataType::Int64, false),
+        Field::new("errors", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(TimestampMillisecondArray::from_iter_values(
+                minutes.iter().map(|count| count.0),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                minutes.iter().map(|count| count.1 as i64),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                minutes.iter().map(|count| count.2 as i64),
+            )),
+        ],
+    )?;
+    if batch.get_array_memory_size() as u64 > limits.max_result_bytes {
+        return Ok(None);
+    }
+    Ok(Some((json_rows(&[batch])?, metadata_bytes)))
 }
 
 /// Arrow-IPC bytes plus the number of rows they encode. The row count is what

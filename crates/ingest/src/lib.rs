@@ -68,8 +68,30 @@ fn content_hash(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
+fn file_from_stats(path: String, bytes: u64, tier: Tier, stats: encode::FileStats) -> DataFile {
+    let mut file = DataFile {
+        path,
+        bytes,
+        rows: stats.rows,
+        min_ts: stats.min_ts,
+        max_ts: stats.max_ts,
+        tier,
+        services: stats.services,
+        levels: stats.levels,
+        minute_summary: None,
+        message_trigrams: Some(stats.message_trigrams),
+        row_groups: stats.row_groups,
+        row_group_trigrams: Some(stats.row_group_trigrams),
+    };
+    file.minute_summary = stats
+        .minute_counts
+        .and_then(|counts| verdigris_core::minute::MinuteSummary::for_file(&file, counts));
+    file
+}
+
 /// Writes a single logical table's data + manifest to an object store.
 pub struct Ingestor {
+    minute_summaries: bool,
     store: Arc<dyn ObjectStore>,
     table: String,
     /// Time seam for retirement/reclamation stamps. Production wires `RealClock`;
@@ -84,6 +106,7 @@ impl Ingestor {
     pub fn new(store: Arc<dyn ObjectStore>, table: impl Into<String>) -> Self {
         Self {
             store,
+            minute_summaries: false,
             table: table.into(),
             clock: Arc::new(SimClock::default()),
             retired_grace_ms: DEFAULT_RETIRED_GRACE_MS,
@@ -99,6 +122,11 @@ impl Ingestor {
     /// Override how long retired files remain readable before reclamation.
     pub fn with_retired_grace_ms(mut self, grace_ms: u64) -> Self {
         self.retired_grace_ms = grace_ms;
+        self
+    }
+
+    pub fn with_minute_summaries(mut self, enabled: bool) -> Self {
+        self.minute_summaries = enabled;
         self
     }
 
@@ -303,6 +331,7 @@ impl Ingestor {
             if !added {
                 return Ok(()); // everything already committed (idempotent)
             }
+            verdigris_core::minute::MinuteSummary::cap_manifest(&mut manifest.files);
             if self.commit_manifest(&manifest, base).await? == CommitOutcome::Committed {
                 return Ok(());
             }
@@ -315,26 +344,15 @@ impl Ingestor {
     /// returns its manifest entry. The name derives from the bytes, so concurrent
     /// writers never collide on a path.
     async fn write_file(&self, records: &[LogRecord], tier: Tier) -> anyhow::Result<DataFile> {
-        let (bytes, stats) = encode::encode_parquet(records)?;
+        let (bytes, stats) =
+            encode::encode_parquet_with_minute_summaries(records, self.minute_summaries)?;
         let path = self.data_path(tier, &content_hash(&bytes));
         let len = bytes.len() as u64;
         self.store
             .put(&ObjPath::from(path.clone()), bytes.into())
             .await
             .with_context(|| format!("writing {path}"))?;
-        Ok(DataFile {
-            path,
-            bytes: len,
-            rows: stats.rows,
-            min_ts: stats.min_ts,
-            max_ts: stats.max_ts,
-            tier,
-            services: stats.services,
-            levels: stats.levels,
-            message_trigrams: Some(stats.message_trigrams),
-            row_groups: stats.row_groups,
-            row_group_trigrams: Some(stats.row_group_trigrams),
-        })
+        Ok(file_from_stats(path, len, tier, stats))
     }
 
     /// Ingest a stream of records: route each by severity (`routing`) to a
@@ -567,7 +585,8 @@ impl Ingestor {
                     // go. Peak memory is one batch plus the encoder's in-progress
                     // row group, NOT the bin's whole decompressed size — see
                     // `MergeWriter` (issue #13).
-                    let mut w = encode::MergeWriter::new(schema::log_schema())?;
+                    let mut w = encode::MergeWriter::new(schema::log_schema())?
+                        .with_minute_summaries(self.minute_summaries);
                     for f in &bin {
                         let bytes = self
                             .store
@@ -613,19 +632,7 @@ impl Ingestor {
                     // Stats are recomputed from the merged rows by `MergeWriter`
                     // (authoritative even if some input files predate value stats),
                     // so the compacted file still prunes by service/level/trigram.
-                    new_files.push(DataFile {
-                        path,
-                        bytes: len,
-                        rows: stats.rows,
-                        min_ts: stats.min_ts,
-                        max_ts: stats.max_ts,
-                        tier,
-                        services: stats.services,
-                        levels: stats.levels,
-                        message_trigrams: Some(stats.message_trigrams),
-                        row_groups: stats.row_groups,
-                        row_group_trigrams: Some(stats.row_group_trigrams),
-                    });
+                    new_files.push(file_from_stats(path, len, tier, stats));
                     for f in &bin {
                         to_retire.push(f.path.clone());
                     }
@@ -660,6 +667,7 @@ impl Ingestor {
             // paths are recorded in the same commit so a reader holding the old
             // manifest still finds its files on disk; they become reclaimable only
             // after the grace period.
+            verdigris_core::minute::MinuteSummary::cap_manifest(&mut new_files);
             manifest.files = new_files;
             manifest.compaction_gen = generation + 1;
             manifest.retire(to_retire, self.clock.now_millis());
@@ -1046,6 +1054,7 @@ mod tests {
             tier: Tier::Hot,
             services: vec![],
             levels: vec![],
+            minute_summary: None,
             message_trigrams: None,
             row_groups: 0,
             row_group_trigrams: None,

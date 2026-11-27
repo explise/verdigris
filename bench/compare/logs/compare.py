@@ -28,6 +28,7 @@ import json
 import math
 import os
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -107,6 +108,15 @@ RECENT_SEARCH_SQL = (
     "SELECT ts, level, service, status, message, trace_id, attrs_json "
     "FROM bench WHERE service = 'checkout' AND level = 'ERROR' "
     "ORDER BY ts DESC LIMIT 200"
+)
+
+
+MINUTE_AGGREGATE_SQL = (
+    "SELECT date_bin(INTERVAL '60 seconds', ts, "
+    "TIMESTAMP '1970-01-01T00:00:00') AS bucket, "
+    "count(*) AS total, "
+    "count(*) FILTER (WHERE level = 'ERROR') AS errors "
+    "FROM bench GROUP BY bucket ORDER BY bucket"
 )
 
 
@@ -435,13 +445,7 @@ class Vdg(Backend):
         return self._query(f"trace_id:{trace_id}", tiers)
 
     def aggregate_minute(self):
-        return self._query(
-            "SELECT date_bin(INTERVAL '60 seconds', ts, "
-            "TIMESTAMP '1970-01-01T00:00:00') AS bucket, "
-            "count(*) AS total, "
-            "count(*) FILTER (WHERE level = 'ERROR') AS errors "
-            "FROM bench GROUP BY bucket ORDER BY bucket"
-        )
+        return self._query(MINUTE_AGGREGATE_SQL)
 
     def cache_stats(self):
         status, _, data = self.client.request("GET", "/v1/metrics")
@@ -645,8 +649,11 @@ def main():
     ap.add_argument("--verify-all-row-ids", action="store_true",
                     help="verify every generated identity on a smoke corpus (up to 100,000 rows)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--vdg-compact-container", help="compact a disposable Verdigris fixture once after ingest")
     args = ap.parse_args()
 
+    if args.vdg_compact_container and args.system != "vdg":
+        ap.error("--vdg-compact-container requires --system vdg")
     rows = args.rows
     # Spread hit lookups across the corpus instead of timing one convenient id.
     # Every id is a real row; keep away from the cross-tier sentinel rows.
@@ -715,7 +722,18 @@ def main():
     if visible != rows:
         raise SystemExit(f"{args.system}: visible {visible}, expected {rows}")
 
-    backend.settle()
+    compact_result = None
+    if args.vdg_compact_container:
+        command = ["docker", "exec", args.vdg_compact_container, "vdg"]
+        manifest_cmd = [*command, "manifest", "--table", "bench"]
+        before = subprocess.check_output(manifest_cmd, text=True)
+        compact_start = time.perf_counter()
+        summary = subprocess.check_output([*command, "compact", "--table", "bench"], text=True)
+        compact_seconds = time.perf_counter() - compact_start
+        after = subprocess.check_output(manifest_cmd, text=True)
+        compact_result = {"before": before, "after": after, "summary": summary, "elapsed_s": compact_seconds}
+    else:
+        backend.settle()
     # Let background merge work fall out of the measurement window. Verdigris has
     # already compacted (run.sh invokes `vdg compact`), ClickHouse has run
     # OPTIMIZE, and VictoriaLogs merges asynchronously.
@@ -848,6 +866,8 @@ def main():
             "minute_aggregation": q_aggregate,
         },
     }
+    if compact_result is not None:
+        results["explicit_compaction"] = compact_result
     if args.verify_all_row_ids:
         # Run outside the measured workloads and audit/cache counter windows.
         validate_row_identity(backend.fixture_messages(rows + 1), rows)

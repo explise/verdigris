@@ -603,3 +603,71 @@ async fn legacy_key_replacement_bypasses_shared_caches() {
         200
     );
 }
+
+#[tokio::test]
+async fn minute_summary_matches_raw_across_late_write_and_compaction() {
+    const SQL: &str = "SELECT date_bin(INTERVAL '60 seconds', ts, TIMESTAMP '1970-01-01T00:00:00') AS bucket, count(*) AS total, count(*) FILTER (WHERE level = 'ERROR') AS errors FROM logs GROUP BY bucket ORDER BY bucket";
+    use verdigris_core::scan::plan_scan;
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let raw_writer = Ingestor::new(store.clone(), "logs");
+    let writer = Ingestor::new(store.clone(), "logs").with_minute_summaries(true);
+    let routing = RoutingConfig::default();
+    let policy = BatchPolicy::default();
+    let records = (0..8_000).map(|i| {
+        let mut row = rec(i, Level::Error, "checkout", None);
+        row.ts_millis = BASE_TS + i % 3 * 60_000;
+        row.trace_id = Some(format!(
+            "{:016x}",
+            (i as u64).wrapping_mul(0x9e3779b97f4a7c15)
+        ));
+        row
+    });
+    writer.ingest(records, &routing, policy).await.unwrap();
+    let before = writer.load_manifest().await.unwrap();
+    let before_plan = plan_scan(&before, SQL, "logs", &[], 0, 200).unwrap();
+    let (summarized, bytes) = engine::minute_summary_json(&before_plan, "logs", &limits())
+        .unwrap()
+        .expect("complete immutable counts");
+    let raw = engine::query_table_json(store.clone(), "logs", &all_paths(&before), SQL, &limits())
+        .await
+        .unwrap();
+    assert_eq!(summarized, raw);
+    assert!(bytes <= before_plan.scanned_bytes() / 100);
+    let narrow_limit = QueryLimits {
+        max_result_rows: 1,
+        ..limits()
+    };
+    assert!(
+        engine::minute_summary_json(&before_plan, "logs", &narrow_limit)
+            .unwrap()
+            .is_none()
+    );
+
+    raw_writer
+        .ingest([rec(8, Level::Error, "late", None)], &routing, policy)
+        .await
+        .unwrap();
+    let mixed = writer.load_manifest().await.unwrap();
+    let mixed_plan = plan_scan(&mixed, SQL, "logs", &[], 0, 200).unwrap();
+    assert!(engine::minute_summary_json(&mixed_plan, "logs", &limits())
+        .unwrap()
+        .is_none());
+
+    writer.compact(64 * 1024 * 1024).await.unwrap();
+    let current = writer.load_manifest().await.unwrap();
+    let current_plan = plan_scan(&current, SQL, "logs", &[], 0, 200).unwrap();
+    let (compacted, _) = engine::minute_summary_json(&current_plan, "logs", &limits())
+        .unwrap()
+        .expect("compaction rebuilt the counts");
+    let raw_current =
+        engine::query_table_json(store.clone(), "logs", &all_paths(&current), SQL, &limits())
+            .await
+            .unwrap();
+    assert_eq!(compacted, raw_current);
+    assert_ne!(compacted, summarized);
+    let raw_old = engine::query_table_json(store, "logs", &all_paths(&before), SQL, &limits())
+        .await
+        .expect("reader retirement grace retains the old immutable file");
+    assert_eq!(raw_old, summarized);
+}

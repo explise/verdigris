@@ -84,6 +84,13 @@ pub struct DataFile {
     /// compare the index against itself.
     #[serde(default)]
     pub row_groups: u64,
+    /// Opt-in counts carried with this immutable file's committed descriptor.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::minute::deserialize_optional"
+    )]
+    pub minute_summary: Option<crate::minute::MinuteSummary>,
     /// Character-trigram presence set over this file's `message` column, letting
     /// a free-text search skip the file when a trigram of the term is provably
     /// absent. `None` = not loaded or not recorded — **never prunes**. See
@@ -430,6 +437,7 @@ mod tests {
             tier: Tier::Hot,
             services: vec![],
             levels: vec![],
+            minute_summary: None,
             message_trigrams: None,
             row_groups: 0,
             row_group_trigrams: None,
@@ -443,6 +451,7 @@ mod tests {
             tier: Tier::Hot,
             services: vec![],
             levels: vec![],
+            minute_summary: None,
             message_trigrams: None,
             row_groups: 0,
             row_group_trigrams: None,
@@ -466,6 +475,7 @@ mod tests {
             tier: Tier::Hot,
             services: vec!["auth".into(), "billing".into()],
             levels: vec!["ERROR".into()],
+            minute_summary: None,
             message_trigrams: None,
             row_groups: 0,
             row_group_trigrams: None,
@@ -533,6 +543,7 @@ mod tests {
             tier: Tier::Hot,
             services: vec![],
             levels: vec![],
+            minute_summary: None,
             message_trigrams: Some(trigrams),
             row_groups: 0,
             row_group_trigrams: None,
