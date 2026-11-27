@@ -9,7 +9,7 @@ out_dir = sys.argv[1] if len(sys.argv) > 1 else "bench/results/compare-logs"
 order = {"vdg": 0, "clickhouse": 1, "victorialogs": 2}
 systems = []
 for path in sorted(glob.glob(os.path.join(out_dir, "*.json"))):
-    if path.endswith(".meta.json"):
+    if path.endswith(".meta.json") or "-restart" in path:
         continue
     with open(path) as f:
         systems.append(json.load(f))
@@ -32,11 +32,15 @@ labels = {
 
 lines = []
 lines.append("# Equivalent log-query comparison\n")
-lines.append(
-    "Same deterministic corpus, same 8 CPU / 6 GiB total budget per complete "
-    "deployment, one system at a time. Verdigris's budget includes its MinIO "
-    "object store (4 CPU / 3 GiB + 4 CPU / 3 GiB).\n"
-)
+cpu_limits = {m["cpu_limit"] for m in meta.values()}
+if len(cpu_limits) == 1:
+    total_cpu = cpu_limits.pop()
+    lines.append(
+        f"Same deterministic corpus, {total_cpu} CPU / 6 GiB per complete "
+        f"deployment, one system at a time. Verdigris and MinIO each receive "
+        f"{total_cpu // 2} CPU / 3 GiB.\n"
+    )
+
 lines.append("| System | Retained | Container memory after queries |")
 lines.append("|---|---:|---:|")
 for s in systems:
@@ -74,6 +78,24 @@ for key, label in names:
             f"| {labels.get(s['system'], s['system'])} | {q['p50_ms']:.1f} | "
             f"{q['p95_ms']:.1f} | {q['p99_ms']:.1f} | {q['max_ms']:.1f} | {q['samples']} |"
         )
+    lines.append("")
+
+restart_shapes = ("trace", "trace-miss", "trace-cross-tier", "search", "aggregate")
+if any(glob.glob(os.path.join(out_dir, f"{s['system']}-restart-*.json")) for s in systems):
+    lines.append("## First query after a separate process restart (ms)\n")
+    lines.append("| System | Trace hit | Trace miss | Cross-tier trace | Search | Aggregation |")
+    lines.append("|---|---:|---:|---:|---:|---:|")
+    for system in (s["system"] for s in systems):
+        values = []
+        for shape in restart_shapes:
+            path = os.path.join(out_dir, f"{system}-restart-{shape}.json")
+            if os.path.isfile(path):
+                with open(path) as f:
+                    sample = json.load(f)[shape]
+                values.append(f"{sample['ms']:.2f}" if sample["status"] == 200 else "failed")
+            else:
+                values.append("n/a")
+        lines.append(f"| {labels.get(system, system)} | {' | '.join(values)} |")
     lines.append("")
 
 lines.append("## Equivalence gate\n")

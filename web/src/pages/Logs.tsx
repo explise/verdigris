@@ -5,6 +5,7 @@
 import { createResource, createSignal, createMemo, For, Show, createEffect, onMount } from "solid-js";
 import { createVirtualizer } from "@tanstack/solid-virtual";
 import { useApi } from "@/store";
+import type { Api } from "@/lib/api";
 import type { LogRow, TierId } from "@/lib/types";
 import { fmtBytes, usd } from "@/lib/format";
 
@@ -17,6 +18,10 @@ const ALL_TIERS: { id: TierId; t: string }[] = [
 
 export default function Logs() {
   const api = useApi();
+  return <Show when={api()} keyed>{(workspace) => <WorkspaceLogs api={workspace} />}</Show>;
+}
+
+function WorkspaceLogs(props: { api: Api }) {
   const [sql, setSql] = createSignal("service:auth status>=500 | last 1h");
   const [tiers, setTiers] = createSignal<TierId[]>(["hot", "warm"]);
   const [gate, setGate] = createSignal(true);
@@ -27,11 +32,19 @@ export default function Logs() {
   // so editing the box doesn't refetch until Run/Enter. A fresh object each time
   // means Run always re-executes, even with unchanged text.
   const [submitted, setSubmitted] = createSignal({ sql: sql(), tiers: tiers() });
-  const [query] = createResource(
-    () => ({ a: api(), q: submitted() }),
-    ({ a, q }) => a.queryLogs({ sql: q.sql, tiers: q.tiers }),
+  const [query] = createResource(submitted, (q) => props.api.queryLogs(q));
+  // A new workspace starts its own resources and cold approval. Inside one
+  // workspace, the submitted query keys both independent responses.
+  const [activity, { refetch: refetchActivity }] = createResource(
+    submitted, (q) => props.api.queryActivity(q),
   );
-  const [est] = createResource(tiers, (t) => api().estimate(t));
+  const activityTotal = createMemo(() => {
+    // Do not read the resource value while it is errored: Solid re-throws the
+    // resource error from the accessor, which would take down the row view.
+    if (activity.error || activity.loading) return 0;
+    return (activity()?.histogram ?? []).reduce((n, b) => n + (b.total || 0), 0);
+  });
+  const [est] = createResource(tiers, (t) => props.api.estimate(t));
 
   const execute = () => setSubmitted({ sql: sql(), tiers: tiers() });
 
@@ -86,15 +99,30 @@ export default function Logs() {
         </div>
 
         <div class="histo">
-          <For each={query()?.histogram ?? []}>{(b) => {
-            // normalize against the tallest bucket so bars are correct at any data scale
-            const max = Math.max(1, ...(query()?.histogram ?? []).map((x) => x.total || 0));
-            return (
-              <div class="bar" style={{ height: `${Math.max(3, Math.min(100, (b.total / max) * 100))}%` }} title={`${b.total} events · ${b.errors} errors`}>
-                <div class="err" style={{ height: `${b.total ? (b.errors / b.total) * 100 : 0}%` }} />
+          <Show
+            when={!activity.error}
+            fallback={
+              <div class="histo-state">
+                activity unavailable{" "}
+                <button type="button" class="btn sm" onClick={() => refetchActivity()}>Retry</button>
               </div>
-            );
-          }}</For>
+            }
+          >
+            <Show when={!activity.loading} fallback={<div class="histo-state">loading activity…</div>}>
+              <For each={activity()?.histogram ?? []}>{(b) => {
+                // normalize against the tallest bucket so bars are correct at any data scale
+                const max = Math.max(1, ...(activity()?.histogram ?? []).map((x) => x.total || 0));
+                return (
+                  <div class="bar" style={{ height: `${Math.max(3, Math.min(100, (b.total / max) * 100))}%` }} title={`${b.total} events · ${b.errors} errors`}>
+                    <div class="err" style={{ height: `${b.total ? (b.errors / b.total) * 100 : 0}%` }} />
+                  </div>
+                );
+              }}</For>
+            </Show>
+          </Show>
+          <Show when={!activity.loading && !activity.error}>
+            <span class="histo-total">{activityTotal().toLocaleString()} events in chart range</span>
+          </Show>
         </div>
       </div>
 
@@ -115,7 +143,7 @@ export default function Logs() {
       </div>
 
       <div class="logs-foot">
-        <span class="count"><b>{query()?.stats.events.toLocaleString() ?? "…"}</b> events</span>
+        <span class="count"><b>{query()?.stats.events.toLocaleString() ?? "…"}</b> rows</span>
         <span class="sep">·</span><span>queried in place · no rehydration</span>
         <span class="sep">·</span>
         <span>scanned {query()?.stats.files ?? "…"} files in <b class="mono" style={{ color: "var(--ink)" }}>{query()?.stats.elapsedMs ?? "…"}ms</b></span>

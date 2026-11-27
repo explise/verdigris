@@ -54,4 +54,4 @@ target_mib = 64
 trigger_pending_files = 2
 max_merge_files_per_pass = 128
 interval_secs = 5
-retired_grace_secs = 3600
+retired_grace_secs = 0

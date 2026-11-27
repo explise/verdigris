@@ -14,7 +14,7 @@ import type { Scope } from "./transport";
 import { json, send, queryTable, eventSourceUrl } from "./transport";
 import { mock } from "./mock";
 import type {
-  QueryResult, QueryStats, HistogramBucket, EstimateResult, Metrics, Alert, NewAlert, Storage, Cost, Pipelines, Settings, LogRow, TierId,
+  QueryResult, QueryStats, ActivityResult, EstimateResult, Metrics, Alert, NewAlert, Storage, Cost, Pipelines, Settings, LogRow, TierId,
 } from "./types";
 
 /** Backend rows carry attributes as a JSON string (`attrs_json`, the schema-
@@ -37,6 +37,7 @@ function normalizeTs(ts: unknown): string {
 
 export interface Api {
   queryLogs(opts: { sql: string; service?: string; tiers: TierId[] }): Promise<QueryResult>;
+  queryActivity(opts: { sql: string; tiers: TierId[] }): Promise<ActivityResult>;
   estimate(tiers: TierId[]): Promise<EstimateResult>;
   tail(onMsg: (e: LogRow) => void, every?: number): { stop(): void };
   metrics(): Promise<Metrics>;
@@ -59,8 +60,8 @@ export function createApi(scope: Scope): Api {
       // wire — Arrow (columnar rows + stats/histogram in headers) or a JSON
       // envelope; the transport negotiates and normalizes that. Adapt rows here:
       // parse attrs_json → attrs, and normalize ts (Arrow: epoch ms; JSON: ISO).
-      const { rows: raw, stats, histogram, wire } = await queryTable<LogRow & { attrs_json?: string }>(
-        "/query", scope, { sql, tiers },
+      const { rows: raw, stats, wire } = await queryTable<LogRow & { attrs_json?: string }>(
+        "/query", scope, { sql, tiers, histogram: false },
       );
       const rows: LogRow[] = raw.map((r) => ({
         ...r,
@@ -70,8 +71,13 @@ export function createApi(scope: Scope): Api {
       return {
         rows,
         stats: { ...(stats as Omit<QueryStats, "wire">), wire },
-        histogram: histogram as HistogramBucket[],
+        histogram: [],
       };
+    },
+    queryActivity({ sql, tiers }) {
+      return live
+        ? json<ActivityResult>("/query/activity", scope, { sql, tiers })
+        : mock.queryActivity();
     },
     estimate(tiers) {
       return live ? json<EstimateResult>("/query/estimate", scope, { tiers }) : mock.estimate(tiers);

@@ -102,6 +102,28 @@ round-trip). Any other `Accept` yields the JSON envelope above. The web UI negot
 column, so the Arrow wire delivers it as epoch-ms; the client normalizes it to the same ISO
 string the JSON wire sends.
 
+**Admission.** Queries run under a node-wide admission limit. Heavy queries
+queue for up to `query.admission_wait_ms`; if no slot frees they return **429**
+with `Retry-After: 1` and `queueDepth` in the body. Small planned scans
+can use a reserved lane. On larger scans, only a parsed single-table
+exact trace lookup with a bounded top-level limit and no histogram qualifies.
+A plan larger than `query.max_scan_gib` is refused **before
+execution** with **413** and the scan estimate attached (`scanBytes`, `scanGB`,
+`costUsd`, `maxScanGB`).
+
+### `POST /v1/query/activity`  *(read role)*
+Aggregation-only companion to `/v1/query`: returns the same severity histogram
+without running the row query. The Logs explorer loads rows first with
+`"histogram": false`, then requests this strip separately.
+
+Request: `{ "sql": "service:auth | last 1h", "tiers": ["hot","warm"] }`
+
+Response: `{ "histogram": [ { "total": 807, "errors": 331 }, … ],
+"stats": { "events": 807, "files": 3, "elapsedMs": 4, "engine": "datafusion" } }`
+
+It builds the same scan plan and selects the same files as the row query, so the
+chart and the estimate stay aligned.
+
 ### `POST /v1/query/estimate`  *(read role)*
 Pre-query scan-size + dollar estimate — powers the cold-scan confirm gate.
 
@@ -162,11 +184,12 @@ computed from the manifest + cost model; a few series that require subsystems no
 
 | Endpoint | Returns |
 |---|---|
-| `GET /v1/metrics` | `{ ingestRate[], errorRate[], p99[], volumeByService[], tiles{} }` — series time-bucketed from the data; `p99` is **modeled** (no latency field yet). |
+| `GET /v1/metrics` | `{ ingestRate[], errorRate[], p99[], volumeByService[], tiles{}, queryCache{}, audit{}, compaction{} }` — series time-bucketed from the data; `p99` is **modeled** (no latency field yet). `audit` exposes queue depth, saturation/failure/timeout counters and last wait. |
 | `GET /v1/storage/tiers` | `{ tiers[], lifecycle[], compaction{}, totalGB, totalPerMonth }` — real per-tier bytes/objects/cost + compaction generation. |
 | `GET /v1/cost?days=N` | `{ rangeDays, monthToDate, projected, lastMonth, breakdown[], spendSeries[], vsHosted{}, expensiveQueries[] }` — `days` (default 30, clamped to 1–3650) sets the projection horizon; `expensiveQueries` comes from the query-history audit doc; `spendSeries` is empty until [#33](https://github.com/explise/verdigris/issues/33). |
 | `GET /v1/pipelines` | `{ sources[], transforms[], throughput[], dropRate, ingestLag, parquetRolls }` — lag/rolls derived from the manifest. |
 | `GET /v1/settings` | `{ bucket, region, retentionDays, queryCompute, confirmColdScans, routing[] }` — from live config. |
+| `GET /metrics` | Prometheus text. `verdigris_alert_evaluations_total` counts rule outcomes (`completed`, `shed`, `failed`, `disabled`) in committed background passes. `verdigris_alert_evaluation_pass_failures_total` counts passes that stopped before committing. Alert creation has its own HTTP outcome. |
 | `GET /v1/alerts` | `[]` — no alerting engine yet. |
 
 ---

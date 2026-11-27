@@ -46,6 +46,9 @@ pub struct IndexedFile {
     pub bytes: u64,
     /// `None` = scan the whole file. `Some(mask)` = read only where `mask[i]`.
     pub row_groups: Option<Vec<bool>>,
+    /// The key proves the object is immutable (content-addressed). Only these
+    /// may use the process-wide schema/footer caches; legacy keys bypass them.
+    pub immutable: bool,
 }
 
 impl IndexedFile {
@@ -59,6 +62,7 @@ impl IndexedFile {
             path: file.path.clone(),
             bytes: file.bytes,
             row_groups: file.row_groups_to_scan(preds, file.row_groups as usize),
+            immutable: file.is_immutable_key(),
         }
     }
 
@@ -68,6 +72,7 @@ impl IndexedFile {
             path: file.path.clone(),
             bytes: file.bytes,
             row_groups: None,
+            immutable: file.is_immutable_key(),
         }
     }
 

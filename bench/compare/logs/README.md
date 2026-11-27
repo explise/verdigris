@@ -13,7 +13,10 @@ Useful knobs:
 
 ```sh
 ROWS=200000 ITERATIONS=5 SYSTEMS="vdg clickhouse" bench/compare/logs/run.sh
-VDG_SKIP_BUILD=1 bench/compare/logs/run.sh      # reuse a built verdigris-bench image
+VDG_SKIP_BUILD=1 VDG_IMAGE=verdigris-bench:<tag> bench/compare/logs/run.sh
+RESTART=1 bench/compare/logs/run.sh             # also restart once per first-query shape
+TOTAL_CPUS=4 bench/compare/logs/run.sh          # equal budget on a 4-vCPU host
+TOTAL_CPUS=4 ROWS=100000 VERIFY_ALL_ROW_IDS=1 bench/compare/logs/run.sh
 ```
 
 Results land in `bench/results/compare-logs/` (`<system>.json`,
@@ -26,7 +29,9 @@ exit.
   budget. Verdigris is charged for its object store: `vdg` gets 4 CPU / 3 GiB
   and MinIO gets 4 CPU / 3 GiB. ClickHouse and VictoriaLogs each get 8 CPU /
   6 GiB in one container. Running them sequentially avoids one system stealing
-  the other's CPU during measurement.
+  the other's CPU during measurement. Supply `TOTAL_CPUS=4` for a 4-vCPU
+  host. Verdigris and MinIO then get 2 CPUs each, and each competitor gets
+  4 CPUs. Report each CPU budget as its own cohort.
 - **Same corpus, generated from row index**, not ingested once and copied:
   1,000,000 events over a 50-minute window, ten services, ~5.9% `ERROR`,
   unique `trace_id` per row, log-like messages and attributes. Every system
@@ -39,80 +44,89 @@ exit.
 - **Merges/compaction settle before queries.** ClickHouse runs `OPTIMIZE TABLE
   … FINAL`; Verdigris runs its background compaction until `/v1/metrics`
   reports `pendingFiles == 0`; VictoriaLogs is given a fixed settle window.
-- **Equivalence is a gate, not a hope.** Before timing, each system must return
-  the same exact recent-match count, the same 200-row search page size, exactly
-  one row for the middle trace id, and the same total/error counts across the
-  same number of one-minute buckets. A mismatch exits nonzero.
-- **Latency** is one warm connection per backend, `WARMUP` warmups then
-  `ITERATIONS` measured requests; p50/p95/p99 use nearest-rank percentiles.
+- **Result validation.** Every warmup, timed query, and first query after a restart
+  is checked against the fixture. Search rows are checked in newest-first order.
+  Trace hits, misses, and cross-tier traces are checked for exact row values.
+  Every minute bucket is checked for timestamp, total, and error count in order.
+  The optional smoke gate also compares the full multiset of generated row
+  identities after timing. Row identity comes from the unique index in the log
+  message. Three fixture rows intentionally share a trace ID.
+- **Latency** is one warm connection per backend, with `WARMUP` warmups and
+  `ITERATIONS` measured requests. Validation runs outside the measured interval.
+  p50 is the median, with nearest rank for p95 and p99. The restart run makes a
+  fresh connection and restarts the engine separately for each of the five shapes.
 
 ## Query shapes
 
 | Shape | Verdigris | ClickHouse | VictoriaLogs |
 |---|---|---|---|
-| Recent service search | `service:checkout level:error \| last 1h` (the product DSL) | `WHERE service='checkout' AND level='ERROR' ORDER BY ts DESC LIMIT 200` | `service:checkout level:ERROR \| sort by (_time) desc \| limit 200` |
+| Recent service search | `WHERE service='checkout' AND level='ERROR' ORDER BY ts DESC LIMIT 200` | same predicate/order | `service:checkout level:ERROR \| sort by (_time) desc \| limit 200` |
 | Trace lookup | `trace_id:<id>` | `WHERE trace_id='<id>'` | `trace_id:="<id>"` |
-| Minute aggregation | `date_bin(INTERVAL '60 seconds', …)` + `count(*) FILTER` | `toStartOfInterval(ts, INTERVAL 60 SECOND)` + `countIf` | `stats by (_time:1m) count() total, count() if (level:ERROR) errors` |
+| Minute aggregation | `date_bin(INTERVAL '60 seconds', …)` + `count(*) FILTER` | `toStartOfInterval(ts, INTERVAL 60 SECOND)` + `countIf` | `stats by (_time:1m) count() total, count() if (level:ERROR) errors \| sort by (_time)` |
 
-The Verdigris search uses its search DSL rather than raw SQL because that is the
-path the Logs explorer uses (and the path that applies file-level
-`service`/`level` pruning). The aggregation is SQL on all three because the DSL
-does not express it.
+All three search queries use the same predicate and newest-first order. Verdigris
+uses SQL for this comparison so a relative `last 1h` cannot drift between
+separately started engine processes; VictoriaLogs uses LogsQL for aggregation.
 
 The trace workload rotates through a fixed set of real IDs spread across the
 corpus, and also checks a missing ID and one ID deliberately written to a row in
-each tier. Verdigris additionally checks each tier independently. Raw per-request
-timings and the shared metadata-cache hit delta are recorded in the JSON for
-issue #70; see [`bench/results/issue70/`](../../results/issue70/README.md).
+each tier. Verdigris additionally checks each tier independently. Rows carry the
+same `attrs_json` values on all three systems, and every one-minute bucket's
+total/error counts are validated against the generator (not just the sums).
+Raw per-request timings and the shared metadata-cache hit delta are recorded in
+the JSON. See [`bench/results/issue63/`](../../results/issue63/README.md) for the
+normalized three-engine run and [`bench/results/issue70/`](../../results/issue70/README.md)
+for the trace-latency work.
 
-## Measured 2026-11-26
+## Results on the four-CPU reference host
 
-Host: 16 vCPU / 14 GiB, Docker 29.9; one system at a time. 1,000,000 events,
-249.2 MiB Verdigris wire bytes (208 MiB for the flat ClickHouse/VictoriaLogs
-wire encoding), 50 one-minute buckets. Full machine/config record is written to
-`bench/results/compare-logs/machine.txt`.
+Each range below is p95 across three fresh 1M-row deployments. Each deployment
+ran 100 warm samples per shape and validated the full query results. Verdigris
+ran with durable audit and disk-backed MinIO inside the same total CPU and RAM
+budget as each competitor.
 
-| System | Retained after settle | Memory after queries | Ingest acked | Visible after |
-|---|---:|---:|---:|---:|
-| **Verdigris + MinIO** | 165.0 MiB | 375 MiB | 317k rows/s (79 MiB/s) | 0.1 s |
-| **ClickHouse** | 95.2 MiB | 231 MiB | 210k rows/s (44 MiB/s) | 0.0 s |
-| **VictoriaLogs** | 18.7 MiB | 237 MiB | 945k rows/s (197 MiB/s) | 2.0 s |
+| Warm p95 (ms) | Verdigris + MinIO | ClickHouse | VictoriaLogs |
+| --- | ---: | ---: | ---: |
+| Exact trace hit | 17.27–18.65 | 5.84–6.00 | 1.83–3.21 |
+| Exact trace miss | 4.27–4.44 | 1.61–1.65 | 0.63–0.66 |
+| Cross-tier trace | 24.48–26.26 | 3.81–3.88 | 1.25–3.13 |
+| Recent service search | 17.89–18.67 | 3.78–3.85 | 7.56–16.01 |
+| Raw minute aggregation | 37.84–38.10 | 8.55–8.81 | 10.63–15.45 |
 
-Query latency, p50 / p95 (ms), 10 samples after warmup:
+Verdigris met its 1M warm targets for trace hit, trace miss and recent search.
+Both reference engines were faster on every measured shape. The separate 20M
+Verdigris sizing run met the warm trace-hit and trace-miss targets and missed
+cross-tier trace, recent search and raw aggregation. These measurements use a
+local S3-compatible store and a specific synthetic corpus. [Raw three-engine
+baseline](../../results/issue63/four-cpu/README.md) · [20M sizing
+run](../../results/issue83/four-cpu/README.md)
 
-| System | Service search | Trace lookup | 1-minute aggregation |
-|---|---:|---:|---:|
-| **Verdigris + MinIO** | 36.4 / 38.8 | 31.6 / 32.8 | 38.1 / 39.6 |
-| **ClickHouse** | 4.1 / 5.3 | 2.3 / 3.1 | 6.8 / 7.5 |
-| **VictoriaLogs** | 4.6 / 5.0 | 0.7 / 0.7 | 6.2 / 7.3 |
+The [earlier eight-CPU cohort](../../results/issue63/README.md) used a different
+host and budget. Its values are retained as a separate reference.
 
-All three returned the same `5,883` recent matches, the same 200-row page, one
-row for the trace id, and the same `1,000,000 / 58,824` total/error split across
-50 buckets.
+## Matched 20M comparison
 
-What the Verdigris numbers are actually measuring: half of its 8-CPU budget is
-the MinIO object store, so query execution gets 4 cores, and every scanned file
-crosses an HTTP object-store boundary instead of a local page cache. The
-30–40 ms band is the same for all three shapes, which points at fixed per-query
-planning/object-store overhead rather than bytes scanned. ClickHouse and
-VictoriaLogs read local files with all 8 cores. This is the architectural trade the product makes for data sovereignty
-and no rehydration, and the comparison should be read that way — not as a
-like-for-like CPU benchmark of three identical storage models.
+Each range is p95 across three fresh deployments per engine, with a
+different engine order on each runner. Every warm sample and first
+query after a restart passed the result checks.
 
-Ingest rates are also not comparable across acknowledgement policies:
-Verdigris acknowledges after the Parquet PUT and manifest CAS commit;
-VictoriaLogs acknowledged the same corpus ~2 s before it became fully queryable.
-The visibility column exists so that difference stays visible.
+| Warm p95 (ms) | Verdigris + MinIO | ClickHouse | VictoriaLogs |
+| --- | ---: | ---: | ---: |
+| Exact trace hit | 18.68–26.79 | 119.06–199.66 | 4.61–7.22 |
+| Exact trace miss | 4.48–7.72 | 1.95–2.63 | 3.85–5.74 |
+| Cross-tier trace | 28.62–36.19 | 6.11–8.64 | 5.57–7.77 |
+| Recent service search | 104.47–133.38 | 3.99–6.90 | 30.73–39.96 |
+| Raw minute aggregation | 388.72–485.53 | 166.00–233.60 | 142.76–228.41 |
 
-## What this does and does not prove
+The exact-hit schedule rotates through 16 IDs and warms ten before timing.
+In both chronological replications, ClickHouse's first six measured
+requests were the only samples above 100 ms. They were the first visits
+to the six IDs outside the warmup. The remaining 94 repeat-ID requests
+had 3.87 and 5.07 ms p95. Verdigris completed all 1,650 expected warm
+audit acknowledgements across the three trials.
 
-It proves relative query latency for three common log-and-archive shapes on one
-host, with the corpus and result cardinalities held constant. It does **not**
-prove performance at billion-row scale, across cold S3/Glacier tiers, or under
-concurrent query load. All three deployments use local disk; Verdigris's bytes
-go through MinIO's S3 API, which is slow relative to real S3 but is charged to
-its budget as the production deployment would be.
-
-The retained-bytes column is the on-disk footprint after settling, not S3
-storage-class charges. A cold-storage comparison needs a lifecycle/restore run
-(see `docs/cost.md`), not this harness.
+Verdigris's biggest remaining gaps are recent search and raw minute
+aggregation. The exact-hit p95 and cross-tier trace still miss their
+20M targets in repeated runs. The short ingest, first-query and retained
+storage measurements are reported separately.
+[Raw samples and method](../../results/issue63/matched-20m/README.md)

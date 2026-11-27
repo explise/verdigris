@@ -1,0 +1,14 @@
+{
+  "system": "vdg",
+  "image": "verdigris-bench:perf81-cfe5146",
+  "image_id": "sha256:861a0f0974ea6fab517059789880a038186be777099fb2b3c68bc380575e4ce2",
+  "cpu_limit": 8,
+  "memory_limit": "vdg 3g + minio 3g",
+  "retained_bytes": 19681706,
+  "container_memory": "vdgbench-20261127070459-228124-vdg=118.1MiB / 3GiB,vdgbench-20261127070459-228124-minio=294.8MiB / 3GiB",
+  "minio_bucket_bytes": 19669428,
+  "minio_internal_bytes": 12132,
+  "active_files": 3,
+  "retired_files": 0,
+  "total_gb": 0.01807788386940956
+}

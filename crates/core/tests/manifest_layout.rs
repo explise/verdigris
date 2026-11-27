@@ -24,3 +24,13 @@ fn ingest_parts_are_distinguishable_from_compaction_output() {
     assert!(file("logs/hot/part-deadbeef.parquet").is_ingest_part());
     assert!(!file("logs/hot/c3-00000-deadbeef.parquet").is_ingest_part());
 }
+
+#[test]
+fn only_content_addressed_keys_prove_immutability() {
+    assert!(file("logs/hot/part-0123456789abcdef.parquet").is_immutable_key());
+    assert!(file("logs/hot/c3-00007-0123456789abcdef.parquet").is_immutable_key());
+    // Legacy generation/counter keys can be replaced at the same path and size.
+    assert!(!file("logs/hot/part-00001.parquet").is_immutable_key());
+    assert!(!file("logs/hot/c3-00007.parquet").is_immutable_key());
+    assert!(!file("logs/hot/c3-00007-nothex-at-all.parquet").is_immutable_key());
+}

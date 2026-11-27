@@ -23,7 +23,7 @@ use std::time::Duration;
 use anyhow::Context;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Query, Request, State};
-use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -102,6 +102,15 @@ struct AppState {
     alerts_lock: Arc<tokio::sync::Mutex<()>>,
     /// Monotonic suffix for generated alert ids within this process.
     alert_seq: Arc<AtomicU64>,
+    /// Replica-unique prefix for audit ids. Two containers must never mint the
+    /// same record id, or the writer's idempotent dedupe would drop one.
+    audit_replica: Arc<str>,
+    /// Monotonic suffix for generated audit-record ids within this process.
+    audit_seq: Arc<AtomicU64>,
+    /// Durable audit writer state and counters.
+    audit: Arc<AuditMetrics>,
+    /// Node-local query admission (issue #29).
+    admission: Arc<Admission>,
     /// Backpressure: caps concurrent in-flight ingest requests so a flood sheds
     /// (429) instead of piling parsed bodies up in memory.
     ingest_sem: Arc<tokio::sync::Semaphore>,
@@ -132,10 +141,11 @@ struct AppState {
     /// Shared, bounded Parquet metadata + schema cache. Scoped to this store and
     /// table; per-query execution memory remains isolated in the engine.
     query_cache: Arc<QueryCache>,
-    /// Audit records are persisted by one background worker. A query must not
-    /// wait on a read-modify-write of the audit doc before returning rows; the
-    /// in-memory history is updated synchronously and this queue is best-effort.
-    audit_tx: tokio::sync::mpsc::Sender<QueryRecord>,
+    /// Audit records are persisted by one background writer. Handlers enqueue a
+    /// job and wait (bounded) for its acknowledgement, so a healthy store makes
+    /// the record durable before the response is released. The queue bounds
+    /// memory; a full queue falls back to a direct append.
+    audit_tx: tokio::sync::mpsc::Sender<AuditJob>,
 }
 
 /// Counters for background auto-compaction. The live "pending files" figure is
@@ -169,6 +179,11 @@ struct Identity(String);
 /// One recorded query kept in the audit ring and the persisted audit doc.
 #[derive(Clone, Serialize, Deserialize)]
 struct QueryRecord {
+    /// Unique record id. Used to make retried/batched audit appends idempotent
+    /// across CAS conflicts and replica handoffs. Empty on records written before
+    /// ids existed; those are never deduplicated (and are never rewritten).
+    #[serde(default)]
+    id: String,
     ts_millis: i64,
     user: String,
     sql: String,
@@ -178,13 +193,171 @@ struct QueryRecord {
     tier: String,
 }
 
+/// Observability for the durable audit writer.
+#[derive(Default)]
+struct AuditMetrics {
+    /// Records waiting for the worker (approximate under concurrency).
+    queued: AtomicU64,
+    /// Enqueues that found the bounded queue full.
+    saturated: AtomicU64,
+    /// Batches that could not be persisted after retries.
+    failed: AtomicU64,
+    /// Handler waits that exceeded the acknowledgement deadline (the record may
+    /// still land later; the response was already released fail-open).
+    timed_out: AtomicU64,
+    /// Records persisted and acknowledged.
+    acked: AtomicU64,
+    /// Last handler wait, microseconds.
+    last_wait_us: AtomicU64,
+}
+
+/// One queued record plus the channel used to tell the handler when it is durable.
+struct AuditJob {
+    rec: QueryRecord,
+    ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
+/// Counters for query admission (issue #29).
+#[derive(Default)]
+struct AdmissionMetrics {
+    admitted: AtomicU64,
+    cheap: AtomicU64,
+    queued: AtomicU64,
+    shed: AtomicU64,
+    /// Last wait for a heavy permit, microseconds.
+    last_wait_us: AtomicU64,
+}
+
+/// Node-local query admission. Heavy queries share `heavy`; one permit is
+/// reserved for cheap (small LIMIT / small scan) traffic so a dashboard query
+/// cannot starve behind full-scan aggregates.
+struct Admission {
+    heavy: Arc<tokio::sync::Semaphore>,
+    /// Empty when `max == 1`: the single permit is shared, not duplicated.
+    cheap: Arc<tokio::sync::Semaphore>,
+    cheap_lane: bool,
+    max: usize,
+    clock: Arc<dyn Clock>,
+    metrics: AdmissionMetrics,
+}
+
+#[derive(Debug)]
+struct AdmissionPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Queue-depth accounting that is released even when the waiting request is
+/// cancelled. A plain fetch_sub after `timeout` leaks the gauge on cancellation.
+struct QueueDepthGuard<'a> {
+    metrics: &'a AdmissionMetrics,
+}
+
+impl Drop for QueueDepthGuard<'_> {
+    fn drop(&mut self) {
+        self.metrics.queued.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Admission {
+    fn new(max_concurrent: usize, clock: Arc<dyn Clock>) -> Self {
+        let max = max_concurrent.max(1);
+        // One slot is reserved for cheap traffic only when there is more than
+        // one slot. At max=1 there is exactly one permit in total; cheap and
+        // heavy share it rather than creating a second, over-budget permit.
+        let cheap_lane = max > 1;
+        let heavy = max.saturating_sub(1).max(1);
+        Self {
+            heavy: Arc::new(tokio::sync::Semaphore::new(heavy)),
+            cheap: Arc::new(tokio::sync::Semaphore::new(if cheap_lane { 1 } else { 0 })),
+            cheap_lane,
+            max,
+            clock,
+            metrics: AdmissionMetrics::default(),
+        }
+    }
+
+    fn depth(&self) -> usize {
+        self.max
+            .saturating_sub(self.heavy.available_permits() + self.cheap.available_permits())
+    }
+
+    async fn admit(&self, cheap: bool, wait: Duration) -> Result<AdmissionPermit, usize> {
+        let started = self.clock.monotonic_micros();
+        if cheap {
+            if self.cheap_lane {
+                if let Ok(permit) = self.cheap.clone().try_acquire_owned() {
+                    self.metrics.cheap.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
+                    return Ok(AdmissionPermit { _permit: permit });
+                }
+            }
+            if let Ok(permit) = self.heavy.clone().try_acquire_owned() {
+                self.metrics.cheap.fetch_add(1, Ordering::Relaxed);
+                self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
+                return Ok(AdmissionPermit { _permit: permit });
+            }
+        }
+
+        // Cheap traffic queues on its reserved lane when one exists; with
+        // max=1 it shares the heavy queue rather than inventing a permit.
+        let use_cheap_lane = cheap && self.cheap_lane;
+        let queue = if use_cheap_lane {
+            self.cheap.clone()
+        } else {
+            self.heavy.clone()
+        };
+        let queue_wait = if use_cheap_lane {
+            CHEAP_LANE_WAIT.max(wait)
+        } else {
+            wait
+        };
+        let _queued = QueueDepthGuard {
+            metrics: &self.metrics,
+        };
+        self.metrics.queued.fetch_add(1, Ordering::Relaxed);
+        let acquired = tokio::time::timeout(queue_wait, queue.acquire_owned()).await;
+        self.metrics.last_wait_us.store(
+            self.clock.monotonic_micros().saturating_sub(started),
+            Ordering::Relaxed,
+        );
+        match acquired {
+            Ok(Ok(permit)) => {
+                self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
+                if cheap {
+                    self.metrics.cheap.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(AdmissionPermit { _permit: permit })
+            }
+            _ => {
+                self.metrics.shed.fetch_add(1, Ordering::Relaxed);
+                Err(self.depth())
+            }
+        }
+    }
+}
+
 const QUERY_HISTORY_CAP: usize = 500;
+
+/// Bounded audit queue. A full queue triggers a short wait, then a direct
+/// append fallback rather than dropping the record.
+const AUDIT_QUEUE_CAPACITY: usize = 1024;
+/// Max records coalesced into one conditional append.
+const AUDIT_BATCH_MAX: usize = 64;
+/// One end-to-end fail-open deadline for enqueue, acknowledgement, and the
+/// direct-append fallback. Generous relative to a healthy local PUT, short
+/// enough that a sick store cannot hold a query.
+const AUDIT_DEADLINE: Duration = Duration::from_millis(250);
+/// Cheap queries queue on their reserved lane for up to this long. Keeps a
+/// dashboard LIMIT query from being shed just because two arrived at once.
+const CHEAP_LANE_WAIT: Duration = Duration::from_secs(1);
+/// How long shutdown may spend draining queued audit records.
+const AUDIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The persisted audit trail: `{table}/_audit/query-history.json`, oldest first,
 /// trimmed to [`QUERY_HISTORY_CAP`]. Appended under optimistic CAS (same
 /// discipline as the manifest) so concurrent reader replicas don't clobber each
 /// other's records.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct AuditDoc {
     queries: Vec<QueryRecord>,
 }
@@ -219,7 +392,9 @@ async fn load_audit(s: &Store, table: &str) -> anyhow::Result<(AuditDoc, Option<
 async fn append_audit(s: &Store, table: &str, rec: QueryRecord) -> anyhow::Result<()> {
     for _ in 0..4 {
         let (mut doc, version) = load_audit(s, table).await?;
-        doc.queries.push(rec.clone());
+        if rec.id.is_empty() || !doc.queries.iter().any(|r| r.id == rec.id) {
+            doc.queries.push(rec.clone());
+        }
         if doc.queries.len() > QUERY_HISTORY_CAP {
             let excess = doc.queries.len() - QUERY_HISTORY_CAP;
             doc.queries.drain(..excess);
@@ -255,6 +430,260 @@ async fn append_audit(s: &Store, table: &str, rec: QueryRecord) -> anyhow::Resul
     anyhow::bail!("audit append failed after retries under contention")
 }
 
+/// In-process view of the audit doc, so a healthy append is one conditional PUT
+/// instead of a GET + PUT. A CAS conflict discards it and reloads.
+struct AuditCache {
+    doc: AuditDoc,
+    version: Option<UpdateVersion>,
+    /// Store does not implement conditional puts; use last-write-wins.
+    no_cas: bool,
+}
+
+/// Append records, de-duplicating by record id. Ids are unique per process and
+/// monotonic; empty ids are legacy records and are never matched against.
+fn append_records_to_doc(doc: &mut AuditDoc, records: Vec<QueryRecord>) {
+    let known: std::collections::HashSet<String> = doc
+        .queries
+        .iter()
+        .filter(|r| !r.id.is_empty())
+        .map(|r| r.id.clone())
+        .collect();
+    for rec in records {
+        if rec.id.is_empty() || !known.contains(&rec.id) {
+            doc.queries.push(rec);
+        }
+    }
+    if doc.queries.len() > QUERY_HISTORY_CAP {
+        let excess = doc.queries.len() - QUERY_HISTORY_CAP;
+        doc.queries.drain(..excess);
+    }
+}
+
+async fn commit_audit_batch(
+    s: &Store,
+    table: &str,
+    cache: &mut Option<AuditCache>,
+    records: Vec<QueryRecord>,
+) -> anyhow::Result<()> {
+    for attempt in 0..8 {
+        if cache.is_none() {
+            let (doc, version) = load_audit(s, table).await?;
+            *cache = Some(AuditCache {
+                doc,
+                version,
+                no_cas: false,
+            });
+        }
+        let entry = cache.as_mut().expect("just loaded");
+        let mut doc = entry.doc.clone();
+        append_records_to_doc(&mut doc, records.clone());
+        let bytes = serde_json::to_vec(&doc).context("serializing audit doc")?;
+        if entry.no_cas {
+            s.put(&audit_path(table), bytes.into())
+                .await
+                .context("writing audit doc (no-CAS fallback)")?;
+            entry.doc = doc;
+            return Ok(());
+        }
+        let mode = match &entry.version {
+            Some(v) => PutMode::Update(v.clone()),
+            None => PutMode::Create,
+        };
+        match s
+            .put_opts(
+                &audit_path(table),
+                bytes.clone().into(),
+                PutOptions {
+                    mode,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(res) => {
+                entry.doc = doc;
+                entry.version = match (res.e_tag, res.version) {
+                    (None, None) => {
+                        // No usable version token: degrade this cache entry to a
+                        // plain put rather than looping on Create.
+                        entry.no_cas = true;
+                        None
+                    }
+                    (e_tag, version) => Some(UpdateVersion { e_tag, version }),
+                };
+                return Ok(());
+            }
+            Err(object_store::Error::Precondition { .. })
+            | Err(object_store::Error::AlreadyExists { .. }) => {
+                *cache = None; // stale; reload and retry
+            }
+            Err(object_store::Error::NotImplemented { .. }) => {
+                entry.no_cas = true;
+                s.put(&audit_path(table), bytes.into())
+                    .await
+                    .context("writing audit doc (no-CAS fallback)")?;
+                entry.doc = doc;
+                entry.version = None;
+                return Ok(());
+            }
+            Err(e) => {
+                // A transient store error is not a conflict: retry the same
+                // cached doc a few times before releasing the handler fail-open.
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+                    continue;
+                }
+                return Err(e).context("committing audit doc");
+            }
+        }
+    }
+    anyhow::bail!("audit append failed after retries under contention")
+}
+
+/// One durable-audit worker. It coalesces whatever is already queued into one
+/// conditional append, then acknowledges every record in that batch. A failed
+/// batch is reported to its waiters and counted; the query itself stays
+/// fail-open.
+async fn audit_worker(
+    s: Store,
+    table: String,
+    mut rx: tokio::sync::mpsc::Receiver<AuditJob>,
+    metrics: Arc<AuditMetrics>,
+) {
+    let mut cache: Option<AuditCache> = None;
+    while let Some(first) = rx.recv().await {
+        let mut batch = vec![first];
+        while batch.len() < AUDIT_BATCH_MAX {
+            match rx.try_recv() {
+                Ok(job) => batch.push(job),
+                Err(_) => break,
+            }
+        }
+        let records: Vec<QueryRecord> = batch.iter().map(|j| j.rec.clone()).collect();
+        let result = commit_audit_batch(&s, &table, &mut cache, records)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        match &result {
+            Ok(()) => {
+                metrics
+                    .acked
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+            }
+            Err(_) => {
+                metrics.failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        for job in batch {
+            let _ = metrics
+                .queued
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(1))
+                });
+            let _ = job.ack.send(result.clone());
+        }
+    }
+}
+
+/// Enqueue one audit record and wait for durability under one end-to-end
+/// deadline. A full queue gets whatever budget remains, then a direct append.
+/// Any failure/timeout is counted and the query proceeds fail-open.
+async fn persist_audit(st: &AppState, rec: QueryRecord) {
+    persist_audit_with(st, rec, AUDIT_DEADLINE).await
+}
+
+/// Remaining time against an absolute monotonic deadline.
+fn remaining_us(deadline_us: u64, now_us: u64) -> Option<Duration> {
+    (deadline_us > now_us).then(|| Duration::from_micros(deadline_us - now_us))
+}
+
+async fn persist_audit_with(st: &AppState, rec: QueryRecord, deadline: Duration) {
+    let started = st.clock.monotonic_micros();
+    let deadline_us = started.saturating_add(deadline.as_micros() as u64);
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    let job = AuditJob {
+        rec: rec.clone(),
+        ack: ack_tx,
+    };
+    st.audit.queued.fetch_add(1, Ordering::Relaxed);
+
+    let queued = match st.audit_tx.try_send(job) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
+            st.audit.saturated.fetch_add(1, Ordering::Relaxed);
+            match remaining_us(deadline_us, st.clock.monotonic_micros()) {
+                Some(left) => matches!(
+                    tokio::time::timeout(left, st.audit_tx.send(job)).await,
+                    Ok(Ok(()))
+                ),
+                None => false,
+            }
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+    };
+
+    if queued {
+        match remaining_us(deadline_us, st.clock.monotonic_micros()) {
+            Some(left) => match tokio::time::timeout(left, ack_rx).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => {
+                    tracing::warn!(error = %e, "audit persistence failed; query remains fail-open");
+                }
+                Ok(Err(_)) => {
+                    st.audit.failed.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!("audit worker dropped an acknowledgement");
+                }
+                Err(_) => {
+                    st.audit.timed_out.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!("audit acknowledgement timed out; query remains fail-open");
+                }
+            },
+            None => {
+                st.audit.timed_out.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    } else {
+        st.audit.queued.fetch_sub(1, Ordering::Relaxed);
+        // Saturated or worker gone: do the CAS append ourselves, still inside
+        // the same request deadline. A stalled append cannot outlive it.
+        match remaining_us(deadline_us, st.clock.monotonic_micros()) {
+            Some(left) => {
+                match tokio::time::timeout(left, append_audit(&st.store, st.table.as_str(), rec))
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        st.audit.failed.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(error = %e, "direct audit append failed; query remains fail-open");
+                    }
+                    Err(_) => {
+                        st.audit.timed_out.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            "direct audit append deadline exceeded; query remains fail-open"
+                        );
+                    }
+                }
+            }
+            None => {
+                st.audit.timed_out.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    st.audit.last_wait_us.store(
+        st.clock.monotonic_micros().saturating_sub(started),
+        Ordering::Relaxed,
+    );
+}
+
+/// The replica prefix makes ids unique even when two replicas observe the same
+/// clock reading and both local counters start at zero.
+fn next_audit_id(st: &AppState) -> String {
+    format!(
+        "{}-{}",
+        st.audit_replica,
+        st.audit_seq.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// Minimal, dependency-free Prometheus metrics for the service: request counts by
 /// status class and a real request-latency histogram. Recorded by the
 /// `track_metrics` middleware, rendered at `GET /metrics`.
@@ -269,6 +698,11 @@ struct HttpMetrics {
     /// Domain counters.
     ingest_records: AtomicU64,
     queries: AtomicU64,
+    alert_completed: AtomicU64,
+    alert_shed: AtomicU64,
+    alert_failed: AtomicU64,
+    alert_disabled: AtomicU64,
+    alert_pass_failed: AtomicU64,
 }
 
 /// Upper bounds (ms) for the latency histogram; a trailing +Inf bucket is implied.
@@ -285,6 +719,11 @@ impl HttpMetrics {
             latency_count: AtomicU64::new(0),
             ingest_records: AtomicU64::new(0),
             queries: AtomicU64::new(0),
+            alert_completed: AtomicU64::new(0),
+            alert_shed: AtomicU64::new(0),
+            alert_failed: AtomicU64::new(0),
+            alert_disabled: AtomicU64::new(0),
+            alert_pass_failed: AtomicU64::new(0),
         }
     }
 
@@ -349,6 +788,25 @@ impl HttpMetrics {
         out.push_str("# HELP verdigris_queries_total Queries executed.\n");
         out.push_str("# TYPE verdigris_queries_total counter\n");
         out.push_str(&format!("verdigris_queries_total {}\n", g(&self.queries)));
+        out.push_str("# HELP verdigris_alert_evaluations_total Rules by outcome in committed background passes.\n");
+        out.push_str("# TYPE verdigris_alert_evaluations_total counter\n");
+        for (outcome, counter) in [
+            ("completed", &self.alert_completed),
+            ("shed", &self.alert_shed),
+            ("failed", &self.alert_failed),
+            ("disabled", &self.alert_disabled),
+        ] {
+            out.push_str(&format!(
+                "verdigris_alert_evaluations_total{{outcome=\"{outcome}\"}} {}\n",
+                g(counter)
+            ));
+        }
+        out.push_str("# HELP verdigris_alert_evaluation_pass_failures_total Uncommitted background evaluation passes.\n");
+        out.push_str("# TYPE verdigris_alert_evaluation_pass_failures_total counter\n");
+        out.push_str(&format!(
+            "verdigris_alert_evaluation_pass_failures_total {}\n",
+            g(&self.alert_pass_failed)
+        ));
         out
     }
 }
@@ -395,6 +853,8 @@ async fn h_prometheus(State(st): State<AppState>) -> Response {
 struct AppError {
     status: StatusCode,
     message: String,
+    retry_after_s: Option<u64>,
+    extra: Option<Value>,
 }
 
 impl AppError {
@@ -402,6 +862,8 @@ impl AppError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: e.to_string(),
+            retry_after_s: None,
+            extra: None,
         }
     }
 
@@ -409,6 +871,40 @@ impl AppError {
         Self {
             status,
             message: e.to_string(),
+            retry_after_s: None,
+            extra: None,
+        }
+    }
+
+    /// Admission shed: 429 with the current queue depth and a retry hint.
+    fn overloaded(depth: usize, retry_after_s: u64) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: format!(
+                "query admission queue is full (depth {depth}); retry in {retry_after_s}s"
+            ),
+            retry_after_s: Some(retry_after_s),
+            extra: Some(json!({ "queueDepth": depth })),
+        }
+    }
+
+    /// Cost/admission gate: the scan is larger than the configured budget.
+    fn scan_over_budget(estimate: &verdigris_core::estimate::QueryEstimate, max_gib: f64) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: format!(
+                "query would scan {:.2} GiB, over the {:.2} GiB admission budget",
+                estimate.scan_gib, max_gib
+            ),
+            retry_after_s: None,
+            extra: Some(json!({
+                "scanBytes": estimate.scan_bytes,
+                "scanGB": estimate.scan_gib,
+                "costUsd": estimate.cost_usd,
+                "filesTouched": estimate.files_touched,
+                "filesTotal": estimate.files_total,
+                "maxScanGB": max_gib
+            })),
         }
     }
 
@@ -428,7 +924,20 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        let mut body = json!({ "error": self.message });
+        if let (Some(extra), Some(obj)) = (self.extra, body.as_object_mut()) {
+            if let Some(extra) = extra.as_object() {
+                for (k, v) in extra {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let mut res = (self.status, Json(body)).into_response();
+        if let Some(secs) = self.retry_after_s {
+            res.headers_mut()
+                .insert(RETRY_AFTER, secs.to_string().parse().expect("header value"));
+        }
+        res
     }
 }
 
@@ -437,6 +946,8 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: e.into().to_string(),
+            retry_after_s: None,
+            extra: None,
         }
     }
 }
@@ -451,6 +962,75 @@ fn limits(st: &AppState) -> QueryLimits {
 
 fn store(st: &AppState) -> anyhow::Result<Store> {
     Ok(st.store.clone())
+}
+
+/// Apply the cost gate and acquire a node admission permit. The permit is held
+/// for the whole request (rows and any optional histogram), then released on
+/// drop. Cheap traffic gets the reserved lane.
+async fn admit_scan_with(
+    admission: &Admission,
+    cfg: &verdigris_core::config::QueryConfig,
+    scan_bytes: u64,
+    cheap: bool,
+    wait: Duration,
+) -> Result<AdmissionPermit, AppError> {
+    let max_scan_gib = cfg.max_scan_gib;
+    if max_scan_gib > 0.0 {
+        let max_bytes = (max_scan_gib * cost::GIB) as u64;
+        if scan_bytes > max_bytes {
+            let throughput = cfg.modeled_mibps_per_core * cfg.cores as f64 * 1024.0 * 1024.0;
+            let est = verdigris_core::estimate::QueryEstimate {
+                scan_bytes,
+                scan_gib: scan_bytes as f64 / cost::GIB,
+                cost_usd: 0.0,
+                restore_ms: 0,
+                scan_ms: (scan_bytes as f64 / throughput * 1000.0) as u64,
+                cold_restore: false,
+                files_touched: 0,
+                files_total: 0,
+                per_tier: Vec::new(),
+            };
+            return Err(AppError::scan_over_budget(&est, max_scan_gib));
+        }
+    }
+    admission
+        .admit(cheap, wait)
+        .await
+        .map_err(|depth| AppError::overloaded(depth, 1))
+}
+
+async fn admit_query(
+    st: &AppState,
+    plan: &verdigris_core::scan::ScanPlan<'_>,
+    allow_point_lookup: bool,
+) -> Result<AdmissionPermit, AppError> {
+    let scan_bytes = plan.scanned_bytes();
+    let max_scan_gib = st.cfg.query.max_scan_gib;
+    if max_scan_gib > 0.0 {
+        let max_bytes = (max_scan_gib * cost::GIB) as u64;
+        if scan_bytes > max_bytes {
+            let throughput =
+                st.cfg.query.modeled_mibps_per_core * st.cfg.query.cores as f64 * 1024.0 * 1024.0;
+            let est =
+                verdigris_core::estimate::estimate_plan(plan, throughput, RetrievalMode::Standard);
+            return Err(AppError::scan_over_budget(&est, max_scan_gib));
+        }
+    }
+    let cheap = verdigris_query::admission::is_cheap_query(
+        &plan.sql,
+        st.table.as_str(),
+        scan_bytes,
+        &st.cfg.query,
+        allow_point_lookup,
+    );
+    admit_scan_with(
+        &st.admission,
+        &st.cfg.query,
+        scan_bytes,
+        cheap,
+        Duration::from_millis(st.cfg.query.admission_wait_ms),
+    )
+    .await
 }
 
 async fn manifest(st: &AppState) -> anyhow::Result<(Store, Manifest)> {
@@ -557,9 +1137,15 @@ async fn measure(
     files: &[IndexedFile],
     sql: &str,
     limits: &QueryLimits,
-) -> anyhow::Result<f64> {
-    let rows =
-        verdigris_query::engine::query_table_json(s.clone(), table, files, sql, limits).await?;
+    admission: &Admission,
+    cfg: &verdigris_core::config::QueryConfig,
+) -> Result<f64, AppError> {
+    let scan_bytes: u64 = files.iter().map(|f| f.bytes).sum();
+    let _permit =
+        admit_scan_with(admission, cfg, scan_bytes, false, Duration::from_millis(50)).await?;
+    let rows = verdigris_query::engine::query_table_json(s.clone(), table, files, sql, limits)
+        .await
+        .map_err(AppError::from_query)?;
     let Some(Value::Object(row)) = rows.into_iter().next() else {
         return Ok(0.0);
     };
@@ -574,19 +1160,33 @@ async fn measure(
     Ok(0.0)
 }
 
+struct AlertEvaluator {
+    store: Store,
+    table: Arc<String>,
+    alerts_lock: Arc<tokio::sync::Mutex<()>>,
+    limits: QueryLimits,
+    clock: Arc<dyn Clock>,
+    admission: Arc<Admission>,
+    query: verdigris_core::config::QueryConfig,
+    metrics: Arc<HttpMetrics>,
+}
+
+async fn evaluate_all(st: &AlertEvaluator) {
+    if let Err(e) = evaluate_alert_pass(st).await {
+        st.metrics.alert_pass_failed.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(error = %e, "alert scheduler pass failed");
+    }
+}
+
 /// One evaluation pass over every enabled rule: measure, advance state, persist
 /// under CAS, and only then fire webhooks — a notification goes out only for a
 /// transition that was actually committed, so a save conflict can't double-fire.
-/// `lock` serializes this against concurrent create/delete within the process;
+/// The alert lock serializes this against concurrent create/delete within the process;
 /// the CAS covers other replicas.
-async fn evaluate_all(
-    s: &Store,
-    table: &str,
-    lock: &tokio::sync::Mutex<()>,
-    limits: &QueryLimits,
-    clock: &Arc<dyn Clock>,
-) -> anyhow::Result<()> {
-    let _g = lock.lock().await;
+async fn evaluate_alert_pass(st: &AlertEvaluator) -> anyhow::Result<()> {
+    let s = &st.store;
+    let table = st.table.as_str();
+    let _g = st.alerts_lock.lock().await;
     for _ in 0..ALERTS_CAS_RETRIES {
         let (mut doc, base) = load_alerts_versioned(s, table).await?;
         if doc.alerts.is_empty() {
@@ -596,22 +1196,40 @@ async fn evaluate_all(
             .load_manifest()
             .await?;
         let files: Vec<IndexedFile> = m.files.iter().map(IndexedFile::whole).collect();
-        let now = clock.now_millis();
+        let now = st.clock.now_millis();
+        let (mut completed, mut shed, mut failed, mut disabled) = (0, 0, 0, 0);
         // Webhooks for this pass, held until the state they announce is committed.
         let mut notifications: Vec<(String, Value)> = Vec::new();
         for a in doc.alerts.iter_mut() {
             if !a.rule.enabled {
+                disabled += 1;
                 continue;
             }
-            let value = match measure(s, table, &files, &a.rule.sql, limits).await {
+            let value = match measure(
+                s,
+                table,
+                &files,
+                &a.rule.sql,
+                &st.limits,
+                &st.admission,
+                &st.query,
+            )
+            .await
+            {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(rule = %a.rule.name, error = %e, "alert eval failed");
+                    if e.status == StatusCode::TOO_MANY_REQUESTS {
+                        shed += 1;
+                    } else {
+                        failed += 1;
+                    }
+                    tracing::warn!(rule = %a.rule.name, error = %e.message, "alert eval failed");
                     continue;
                 }
             };
             let (next, transition) = alert::evaluate(&a.rule, &a.status, value, now);
             a.status = next;
+            completed += 1;
             if matches!(transition, Transition::Fired | Transition::Resolved) {
                 tracing::info!(rule = %a.rule.name, ?transition, value, "alert transition");
                 if let Some(url) = a.rule.webhook.clone() {
@@ -635,6 +1253,14 @@ async fn evaluate_all(
             // a state that never landed, so they are dropped, not sent.
             continue;
         }
+        st.metrics
+            .alert_completed
+            .fetch_add(completed, Ordering::Relaxed);
+        st.metrics.alert_shed.fetch_add(shed, Ordering::Relaxed);
+        st.metrics.alert_failed.fetch_add(failed, Ordering::Relaxed);
+        st.metrics
+            .alert_disabled
+            .fetch_add(disabled, Ordering::Relaxed);
         for (url, payload) in notifications {
             tokio::spawn(async move {
                 if let Err(e) = notify_webhook(&url, payload).await {
@@ -879,24 +1505,26 @@ pub async fn serve_with_clock(
     // footers that cannot have changed (files are immutable).
     let query_store = verdigris_storage::build(&cfg.storage).context("building object store")?;
     let query_cache = Arc::new(QueryCache::from_config(&cfg.query));
+    let admission = Arc::new(Admission::new(cfg.query.max_concurrent, clock.clone()));
+    // Replica-unique audit prefix from the same OS entropy used for API tokens.
+    // A local counter alone is not unique across containers.
+    let audit_replica: Arc<str> = Arc::from(gen_replica_id());
 
-    // Persist audit records off the request path. The audit doc is a CAS
-    // read-modify-write against the object store; doing it inline added a
-    // metadata round-trip to every query. The bounded queue makes backpressure
-    // explicit: under a flood, audit records are dropped rather than delaying
-    // query responses (the in-memory history still has the record).
-    let (audit_tx, mut audit_rx) = tokio::sync::mpsc::channel::<QueryRecord>(1024);
-    {
+    // Durable audit writer: batch queued records into one conditional append,
+    // acknowledge each waiter, and keep a cached doc/version so a healthy append
+    // is one PUT. The queue bounds memory; saturation falls back to a direct CAS
+    // append rather than dropping a completed query.
+    let audit_metrics = Arc::new(AuditMetrics::default());
+    let (audit_tx, audit_rx) = tokio::sync::mpsc::channel::<AuditJob>(AUDIT_QUEUE_CAPACITY);
+    let audit_shutdown_tx = audit_tx.clone();
+    let audit_handle = {
         let audit_store = query_store.clone();
         let audit_table = table.clone();
+        let audit_metrics = audit_metrics.clone();
         tokio::spawn(async move {
-            while let Some(rec) = audit_rx.recv().await {
-                if let Err(e) = append_audit(&audit_store, &audit_table, rec).await {
-                    tracing::warn!(error = %e, "audit write-through failed");
-                }
-            }
-        });
-    }
+            audit_worker(audit_store, audit_table, audit_rx, audit_metrics).await;
+        })
+    };
 
     // Load the persisted token catalog into the in-memory cache.
     let boot_store = Some(query_store.clone());
@@ -920,6 +1548,10 @@ pub async fn serve_with_clock(
         ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
         alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
         alert_seq: Arc::new(AtomicU64::new(0)),
+        audit_replica,
+        audit_seq: Arc::new(AtomicU64::new(0)),
+        audit: audit_metrics,
+        admission,
         ingest_sem: Arc::new(tokio::sync::Semaphore::new(max_inflight)),
         tokens: Arc::new(tokio::sync::RwLock::new(tokens_doc)),
         metrics: Arc::new(HttpMetrics::new()),
@@ -935,22 +1567,30 @@ pub async fn serve_with_clock(
     // state), seed illustrative rules the first time, evaluate once immediately
     // so the first GET has real state, then re-evaluate on a fixed cadence.
     if role.serves_writes() {
-        if let Ok(s) = store(&state) {
-            let table = state.table.clone();
-            let lock = state.alerts_lock.clone();
-            let lim = limits(&state);
-            let clock = state.clock.clone();
-            let _ = seed_example_alerts(&s, table.as_str(), &lock, &clock).await;
-            let _ = evaluate_all(&s, table.as_str(), &lock, &lim, &clock).await;
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(15)).await;
-                    if let Err(e) = evaluate_all(&s, table.as_str(), &lock, &lim, &clock).await {
-                        tracing::warn!(error = %e, "alert scheduler tick failed");
-                    }
-                }
-            });
-        }
+        let _ = seed_example_alerts(
+            &state.store,
+            state.table.as_str(),
+            &state.alerts_lock,
+            &state.clock,
+        )
+        .await;
+        let evaluator = AlertEvaluator {
+            store: state.store.clone(),
+            table: state.table.clone(),
+            alerts_lock: state.alerts_lock.clone(),
+            limits: limits(&state),
+            clock: state.clock.clone(),
+            admission: state.admission.clone(),
+            query: state.cfg.query.clone(),
+            metrics: state.metrics.clone(),
+        };
+        evaluate_all(&evaluator).await;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                evaluate_all(&evaluator).await;
+            }
+        });
     }
 
     // Background auto-compaction. Only the writer role compacts (it owns the
@@ -1021,6 +1661,7 @@ pub async fn serve_with_clock(
     if role.serves_reads() {
         api = api
             .route("/v1/query", post(h_query))
+            .route("/v1/query/activity", post(h_activity))
             .route("/v1/query/estimate", post(h_estimate))
             .route("/v1/metrics", get(h_metrics))
             .route("/v1/alerts", get(h_alerts).post(h_alert_create))
@@ -1110,8 +1751,43 @@ pub async fn serve_with_clock(
         println!("  auth:     bearer-token required on /v1/*");
     }
     println!("  remember to set USE_MOCKS = false in frontend/api.js");
-    axum::serve(listener, app).await.context("http server")?;
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+    server.await.context("http server")?;
+
+    // Every handler has returned; drop the last sender so the audit worker sees
+    // the channel close, then give it a bounded deadline to flush what is queued.
+    drop(audit_shutdown_tx);
+    match tokio::time::timeout(AUDIT_DRAIN_TIMEOUT, audit_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "audit worker join failed during shutdown"),
+        Err(_) => tracing::warn!(
+            timeout_s = AUDIT_DRAIN_TIMEOUT.as_secs(),
+            "audit drain deadline exceeded at shutdown"
+        ),
+    }
     Ok(())
+}
+
+/// Resolve on SIGINT or SIGTERM so the HTTP server stops accepting requests and
+/// the audit writer can drain before the process exits.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 fn role_name(role: Role) -> &'static str {
@@ -1253,6 +1929,12 @@ fn gen_secret() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A replica-unique id. `gen_secret` draws 256 bits from OS entropy; two
+/// containers cannot practically collide, unlike pid+millisecond+counter.
+fn gen_replica_id() -> String {
+    gen_secret()
 }
 
 fn default_role() -> AuthRole {
@@ -1440,10 +2122,24 @@ async fn h_query(
     let arrow = wants_arrow(&headers);
     st.metrics.queries.fetch_add(1, Ordering::Relaxed);
     let t_request = st.clock.monotonic_micros();
+    let mut profile = match headers
+        .get("x-vdg-query-profile")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(mode @ ("1" | "plan")) => Some(verdigris_query::profile::QueryProfile::new(
+            st.clock.clone(),
+            t_request,
+            mode == "plan",
+        )),
+        _ => None,
+    };
     // Predicates first: they decide whether the trigram sidecar is worth
     // fetching, so the manifest load can skip it for non-text queries.
     let preds = verdigris_core::search::stat_predicates(&req.sql);
     let (s, m) = manifest_for(&st, &preds).await?;
+    if let Some(profile) = &mut profile {
+        profile.mark("manifest");
+    }
     let manifest_us = st.clock.monotonic_micros().saturating_sub(t_request);
 
     // Build ONE scan plan, the same call `POST /v1/query/estimate` makes. It
@@ -1460,6 +2156,9 @@ async fn h_query(
         verdigris_core::scan::DEFAULT_QUERY_LIMIT,
     )
     .map_err(AppError::bad_request)?;
+    if let Some(profile) = &mut profile {
+        profile.mark("scan_plan");
+    }
     let plan_us = st
         .clock
         .monotonic_micros()
@@ -1468,7 +2167,14 @@ async fn h_query(
     let selected = &plan.files;
     if selected.is_empty() {
         let stats = json!({ "events": 0, "scannedBytes": 0, "elapsedMs": 0, "engine": "datafusion", "files": 0 });
-        return Ok(query_response(arrow, Vec::new(), &stats, &Vec::new()));
+        return Ok(profile_response(
+            query_response(arrow, Vec::new(), &stats, &[]),
+            profile,
+        ));
+    }
+    let _admission = admit_query(&st, &plan, !req.histogram).await?;
+    if let Some(profile) = &mut profile {
+        profile.mark("admission");
     }
     let scanned_bytes: u64 = plan.scanned_bytes();
     // Same predicates again, one level down: `select_files` decided which files to
@@ -1486,25 +2192,27 @@ async fn h_query(
     // Run the query once, in the negotiated wire (never both).
     let t0 = st.clock.monotonic_micros();
     let (arrow_body, json_rows, rows_returned) = if arrow {
-        let out = verdigris_query::engine::query_table_arrow_with_rows_cached(
+        let out = verdigris_query::engine::query_table_arrow_with_rows_profiled(
             s.clone(),
             st.table.as_str(),
             &files,
             &sql,
             &limits(&st),
             Some(&st.query_cache),
+            profile.as_mut(),
         )
         .await
         .map_err(AppError::from_query)?;
         (out.bytes, Value::Null, out.rows)
     } else {
-        let rows = verdigris_query::engine::query_table_json_cached(
+        let rows = verdigris_query::engine::query_table_json_profiled(
             s.clone(),
             st.table.as_str(),
             &files,
             &sql,
             &limits(&st),
             Some(&st.query_cache),
+            profile.as_mut(),
         )
         .await
         .map_err(AppError::from_query)?;
@@ -1532,6 +2240,9 @@ async fn h_query(
     } else {
         Vec::new()
     };
+    if let Some(profile) = &mut profile {
+        profile.mark("histogram");
+    }
     // With a histogram, `events` is the exact total matched count (histogram
     // sum). Without one, it is the page of rows this response actually carries —
     // no second scan is spent inferring a total the caller did not ask for.
@@ -1552,7 +2263,7 @@ async fn h_query(
         .iter()
         .filter_map(|f| f.scanned_row_groups())
         .fold((0usize, 0usize), |(s, t), (fs, ft)| (s + fs, t + ft));
-    let stats = json!({
+    let mut stats = json!({
         "events": events,
         // False when the caller opted out of the histogram: `events` is then the
         // returned row count, not the total match count.
@@ -1586,6 +2297,7 @@ async fn h_query(
         )
     });
     let rec = QueryRecord {
+        id: next_audit_id(&st),
         ts_millis: st.clock.now_millis() as i64,
         user,
         sql: req.sql.clone(),
@@ -1600,22 +2312,113 @@ async fn h_query(
         }
         hist.push_back(rec.clone());
     }
-    // Queue the persisted audit record off the request path. A full queue means
-    // the audit writer is behind; drop rather than delay the response that the
-    // caller already earned. The in-memory history above is authoritative for
-    // the current process.
-    if st.audit_tx.try_send(rec).is_err() {
-        tracing::debug!("audit queue full; dropping persisted record");
+    // Persist before releasing the response. The writer batches concurrent
+    // records into one conditional append and acknowledges each waiter, so a
+    // healthy store makes the record immediately visible to other replicas.
+    // Persistence errors are counted and remain fail-open.
+    let audit_start = st.clock.monotonic_micros();
+    if let Some(profile) = &mut profile {
+        profile.mark("audit_prepare");
+    }
+    persist_audit(&st, rec).await;
+    if let Some(profile) = &mut profile {
+        profile.mark("audit_wait");
+    }
+    let audit_us = st.clock.monotonic_micros().saturating_sub(audit_start);
+    let total_us = st.clock.monotonic_micros().saturating_sub(t_request);
+    if let Some(obj) = stats.as_object_mut() {
+        obj.insert("auditMs".into(), json!(audit_us / 1_000));
+        obj.insert("totalMs".into(), json!(total_us / 1_000));
     }
 
-    if arrow {
-        Ok(query_response(true, arrow_body, &stats, &histogram))
+    let response = if arrow {
+        query_response(true, arrow_body, &stats, &histogram)
     } else {
-        Ok(
-            Json(json!({ "rows": json_rows, "stats": stats, "histogram": histogram }))
-                .into_response(),
-        )
+        Json(json!({ "rows": json_rows, "stats": stats, "histogram": histogram })).into_response()
+    };
+    Ok(profile_response(response, profile))
+}
+
+fn profile_response(
+    mut response: Response,
+    profile: Option<verdigris_query::profile::QueryProfile>,
+) -> Response {
+    if let Some(mut profile) = profile {
+        profile.mark("encode_response");
+        if let Ok(value) = axum::http::HeaderValue::from_str(&profile.finish().to_string()) {
+            response.headers_mut().insert("x-vdg-query-profile", value);
+        }
     }
+    response
+}
+
+/// `POST /v1/query/activity` — the severity histogram only.
+///
+/// The browser loads rows first (`histogram:false`) and requests this strip
+/// separately, so the row response pays for one scan and the chart pays for only
+/// its aggregation. It reuses the same scan plan, tier selection and file set as
+/// `/v1/query` and `/v1/query/estimate`.
+#[derive(Deserialize)]
+struct ActivityReq {
+    sql: String,
+    #[serde(default)]
+    tiers: Vec<String>,
+}
+
+async fn h_activity(State(st): State<AppState>, Json(req): Json<ActivityReq>) -> ApiResult {
+    let t0 = st.clock.monotonic_micros();
+    let preds = verdigris_core::search::stat_predicates(&req.sql);
+    let (s, m) = manifest_for(&st, &preds).await?;
+    let tiers: Vec<Tier> = req.tiers.iter().filter_map(|t| parse_tier(t)).collect();
+    let plan = verdigris_core::scan::plan_scan(
+        &m,
+        &req.sql,
+        st.table.as_str(),
+        &tiers,
+        st.clock.now_millis() as i64,
+        verdigris_core::scan::DEFAULT_QUERY_LIMIT,
+    )
+    .map_err(AppError::bad_request)?;
+
+    let files: Vec<IndexedFile> = plan
+        .files
+        .iter()
+        .map(|f| IndexedFile::plan(f, &preds))
+        .collect();
+    let _admission = if files.is_empty() {
+        None
+    } else {
+        Some(admit_query(&st, &plan, false).await?)
+    };
+    let histogram = if files.is_empty() {
+        Vec::new()
+    } else {
+        let (min_ts, max_ts) = time_range(&m);
+        histogram(
+            &s,
+            st.table.as_str(),
+            &files,
+            min_ts,
+            max_ts,
+            &limits(&st),
+            &st.query_cache,
+        )
+        .await?
+    };
+    let events: i64 = histogram
+        .iter()
+        .filter_map(|b| b.get("total").and_then(Value::as_i64))
+        .sum();
+    let elapsed_ms = st.clock.monotonic_micros().saturating_sub(t0) / 1_000;
+    Ok(Json(json!({
+        "histogram": histogram,
+        "stats": {
+            "events": events,
+            "files": files.len(),
+            "elapsedMs": elapsed_ms,
+            "engine": "datafusion",
+        }
+    })))
 }
 
 /// Build a `/v1/query` response in the requested wire. Arrow: the rows are the
@@ -2025,6 +2828,24 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
     let mut total_events = 0i64;
     let mut total_errors = 0i64;
 
+    // One permit covers both dashboard aggregations (service volume and the
+    // time histogram). Previously the service-volume query ran outside
+    // admission.
+    let _admission = if files.is_empty() {
+        None
+    } else {
+        let scan_bytes: u64 = files.iter().map(|f| f.bytes).sum();
+        Some(
+            admit_scan_with(
+                &st.admission,
+                &st.cfg.query,
+                scan_bytes,
+                false,
+                Duration::from_millis(st.cfg.query.admission_wait_ms),
+            )
+            .await?,
+        )
+    };
     if !files.is_empty() {
         let sql =
             format!("SELECT service, count(*) AS n FROM {table} GROUP BY service ORDER BY n DESC");
@@ -2106,6 +2927,23 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
             "metadataEntries": cache_entries,
             "metadataBytes": cache_bytes,
             "metadataHits": cache_hits,
+        },
+        "audit": {
+            "queued": st.audit.queued.load(Ordering::Relaxed),
+            "saturatedTotal": st.audit.saturated.load(Ordering::Relaxed),
+            "failedTotal": st.audit.failed.load(Ordering::Relaxed),
+            "timedOutTotal": st.audit.timed_out.load(Ordering::Relaxed),
+            "ackedTotal": st.audit.acked.load(Ordering::Relaxed),
+            "lastWaitMs": st.audit.last_wait_us.load(Ordering::Relaxed) / 1_000,
+        },
+        "admission": {
+            "maxConcurrent": st.admission.max,
+            "queueDepth": st.admission.depth(),
+            "admittedTotal": st.admission.metrics.admitted.load(Ordering::Relaxed),
+            "cheapTotal": st.admission.metrics.cheap.load(Ordering::Relaxed),
+            "queuedTotal": st.admission.metrics.queued.load(Ordering::Relaxed),
+            "shedTotal": st.admission.metrics.shed.load(Ordering::Relaxed),
+            "lastWaitMs": st.admission.metrics.last_wait_us.load(Ordering::Relaxed) / 1_000,
         },
         "compaction": {
             "enabled": st.cfg.compaction.enabled,
@@ -2273,9 +3111,16 @@ async fn h_alert_create(
         .load_manifest()
         .await?;
     let files: Vec<IndexedFile> = m.files.iter().map(IndexedFile::whole).collect();
-    let value = measure(&s, st.table.as_str(), &files, &rule.sql, &limits(&st))
-        .await
-        .map_err(AppError::bad_request)?;
+    let value = measure(
+        &s,
+        st.table.as_str(),
+        &files,
+        &rule.sql,
+        &limits(&st),
+        &st.admission,
+        &st.cfg.query,
+    )
+    .await?;
     let (status, _t) = alert::evaluate(&rule, &AlertStatus::initial(now), value, now);
     let id = rule.id.clone();
     for _ in 0..ALERTS_CAS_RETRIES {
@@ -2341,6 +3186,7 @@ struct TailFile {
     path: String,
     bytes: u64,
     min_ts: i64,
+    immutable: bool,
 }
 
 /// Cursor over append-only ingest files, carried across `unfold` steps.
@@ -2437,6 +3283,7 @@ impl TailCursor {
                 path: f.path.clone(),
                 bytes: f.bytes,
                 min_ts: f.min_ts,
+                immutable: f.is_immutable_key(),
             })
             .collect();
         // Mark every current path known — including compaction outputs — so the
@@ -2459,6 +3306,7 @@ impl TailCursor {
             path: file.path.clone(),
             bytes: file.bytes,
             row_groups: None,
+            immutable: file.immutable,
         }];
         // `arrow_cast(ts, 'Int64')` keeps the internal epoch-millis helper out of
         // the public row contract while still letting `ORDER BY ts` use the
@@ -2773,6 +3621,7 @@ mod tests {
 
     fn audit_rec(i: i64) -> QueryRecord {
         QueryRecord {
+            id: format!("audit-{i}"),
             ts_millis: i,
             user: "u".into(),
             sql: "select 1".into(),
@@ -2839,5 +3688,584 @@ mod tests {
         append_audit(&s, "t", audit_rec(1)).await.unwrap();
         let (doc, _) = load_audit(&s, "t").await.unwrap();
         assert_eq!(doc.queries.len(), 1);
+    }
+
+    #[derive(Debug)]
+    struct FlakyStore {
+        inner: Store,
+        failures: std::sync::atomic::AtomicUsize,
+    }
+
+    impl std::fmt::Display for FlakyStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FlakyStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for FlakyStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: object_store::PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if self
+                .failures
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok_and(|n| n > 0)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "flaky",
+                    source: "transient audit store failure".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A store whose writes never complete. Used to prove the direct-append
+    /// fallback is bounded by the same deadline as the queue/ack path.
+    #[derive(Debug)]
+    struct HangingPutStore {
+        inner: Store,
+    }
+
+    impl std::fmt::Display for HangingPutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "HangingPutStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for HangingPutStore {
+        async fn put_opts(
+            &self,
+            _location: &ObjPath,
+            _payload: object_store::PutPayload,
+            _options: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            std::future::pending::<()>().await;
+            unreachable!("pending never returns")
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn audit_test_state(store: Store, tx: tokio::sync::mpsc::Sender<AuditJob>) -> AppState {
+        AppState {
+            cfg: Arc::new(Config::default()),
+            table: Arc::new("t".into()),
+            ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
+            alerts_lock: Arc::new(tokio::sync::Mutex::new(())),
+            alert_seq: Arc::new(AtomicU64::new(0)),
+            audit_replica: Arc::from("test-replica"),
+            audit_seq: Arc::new(AtomicU64::new(0)),
+            audit: Arc::new(AuditMetrics::default()),
+            admission: Arc::new(Admission::new(
+                4,
+                Arc::new(verdigris_core::clock::SimClock::new(0)),
+            )),
+            ingest_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            tokens: Arc::new(tokio::sync::RwLock::new(TokensDoc::default())),
+            metrics: Arc::new(HttpMetrics::new()),
+            query_history: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            compaction: Arc::new(CompactionMetrics::new()),
+            clock: Arc::new(verdigris_core::clock::SimClock::new(1_700_000_000_000)),
+            store,
+            query_cache: Arc::new(QueryCache::new(1024 * 1024)),
+            audit_tx: tx,
+        }
+    }
+
+    #[tokio::test]
+    async fn background_alert_metrics_record_persisted_outcomes() {
+        let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let st = audit_test_state(store.clone(), tx);
+        let table = st.table.as_str();
+        verdigris_ingest::Ingestor::new(store.clone(), table)
+            .ingest(
+                verdigris_ingest::generate::generate(10, 0, 0),
+                &st.cfg.routing,
+                st.cfg.ingest.batch_policy(),
+            )
+            .await
+            .unwrap();
+        let doc = AlertsDoc {
+            alerts: [
+                ("complete", "SELECT count(*) AS v FROM t", true),
+                ("invalid", "SELECT absent AS v FROM t", true),
+                ("disabled", "SELECT count(*) AS v FROM t", false),
+            ]
+            .into_iter()
+            .map(|(name, sql, enabled)| Alert {
+                rule: AlertRule {
+                    id: name.into(),
+                    name: name.into(),
+                    sql: sql.into(),
+                    comparator: Comparator::Gt,
+                    threshold: 100.0,
+                    severity: "info".into(),
+                    webhook: None,
+                    enabled,
+                },
+                status: AlertStatus::initial(0),
+            })
+            .collect(),
+        };
+        assert!(save_alerts_cas(&store, table, &doc, None).await.unwrap());
+        let evaluator = AlertEvaluator {
+            store: store.clone(),
+            table: st.table.clone(),
+            alerts_lock: st.alerts_lock.clone(),
+            limits: limits(&st),
+            clock: st.clock.clone(),
+            admission: Arc::new(Admission::new(1, st.clock.clone())),
+            query: st.cfg.query.clone(),
+            metrics: st.metrics.clone(),
+        };
+        evaluate_all(&evaluator).await;
+        assert_eq!(
+            load_alerts(&store, table).await.unwrap().alerts[0]
+                .status
+                .value,
+            10.0
+        );
+        let permit = evaluator
+            .admission
+            .admit(false, Duration::ZERO)
+            .await
+            .unwrap();
+        evaluate_all(&evaluator).await;
+        drop(permit);
+        let rendered = st.metrics.render();
+        for (outcome, count) in [
+            ("completed", 1),
+            ("shed", 2),
+            ("failed", 1),
+            ("disabled", 2),
+        ] {
+            assert!(rendered.contains(&format!(
+                "verdigris_alert_evaluations_total{{outcome=\"{outcome}\"}} {count}\n"
+            )));
+        }
+        assert!(rendered.contains("verdigris_alert_evaluation_pass_failures_total 0\n"));
+    }
+
+    #[tokio::test]
+    async fn audit_worker_batches_acknowledges_and_drains_on_shutdown() {
+        let s: Store = Arc::new(object_store::memory::InMemory::new());
+        let metrics = Arc::new(AuditMetrics::default());
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let handle = tokio::spawn(audit_worker(s.clone(), "t".into(), rx, metrics.clone()));
+
+        let mut acks = Vec::new();
+        for i in 0..20 {
+            let (ack, ack_rx) = tokio::sync::oneshot::channel();
+            tx.send(AuditJob {
+                rec: audit_rec(i),
+                ack,
+            })
+            .await
+            .unwrap();
+            acks.push(ack_rx);
+        }
+        drop(tx); // orderly shutdown: channel closes, worker drains, then exits.
+        handle.await.unwrap();
+
+        for ack in acks {
+            assert!(ack.await.unwrap().is_ok(), "every record must be acked");
+        }
+        let (doc, _) = load_audit(&s, "t").await.unwrap();
+        assert_eq!(doc.queries.len(), 20);
+        let unique: std::collections::HashSet<&str> =
+            doc.queries.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(unique.len(), 20, "retries must not duplicate records");
+        assert_eq!(metrics.acked.load(Ordering::Relaxed), 20);
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn audit_batch_retries_transient_errors() {
+        let inner: Store = Arc::new(object_store::memory::InMemory::new());
+        let store: Store = Arc::new(FlakyStore {
+            inner: inner.clone(),
+            failures: std::sync::atomic::AtomicUsize::new(1),
+        });
+        let mut cache = None;
+        commit_audit_batch(&store, "t", &mut cache, vec![audit_rec(1)])
+            .await
+            .unwrap();
+        let (doc, _) = load_audit(&inner, "t").await.unwrap();
+        assert_eq!(doc.queries.len(), 1);
+        assert_eq!(doc.queries[0].id, "audit-1");
+    }
+
+    #[tokio::test]
+    async fn audit_batch_reloads_after_stale_etag() {
+        let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let table = "test-audit-stale-update";
+        let path = audit_path(table);
+        match store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => panic!("clearing test audit object: {error}"),
+        }
+        append_audit(&store, table, audit_rec(0)).await.unwrap();
+        let (established, version) = load_audit(&store, table).await.unwrap();
+        let version = version.unwrap();
+        let initial_etag = version.e_tag.clone().expect("CAS requires an ETag");
+        // Establish the same cached version in both replicas before either writes.
+        let mut first = Some(AuditCache {
+            doc: established.clone(),
+            version: Some(version.clone()),
+            no_cas: false,
+        });
+        let mut stale = Some(AuditCache {
+            doc: established,
+            version: Some(version),
+            no_cas: false,
+        });
+        commit_audit_batch(&store, table, &mut first, vec![audit_rec(1)])
+            .await
+            .unwrap();
+        let (_, written_version) = load_audit(&store, table).await.unwrap();
+        assert_ne!(
+            written_version.unwrap().e_tag.as_deref(),
+            Some(initial_etag.as_str())
+        );
+        assert_eq!(
+            stale
+                .as_ref()
+                .unwrap()
+                .version
+                .as_ref()
+                .unwrap()
+                .e_tag
+                .as_deref(),
+            Some(initial_etag.as_str()),
+        );
+        commit_audit_batch(&store, table, &mut stale, vec![audit_rec(2)])
+            .await
+            .unwrap();
+        let (durable, _) = load_audit(&store, table).await.unwrap();
+        let ids: Vec<_> = durable
+            .queries
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect();
+        assert_eq!(ids, ["audit-0", "audit-1", "audit-2"]);
+        assert!(!stale.unwrap().no_cas);
+    }
+
+    #[tokio::test]
+    async fn same_clock_and_counter_replicas_keep_both_records() {
+        let s: Store = Arc::new(object_store::memory::InMemory::new());
+        let clock: Arc<dyn Clock> =
+            Arc::new(verdigris_core::clock::SimClock::new(1_700_000_000_000));
+        // Both replicas start with counter 0 and read the same clock. Only the
+        // replica prefix can keep their record ids distinct.
+        let (tx_a, _rx_a) = tokio::sync::mpsc::channel(1);
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel(1);
+        let mut a = audit_test_state(s.clone(), tx_a);
+        let mut b = audit_test_state(s.clone(), tx_b);
+        a.clock = clock.clone();
+        b.clock = clock.clone();
+        a.audit_replica = Arc::from("replica-a");
+        b.audit_replica = Arc::from("replica-b");
+        let rec_a = QueryRecord {
+            id: next_audit_id(&a),
+            ts_millis: clock.now_millis() as i64,
+            ..audit_rec(1)
+        };
+        let rec_b = QueryRecord {
+            id: next_audit_id(&b),
+            ts_millis: clock.now_millis() as i64,
+            ..audit_rec(2)
+        };
+        assert_eq!(rec_a.ts_millis, rec_b.ts_millis);
+        assert!(rec_a.id.ends_with("-0") && rec_b.id.ends_with("-0"));
+        assert_ne!(rec_a.id, rec_b.id);
+        let (mut ca, mut cb) = (None, None);
+        let (ra, rb) = tokio::join!(
+            commit_audit_batch(&s, "t", &mut ca, vec![rec_a.clone()]),
+            commit_audit_batch(&s, "t", &mut cb, vec![rec_b.clone()]),
+        );
+        ra.unwrap();
+        rb.unwrap();
+        let (doc, _) = load_audit(&s, "t").await.unwrap();
+        let mut ids: Vec<&str> = doc.queries.iter().map(|r| r.id.as_str()).collect();
+        ids.sort();
+        let mut want = vec![rec_a.id.as_str(), rec_b.id.as_str()];
+        want.sort();
+        assert_eq!(ids, want);
+    }
+
+    #[tokio::test]
+    async fn audit_saturation_falls_back_and_increments_metric() {
+        let s: Store = Arc::new(object_store::memory::InMemory::new());
+        // Capacity one, receiver kept alive but no worker: the second record
+        // must fall back to a direct append rather than being dropped.
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let st = audit_test_state(s.clone(), tx.clone());
+        let (ack, _) = tokio::sync::oneshot::channel();
+        tx.try_send(AuditJob {
+            rec: audit_rec(99),
+            ack,
+        })
+        .unwrap();
+        persist_audit_with(&st, audit_rec(1), Duration::from_millis(20)).await;
+        let (doc, _) = load_audit(&s, "t").await.unwrap();
+        assert!(doc.queries.iter().any(|r| r.id == "audit-1"));
+        assert_eq!(st.audit.saturated.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn audit_persistence_failure_increments_metric_and_remains_fail_open() {
+        let inner: Store = Arc::new(object_store::memory::InMemory::new());
+        let store: Store = Arc::new(FlakyStore {
+            inner,
+            failures: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        });
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx); // worker gone: force the direct fallback
+        let st = audit_test_state(store, tx);
+        // Must return normally (fail-open) despite the store failure.
+        persist_audit_with(&st, audit_rec(1), Duration::from_millis(20)).await;
+        assert_eq!(st.audit.failed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn admission_sheds_heavy_but_reserves_cheap_lane() {
+        let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
+        let admission = Admission::new(4, clock);
+        let _a = admission
+            .admit(false, Duration::from_millis(5))
+            .await
+            .expect("first heavy permit");
+        let _b = admission
+            .admit(false, Duration::from_millis(5))
+            .await
+            .expect("second heavy permit");
+        let _c = admission
+            .admit(false, Duration::from_millis(5))
+            .await
+            .expect("third heavy permit");
+        let err = admission
+            .admit(false, Duration::from_millis(5))
+            .await
+            .expect_err("fourth heavy must shed");
+        assert_eq!(err, 3);
+        // The reserved lane still admits a cheap query.
+        let _cheap = admission
+            .admit(true, Duration::from_millis(5))
+            .await
+            .expect("cheap lane must be reserved");
+        assert_eq!(admission.metrics.shed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn max_concurrent_one_has_exactly_one_permit() {
+        let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
+        let admission = Admission::new(1, clock);
+        // The first (cheap or heavy) request gets the one permit.
+        let _one = admission
+            .admit(true, Duration::from_millis(5))
+            .await
+            .expect("single permit");
+        // Nothing else can be admitted; the old code created a second permit.
+        assert!(admission
+            .admit(false, Duration::from_millis(5))
+            .await
+            .is_err());
+        assert!(admission
+            .admit(true, Duration::from_millis(5))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_releases_queue_accounting() {
+        let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
+        let admission = Arc::new(Admission::new(2, clock));
+        let _heavy = admission
+            .admit(false, Duration::from_millis(5))
+            .await
+            .expect("heavy permit");
+        let _cheap = admission
+            .admit(true, Duration::from_millis(5))
+            .await
+            .expect("cheap permit");
+        let waiting = admission.clone();
+        let task = tokio::spawn(async move {
+            waiting
+                .admit(false, Duration::from_secs(30))
+                .await
+                .map(|_| ())
+        });
+        for _ in 0..100 {
+            if admission.metrics.queued.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(admission.metrics.queued.load(Ordering::Relaxed), 1);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            admission.metrics.queued.load(Ordering::Relaxed),
+            0,
+            "cancelled waiter must not leak queue depth"
+        );
+        drop(_heavy);
+        let _again = admission
+            .admit(false, Duration::from_millis(5))
+            .await
+            .expect("cancelled waiter must not consume a permit");
+    }
+
+    #[test]
+    fn shed_response_carries_retry_after_and_depth() {
+        let res = AppError::overloaded(3, 1).into_response();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            res.headers().get(RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn scan_budget_error_attaches_the_estimate() {
+        let est = verdigris_core::estimate::QueryEstimate {
+            scan_bytes: 10 * 1024 * 1024,
+            scan_gib: 10.0 / 1024.0,
+            cost_usd: 0.01,
+            restore_ms: 0,
+            scan_ms: 10,
+            cold_restore: false,
+            files_touched: 2,
+            files_total: 4,
+            per_tier: Vec::new(),
+        };
+        let err = AppError::scan_over_budget(&est, 0.001);
+        let res = err.into_response();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn stalled_direct_append_is_bounded_by_end_to_end_deadline() {
+        let inner: Store = Arc::new(object_store::memory::InMemory::new());
+        let store: Store = Arc::new(HangingPutStore { inner });
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx); // force the direct fallback
+        let st = audit_test_state(store, tx);
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            persist_audit_with(&st, audit_rec(1), Duration::from_millis(30)),
+        )
+        .await
+        .expect("audit fallback must honour its deadline");
+        assert_eq!(st.audit.timed_out.load(Ordering::Relaxed), 1);
+        assert_eq!(st.audit.queued.load(Ordering::Relaxed), 0);
     }
 }

@@ -46,6 +46,17 @@ cores = 4
 # cross-request reuse. The object-store client is built once per process either way.
 metadata_cache_mib = 64
 
+# Query admission (issue #29). Heavy queries share max_concurrent - 1 slots;
+# one slot is reserved for small planned scans (or a selective point lookup
+# with a small LIMIT). A plain LIMIT over a full scan is heavy. A heavy query waits
+# admission_wait_ms, then gets 429 + Retry-After. max_scan_gib is a pre-execution
+# cost gate (0 disables it).
+max_concurrent = 4
+admission_wait_ms = 250
+cheap_limit_rows = 1000
+cheap_scan_mib = 8
+max_scan_gib = 100.0
+
 # Severity-based write-time routing: which tier each level lands in.
 # Severity decides placement (prefix / storage class), never price.
 [routing]

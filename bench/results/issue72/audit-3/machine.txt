@@ -1,0 +1,9 @@
+date_utc=2026-11-26T20:11:31Z
+host_cpus=16
+host_mem_kb=15587280
+kernel=7.0.0-38-generic
+docker=29.9.0
+git_commit=a2ca34a
+git_dirty=15
+rows=1000000 batch_rows=10000 threads=4 iterations=100 warmup=10
+budget=8cpu/6GiB per system; vdg=4cpu/3GiB + minio=4cpu/3GiB

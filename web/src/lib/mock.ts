@@ -4,7 +4,7 @@
    pages render identically whether data is mocked or live.
    ═══════════════════════════════════════════════════════════════════ */
 import type {
-  QueryResult, EstimateResult, Metrics, Alert, NewAlert, Storage, Cost, Pipelines, Settings, LogRow, Level, TierId,
+  QueryResult, ActivityResult, EstimateResult, Metrics, Alert, NewAlert, Storage, Cost, Pipelines, Settings, LogRow, Level, TierId,
 } from "./types";
 import { TIER_ECON } from "./types";
 
@@ -57,6 +57,13 @@ export function genLogs(n: number, svc?: string): LogRow[] {
 const TIER_SCAN_GB: Record<TierId, number> = { hot: 0.21, warm: 4.2, cold: 38 };
 
 export const mock = {
+  async queryActivity(): Promise<ActivityResult> {
+    await wait(180);
+    return {
+      histogram: ser(60, 22, 14, 18).map((v) => ({ total: Math.round(v), errors: Math.round(v * (0.2 + rnd() * 0.4)) })),
+      stats: { events: 2481, files: 38, elapsedMs: 12, engine: "datafusion" },
+    };
+  },
   async queryLogs(svc?: string): Promise<QueryResult> {
     await wait(140);
     return {

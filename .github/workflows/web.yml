@@ -34,6 +34,12 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install playwright==1.63.0
+      - run: python -m playwright install --with-deps chromium
+      - run: python tests/logs_rows_first.py
 
   # The prototype is dependency-free by design: plain node, no install step.
   prototype:

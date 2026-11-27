@@ -21,7 +21,9 @@ Usage:
 """
 import argparse
 import concurrent.futures
+import datetime
 import http.client
+import itertools
 import json
 import math
 import os
@@ -30,6 +32,7 @@ import sys
 import threading
 import time
 import urllib.parse
+from collections import Counter
 
 SERVICES = [
     "gateway", "checkout", "auth", "billing", "search",
@@ -43,6 +46,7 @@ DEFAULT_BATCH_ROWS = 10_000
 DEFAULT_THREADS = 4
 DEFAULT_ITERATIONS = 10
 DEFAULT_WARMUP = 3
+MAX_IDENTITY_SMOKE_ROWS = 100_000
 
 # One trace id is deliberately written to one row in each tier. A full lookup
 # must return all three; a tier-scoped Verdigris query must return exactly one.
@@ -52,13 +56,115 @@ CROSS_TRACE_ROWS = (0, 1, 3)  # ERROR/hot, INFO/warm, DEBUG/cold
 # The corpus sits wholly inside "the last hour" so a `| last 1h` DSL query is
 # equivalent to an absolute [start, end) filter on the other two systems.
 NOW_MS = int(time.time() * 1_000)
-BASE_TS = (NOW_MS - 55 * 60_000) // 60_000 * 60_000
+# One run computes this once and exports it to every backend process, so all
+# three engines ingest the exact same timestamps. A per-process default keeps
+# the standalone invocation useful.
+BASE_TS = int(
+    os.environ.get(
+        "CORPUS_TS_MS", str((NOW_MS - 55 * 60_000) // 60_000 * 60_000)
+    )
+)
 WINDOW_MS = 50 * 60_000
 
 
 def iso_ms(ms: int) -> str:
     """RFC3339 with milliseconds, accepted by ClickHouse and VictoriaLogs."""
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms / 1000)) + f".{ms % 1000:03d}Z"
+
+
+def normalize_rows(rows):
+    """Map each engine's native field names to the common log-row contract."""
+    out = []
+    for r in rows:
+        r = dict(r)
+        if "_msg" in r and "message" not in r:
+            r["message"] = r.pop("_msg")
+        if "_time" in r and "ts" not in r:
+            r["ts"] = r.pop("_time")
+        out.append(r)
+    return out
+
+
+def bucket_ms(value) -> int:
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).replace("Z", "+00:00")
+    dt = datetime.datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return round(dt.timestamp() * 1000)
+
+
+def row_ts_ms(row):
+    value = row.get("ts", row.get("_time"))
+    if value is None:
+        raise SystemExit(f"row has no timestamp: {row}")
+    return bucket_ms(value)
+
+
+MISSING_TRACE = "ffffffffffffffff"
+RECENT_SEARCH_SQL = (
+    "SELECT ts, level, service, status, message, trace_id, attrs_json "
+    "FROM bench WHERE service = 'checkout' AND level = 'ERROR' "
+    "ORDER BY ts DESC LIMIT 200"
+)
+
+
+def trace_schedule(rows):
+    return [f"{i:016x}" for i in sorted({max(4, k * rows // 16) for k in range(16)}) if i < rows]
+
+
+def expected_row(index, rows):
+    payload = record(index, rows, "vdg")
+    return (payload["ts_millis"], payload["level"], payload["service"],
+            payload["status"], payload["message"], payload["trace_id"], payload["attrs"])
+
+
+def canonical_row(row):
+    row = normalize_rows([row])[0]
+    return (row_ts_ms(row), row["level"], row["service"], int(row["status"]),
+            row["message"], row["trace_id"], json.loads(row["attrs_json"]))
+
+
+def expected_search(rows):
+    indices = (i for i in range(rows - 1, -1, -1)
+               if level_for(i) == "ERROR" and service_for(i) == "checkout")
+    return [expected_row(i, rows) for i in itertools.islice(indices, 200)]
+
+
+def validate_search(got, expected):
+    if [canonical_row(r) for r in got] != expected:
+        raise SystemExit("search returned different fields, rows, or order")
+
+
+def validate_trace(trace_id: str, got, rows: int):
+    if trace_id == CROSS_TRACE:
+        indices = CROSS_TRACE_ROWS
+    elif trace_id == MISSING_TRACE:
+        indices = ()
+    else:
+        indices = (int(trace_id, 16),)
+    actual = sorted((canonical_row(r) for r in got), key=lambda r: (r[0], r[4]))
+    expected = sorted((expected_row(i, rows) for i in indices), key=lambda r: (r[0], r[4]))
+    if actual != expected:
+        raise SystemExit(f"trace {trace_id} returned {len(actual)} rows with different fields or identities (expected {len(expected)})")
+
+
+def validate_aggregation(got, expected):
+    actual = [(bucket_ms(r.get("bucket") or r["_time"]), int(r["total"]), int(r["errors"]))
+              for r in got]
+    want = [(bucket, *counts) for bucket, counts in expected.items()]
+    if actual != want:
+        raise SystemExit(f"aggregate returned different ordered buckets (got {len(actual)}, expected {len(want)})")
+
+
+def expected_buckets(rows: int):
+    buckets = {}
+    for i in range(rows):
+        bucket = (ts_for(i, rows) // 60_000) * 60_000
+        total, errors = buckets.get(bucket, (0, 0))
+        buckets[bucket] = (total + 1, errors + (1 if level_for(i) == "ERROR" else 0))
+    return buckets
 
 
 def level_for(i: int) -> str:
@@ -92,6 +198,21 @@ def message_for(i: int, level: str, service: str) -> str:
     )
 
 
+def validate_row_identity(messages, rows):
+    # Each generated message contains its unique input index even when three
+    # rows deliberately share a trace ID. Compare multiplicities exactly.
+    expected = Counter(message_for(i, level_for(i), service_for(i)) for i in range(rows))
+    actual = Counter(messages)
+    if actual != expected:
+        missing = expected - actual
+        unexpected = actual - expected
+        raise SystemExit(
+            f"row identity mismatch: {sum(missing.values())} missing; "
+            f"{sum(unexpected.values())} duplicate or unexpected "
+            f"(examples: {next(iter(missing), None)!r}, {next(iter(unexpected), None)!r})"
+        )
+
+
 def record(i: int, rows: int, system: str) -> dict:
     level = level_for(i)
     service = service_for(i)
@@ -119,6 +240,10 @@ def record(i: int, rows: int, system: str) -> dict:
             "status": status_for(level),
             "message": msg,
             "trace_id": trace_id,
+            "attrs_json": json.dumps(
+                {"region": REGIONS[i % len(REGIONS)], "host": f"node-{i % 50:02d}"},
+                separators=(",", ":"),
+            ),
         }
     return {
         "_time": iso_ms(ts),
@@ -127,6 +252,10 @@ def record(i: int, rows: int, system: str) -> dict:
         "service": service,
         "status": status_for(level),
         "trace_id": trace_id,
+        "attrs_json": json.dumps(
+            {"region": REGIONS[i % len(REGIONS)], "host": f"node-{i % 50:02d}"},
+            separators=(",", ":"),
+        ),
     }
 
 
@@ -207,6 +336,9 @@ class Backend:
     def validate(self):
         raise NotImplementedError
 
+    def fixture_messages(self, limit):
+        raise NotImplementedError
+
     def count_recent(self):
         raise NotImplementedError
 
@@ -235,15 +367,25 @@ class Vdg(Backend):
             raise RuntimeError(f"vdg ingest {status}: {data[:300]!r}")
         return int(json.loads(data)["ingested"])
 
-    def _query(self, sql: str):
-        body = json.dumps({"sql": sql, "tiers": [], "histogram": False}).encode()
-        status, _, data = self.client.request(
-            "POST", "/v1/query", body, {"content-type": "application/json"},
-        )
+    profile_mode = None
+    last_profile = None
+
+    def _query(self, sql: str, tiers=()):
+        body = json.dumps({"sql": sql, "tiers": list(tiers), "histogram": False}).encode()
+        request_headers = {"content-type": "application/json"}
+        if self.profile_mode:
+            request_headers["x-vdg-query-profile"] = self.profile_mode
+        status, headers, data = self.client.request("POST", "/v1/query", body, request_headers)
         if status != 200:
             raise RuntimeError(f"vdg query {status}: {data[:300]!r}")
         payload = json.loads(data)
         self.last_stats = payload.get("stats") or {}
+        self.last_profile = None
+        if self.profile_mode:
+            value = next((v for k, v in headers if k.lower() == "x-vdg-query-profile"), None)
+            if value is None:
+                raise RuntimeError("server did not return the requested query profile")
+            self.last_profile = json.loads(value)
         return payload["rows"]
 
     def settle(self):
@@ -267,6 +409,9 @@ class Vdg(Backend):
         rows = self._query("SELECT count(*) AS n FROM bench")
         return int(rows[0]["n"])
 
+    def fixture_messages(self, limit):
+        return [row["message"] for row in self._query(f"SELECT message FROM bench LIMIT {limit}")]
+
     def count_recent(self):
         rows = self._query(
             "SELECT count(*) AS n FROM bench WHERE service = 'checkout' AND level = 'ERROR'"
@@ -274,19 +419,10 @@ class Vdg(Backend):
         return int(rows[0]["n"])
 
     def search_recent(self):
-        # The product's search path, not raw SQL: this is what exercises
-        # file-level service/level pruning.
-        body = json.dumps(
-            {"sql": "service:checkout level:error | last 1h", "tiers": [], "histogram": False}
-        ).encode()
-        status, _, data = self.client.request(
-            "POST", "/v1/query", body, {"content-type": "application/json"},
-        )
-        if status != 200:
-            raise RuntimeError(f"vdg search {status}: {data[:300]!r}")
-        payload = json.loads(data)
-        self.last_stats = payload.get("stats") or {}
-        return payload["rows"]
+        # SQL over the same columns/predicate/order as the other engines. A
+        # relative `last 1h` would drift between separately started runs; the
+        # corpus is one fixed window, so the explicit query schedule is stable.
+        return self._query(RECENT_SEARCH_SQL)
 
     def trace_lookup(self, trace_id=None):
         trace_id = trace_id or self.args.trace_id
@@ -296,17 +432,7 @@ class Vdg(Backend):
         return self._trace_query(trace_id, tiers)
 
     def _trace_query(self, trace_id: str, tiers):
-        body = json.dumps(
-            {"sql": f"trace_id:{trace_id}", "tiers": tiers, "histogram": False}
-        ).encode()
-        status, _, data = self.client.request(
-            "POST", "/v1/query", body, {"content-type": "application/json"},
-        )
-        if status != 200:
-            raise RuntimeError(f"vdg trace {status}: {data[:300]!r}")
-        payload = json.loads(data)
-        self.last_stats = payload.get("stats") or {}
-        return payload["rows"]
+        return self._query(f"trace_id:{trace_id}", tiers)
 
     def aggregate_minute(self):
         return self._query(
@@ -339,7 +465,8 @@ class ClickHouse(Backend):
                 service LowCardinality(String),
                 status Nullable(Int32),
                 message String,
-                trace_id String
+                trace_id String,
+                attrs_json String
             ) ENGINE = MergeTree ORDER BY (service, level, ts)""",
             self.auth_headers,
         )
@@ -381,6 +508,9 @@ class ClickHouse(Backend):
     def validate(self):
         return int(self._sql_json("SELECT count() AS n FROM bench")[0]["n"])
 
+    def fixture_messages(self, limit):
+        return [row["message"] for row in self._sql_json(f"SELECT message FROM bench LIMIT {limit}")]
+
     def count_recent(self):
         return int(self._sql_json(
             "SELECT count() AS n FROM bench WHERE service = 'checkout' AND level = 'ERROR'"
@@ -388,7 +518,7 @@ class ClickHouse(Backend):
 
     def search_recent(self):
         return self._sql_json(
-            "SELECT ts, level, service, status, message, trace_id FROM bench "
+            "SELECT ts, level, service, status, message, trace_id, attrs_json FROM bench "
             "WHERE service = 'checkout' AND level = 'ERROR' "
             "ORDER BY ts DESC LIMIT 200"
         )
@@ -396,7 +526,7 @@ class ClickHouse(Backend):
     def trace_lookup(self, trace_id=None):
         trace_id = trace_id or self.args.trace_id
         return self._sql_json(
-            "SELECT ts, level, service, status, message, trace_id FROM bench "
+            "SELECT ts, level, service, status, message, trace_id, attrs_json FROM bench "
             f"WHERE trace_id = '{trace_id}' LIMIT 10"
         )
 
@@ -440,6 +570,9 @@ class VictoriaLogs(Backend):
         rows = self._query_rows("* | stats count() total")
         return int(rows[0]["total"])
 
+    def fixture_messages(self, limit):
+        return [row["_msg"] for row in self._query_rows(f"* | fields _msg | limit {limit}")]
+
     def count_recent(self):
         rows = self._query_rows(
             "service:checkout level:ERROR | stats count() total"
@@ -449,7 +582,7 @@ class VictoriaLogs(Backend):
     def search_recent(self):
         return self._query_rows(
             "service:checkout level:ERROR "
-            "| fields _time, level, service, status, message, trace_id "
+            "| fields _time, level, service, status, _msg, trace_id, attrs_json "
             "| sort by (_time) desc | limit 200"
         )
 
@@ -457,12 +590,12 @@ class VictoriaLogs(Backend):
         trace_id = trace_id or self.args.trace_id
         return self._query_rows(
             f'trace_id:="{trace_id}" '
-            "| fields _time, level, service, status, message, trace_id | limit 10"
+            "| fields _time, level, service, status, _msg, trace_id, attrs_json | limit 10"
         )
 
     def aggregate_minute(self):
         return self._query_rows(
-            "* | stats by (_time:1m) count() total, count() if (level:ERROR) errors"
+            "* | stats by (_time:1m) count() total, count() if (level:ERROR) errors | sort by (_time)"
         )
 
 
@@ -476,15 +609,16 @@ def make_backend(system: str, args) -> Backend:
     raise SystemExit(f"unknown system {system}")
 
 
-def timed(fn, iterations: int, warmup: int):
+def timed(fn, iterations: int, warmup: int, validate):
     for _ in range(warmup):
-        fn()
+        validate(fn())
     samples = []
     last = None
     for _ in range(iterations):
         t0 = time.perf_counter()
         last = fn()
         samples.append((time.perf_counter() - t0) * 1000.0)
+        validate(last)
     samples.sort()
     return {
         "samples": len(samples),
@@ -508,16 +642,21 @@ def main():
     ap.add_argument("--threads", type=int, default=DEFAULT_THREADS)
     ap.add_argument("--iterations", type=int, default=DEFAULT_ITERATIONS)
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
+    ap.add_argument("--verify-all-row-ids", action="store_true",
+                    help="verify every generated identity on a smoke corpus (up to 100,000 rows)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
     rows = args.rows
     # Spread hit lookups across the corpus instead of timing one convenient id.
     # Every id is a real row; keep away from the cross-tier sentinel rows.
-    indices = sorted({max(4, (k * rows) // 16) for k in range(16)})
-    args.trace_ids = [f"{i:016x}" for i in indices]
+    if rows < 5:
+        ap.error("--rows requires at least five fixture rows")
+    if args.verify_all_row_ids and rows > MAX_IDENTITY_SMOKE_ROWS:
+        ap.error(f"--verify-all-row-ids supports up to {MAX_IDENTITY_SMOKE_ROWS:,} smoke rows")
+    args.trace_ids = trace_schedule(rows)
     args.trace_id = args.trace_ids[len(args.trace_ids) // 2]
-    args.missing_trace_id = "ffffffffffffffff"
+    args.missing_trace_id = MISSING_TRACE
     expected_errors = sum(1 for i in range(rows) if level_for(i) == "ERROR")
     expected_recent = sum(
         1 for i in range(rows) if service_for(i) == "checkout" and level_for(i) == "ERROR"
@@ -547,6 +686,9 @@ def main():
         for n in ex.map(send, range(len(batches))):
             ingested += n
     ingest_s = time.perf_counter() - t0
+    # The 20M fixture holds several GiB of encoded ingest requests. Release
+    # them before settling compaction and sampling query latency.
+    del bodies
     print(
         f"{args.system}: acked {ingested} rows in {ingest_s:.2f}s "
         f"({ingested / ingest_s:,.0f} rows/s, {total_bytes / ingest_s / 1048576:.1f} MiB/s)",
@@ -586,25 +728,15 @@ def main():
         raise SystemExit(
             f"{args.system}: recent count {recent_count}, expected {expected_recent}"
         )
+    search_expected = expected_search(rows)
     search_rows = backend.search_recent()
-    if len(search_rows) != min(200, expected_recent):
-        raise SystemExit(
-            f"{args.system}: search returned {len(search_rows)}, expected {min(200, expected_recent)}"
-        )
+    validate_search(search_rows, search_expected)
     trace_rows = backend.trace_lookup(args.trace_id)
-    if len(trace_rows) != 1:
-        raise SystemExit(f"{args.system}: trace lookup returned {len(trace_rows)}, expected 1")
+    validate_trace(args.trace_id, trace_rows, rows)
     cross_rows = backend.trace_lookup(CROSS_TRACE)
-    if len(cross_rows) != len(CROSS_TRACE_ROWS):
-        raise SystemExit(
-            f"{args.system}: cross-tier trace returned {len(cross_rows)}, "
-            f"expected {len(CROSS_TRACE_ROWS)}"
-        )
+    validate_trace(CROSS_TRACE, cross_rows, rows)
     missing_rows = backend.trace_lookup(args.missing_trace_id)
-    if missing_rows:
-        raise SystemExit(
-            f"{args.system}: missing trace returned {len(missing_rows)} rows, expected 0"
-        )
+    validate_trace(args.missing_trace_id, missing_rows, rows)
     tier_rows = {}
     if args.system == "vdg":
         for tier in ("hot", "warm", "cold"):
@@ -624,6 +756,8 @@ def main():
             f"{args.system}: aggregate total={total} errors={errors}, "
             f"expected {rows}/{expected_errors}"
         )
+    bucket_expected = expected_buckets(rows)
+    validate_aggregation(buckets, bucket_expected)
     print(
         f"{args.system}: equivalence OK (recent={recent_count}, "
         f"buckets={len(buckets)}, total={total}, errors={errors})",
@@ -646,15 +780,20 @@ def main():
         return rows
 
     cache_before = backend.cache_stats() if args.system == "vdg" else {}
-    q_search = timed(backend.search_recent, args.iterations, args.warmup)
-    q_trace = timed(next_trace, args.iterations, args.warmup)
+    q_search = timed(backend.search_recent, args.iterations, args.warmup,
+                     lambda got: validate_search(got, search_expected))
+    q_trace = timed(next_trace, args.iterations, args.warmup,
+                    lambda got: validate_trace(args.trace_ids[(trace_cursor[0] - 1) % len(args.trace_ids)], got, rows))
     q_trace_miss = timed(
-        lambda: backend.trace_lookup(args.missing_trace_id), args.iterations, args.warmup
+        lambda: backend.trace_lookup(args.missing_trace_id), args.iterations, args.warmup,
+        lambda got: validate_trace(args.missing_trace_id, got, rows),
     )
     q_trace_cross = timed(
-        lambda: backend.trace_lookup(CROSS_TRACE), args.iterations, args.warmup
+        lambda: backend.trace_lookup(CROSS_TRACE), args.iterations, args.warmup,
+        lambda got: validate_trace(CROSS_TRACE, got, rows),
     )
-    q_aggregate = timed(backend.aggregate_minute, args.iterations, args.warmup)
+    q_aggregate = timed(backend.aggregate_minute, args.iterations, args.warmup,
+                        lambda got: validate_aggregation(got, bucket_expected))
     cache_after = backend.cache_stats() if args.system == "vdg" else {}
 
     results = {
@@ -709,6 +848,11 @@ def main():
             "minute_aggregation": q_aggregate,
         },
     }
+    if args.verify_all_row_ids:
+        # Run outside the measured workloads and audit/cache counter windows.
+        validate_row_identity(backend.fixture_messages(rows + 1), rows)
+        results["equivalence"]["verified_row_identities"] = rows
+        print(f"{args.system}: verified all {rows} row identities", flush=True)
     backend.close()
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:

@@ -4810,9 +4810,11 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "datafusion",
  "futures",
  "object_store",
+ "parquet",
  "serde_json",
  "thiserror",
  "tokio",

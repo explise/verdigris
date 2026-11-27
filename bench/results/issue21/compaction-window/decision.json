@@ -1,0 +1,55 @@
+{
+  "normal": {
+    "compaction_passes_during_load": 87,
+    "drain": {
+      "elapsed_s": 13,
+      "completed": true
+    },
+    "rate_in_window": 29883.333333333332,
+    "rate_including_drain": 28997.444800519148,
+    "acknowledged_rows": 18080000,
+    "visibility_p95_ms": null,
+    "peak_sampled_active_files": 3590,
+    "online_parquet_io": {
+      "ingest_put": 220666045,
+      "compact_get": 2837155391,
+      "compact_put": 2753547208
+    },
+    "offline_parquet_io": {
+      "ingest_put": 0,
+      "compact_get": 135590414,
+      "compact_put": 73977044
+    },
+    "parquet_write_amplification": 13.813590110793893
+  },
+  "deferred": {
+    "compaction_passes_during_load": 0,
+    "drain": {
+      "elapsed_s": 22,
+      "completed": true
+    },
+    "rate_in_window": 35883.333333333336,
+    "rate_including_drain": 34441.460751039456,
+    "acknowledged_rows": 21690000,
+    "visibility_p95_ms": null,
+    "peak_sampled_active_files": 6459,
+    "online_parquet_io": {
+      "ingest_put": 264709464,
+      "compact_get": 0,
+      "compact_put": 0
+    },
+    "offline_parquet_io": {
+      "ingest_put": 0,
+      "compact_get": 264709464,
+      "compact_put": 147433189
+    },
+    "parquet_write_amplification": 1.5569622890400323
+  },
+  "gates": {
+    "gain_at_least_25_percent": false,
+    "both_drains_complete": true,
+    "write_amplification_within_10_percent": true,
+    "peak_active_files_within_2x": true
+  },
+  "decision": "no-go"
+}
