@@ -35,6 +35,18 @@ def post(port, path, body, headers=None):
     return status, data
 
 
+def alert_counters(port):
+    status, data, _ = request(port, "GET", "/metrics")
+    if status != 200:
+        raise RuntimeError(f"could not read benchmark counters: HTTP {status}")
+    counters = {}
+    for line in data.decode().splitlines():
+        if line.startswith(("verdigris_alert_evaluations_total{", "verdigris_alert_evaluation_pass_failures_total ")):
+            name, value = line.split()
+            counters[name] = int(value)
+    return counters
+
+
 def fixed_mix(executor, run, overload, rates, duration, max_inflight):
     """Queue arrivals against a monotonic schedule, independent of replies."""
     start = time.monotonic()
@@ -214,12 +226,15 @@ def main():
                     pass
 
     sampler = threading.Thread(target=sample_rss, daemon=True)
+    alert_start = alert_counters(args.port) if args.fixed_rates else {}
+    alert_end = {}
     t0 = time.perf_counter()
     if args.fixed_rates:
         sampler.start()
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_inflight) as ex:
                 fixed_mix(ex, run, overloaded, rates, args.duration, args.max_inflight)
+            alert_end = alert_counters(args.port)
         finally:
             stop.set()
             sampler.join(timeout=2)
@@ -282,11 +297,15 @@ def main():
                 "p95_ms": percentile(ok, .95), "p99_ms": percentile(ok, .99),
                 "max_ms": ok[-1] if ok else None, "phases": phases}
 
+    if alert_start.keys() != alert_end.keys() or any(alert_end[k] < v for k, v in alert_start.items()):
+        raise RuntimeError("background alert counters reset during the trial")
+    alert_deltas = {name: alert_end[name] - before for name, before in alert_start.items()}
     kinds = tuple(results) if args.fixed_rates else ("heavy", "cheap", "trace", "expensive")
     out = {"rows": args.rows, "base_ts_ms": BASE, "elapsed_s": elapsed,
            "duration_s": args.duration if args.duration > 0 else None,
            "rounds": None if args.duration > 0 else args.rounds, "trial": args.trial,
            "fixed_rates": rates if args.fixed_rates else None,
+           "background_alert_counters": alert_deltas or None,
            **{kind: summarize(kind) for kind in kinds}, "peak_rss_mib": peak,
            "raw": {kind: [{"status": s, "scheduled_ms": round(d, 3), "service_ms": svc,
                             "phases_us": p, "error": error}

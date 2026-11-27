@@ -698,6 +698,11 @@ struct HttpMetrics {
     /// Domain counters.
     ingest_records: AtomicU64,
     queries: AtomicU64,
+    alert_completed: AtomicU64,
+    alert_shed: AtomicU64,
+    alert_failed: AtomicU64,
+    alert_disabled: AtomicU64,
+    alert_pass_failed: AtomicU64,
 }
 
 /// Upper bounds (ms) for the latency histogram; a trailing +Inf bucket is implied.
@@ -714,6 +719,11 @@ impl HttpMetrics {
             latency_count: AtomicU64::new(0),
             ingest_records: AtomicU64::new(0),
             queries: AtomicU64::new(0),
+            alert_completed: AtomicU64::new(0),
+            alert_shed: AtomicU64::new(0),
+            alert_failed: AtomicU64::new(0),
+            alert_disabled: AtomicU64::new(0),
+            alert_pass_failed: AtomicU64::new(0),
         }
     }
 
@@ -778,6 +788,25 @@ impl HttpMetrics {
         out.push_str("# HELP verdigris_queries_total Queries executed.\n");
         out.push_str("# TYPE verdigris_queries_total counter\n");
         out.push_str(&format!("verdigris_queries_total {}\n", g(&self.queries)));
+        out.push_str("# HELP verdigris_alert_evaluations_total Rules by outcome in committed background passes.\n");
+        out.push_str("# TYPE verdigris_alert_evaluations_total counter\n");
+        for (outcome, counter) in [
+            ("completed", &self.alert_completed),
+            ("shed", &self.alert_shed),
+            ("failed", &self.alert_failed),
+            ("disabled", &self.alert_disabled),
+        ] {
+            out.push_str(&format!(
+                "verdigris_alert_evaluations_total{{outcome=\"{outcome}\"}} {}\n",
+                g(counter)
+            ));
+        }
+        out.push_str("# HELP verdigris_alert_evaluation_pass_failures_total Uncommitted background evaluation passes.\n");
+        out.push_str("# TYPE verdigris_alert_evaluation_pass_failures_total counter\n");
+        out.push_str(&format!(
+            "verdigris_alert_evaluation_pass_failures_total {}\n",
+            g(&self.alert_pass_failed)
+        ));
         out
     }
 }
@@ -1131,21 +1160,33 @@ async fn measure(
     Ok(0.0)
 }
 
+struct AlertEvaluator {
+    store: Store,
+    table: Arc<String>,
+    alerts_lock: Arc<tokio::sync::Mutex<()>>,
+    limits: QueryLimits,
+    clock: Arc<dyn Clock>,
+    admission: Arc<Admission>,
+    query: verdigris_core::config::QueryConfig,
+    metrics: Arc<HttpMetrics>,
+}
+
+async fn evaluate_all(st: &AlertEvaluator) {
+    if let Err(e) = evaluate_alert_pass(st).await {
+        st.metrics.alert_pass_failed.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(error = %e, "alert scheduler pass failed");
+    }
+}
+
 /// One evaluation pass over every enabled rule: measure, advance state, persist
 /// under CAS, and only then fire webhooks — a notification goes out only for a
 /// transition that was actually committed, so a save conflict can't double-fire.
-/// `lock` serializes this against concurrent create/delete within the process;
+/// The alert lock serializes this against concurrent create/delete within the process;
 /// the CAS covers other replicas.
-async fn evaluate_all(
-    s: &Store,
-    table: &str,
-    lock: &tokio::sync::Mutex<()>,
-    limits: &QueryLimits,
-    clock: &Arc<dyn Clock>,
-    admission: &Admission,
-    cfg: &verdigris_core::config::QueryConfig,
-) -> anyhow::Result<()> {
-    let _g = lock.lock().await;
+async fn evaluate_alert_pass(st: &AlertEvaluator) -> anyhow::Result<()> {
+    let s = &st.store;
+    let table = st.table.as_str();
+    let _g = st.alerts_lock.lock().await;
     for _ in 0..ALERTS_CAS_RETRIES {
         let (mut doc, base) = load_alerts_versioned(s, table).await?;
         if doc.alerts.is_empty() {
@@ -1155,22 +1196,40 @@ async fn evaluate_all(
             .load_manifest()
             .await?;
         let files: Vec<IndexedFile> = m.files.iter().map(IndexedFile::whole).collect();
-        let now = clock.now_millis();
+        let now = st.clock.now_millis();
+        let (mut completed, mut shed, mut failed, mut disabled) = (0, 0, 0, 0);
         // Webhooks for this pass, held until the state they announce is committed.
         let mut notifications: Vec<(String, Value)> = Vec::new();
         for a in doc.alerts.iter_mut() {
             if !a.rule.enabled {
+                disabled += 1;
                 continue;
             }
-            let value = match measure(s, table, &files, &a.rule.sql, limits, admission, cfg).await {
+            let value = match measure(
+                s,
+                table,
+                &files,
+                &a.rule.sql,
+                &st.limits,
+                &st.admission,
+                &st.query,
+            )
+            .await
+            {
                 Ok(v) => v,
                 Err(e) => {
+                    if e.status == StatusCode::TOO_MANY_REQUESTS {
+                        shed += 1;
+                    } else {
+                        failed += 1;
+                    }
                     tracing::warn!(rule = %a.rule.name, error = %e.message, "alert eval failed");
                     continue;
                 }
             };
             let (next, transition) = alert::evaluate(&a.rule, &a.status, value, now);
             a.status = next;
+            completed += 1;
             if matches!(transition, Transition::Fired | Transition::Resolved) {
                 tracing::info!(rule = %a.rule.name, ?transition, value, "alert transition");
                 if let Some(url) = a.rule.webhook.clone() {
@@ -1194,6 +1253,14 @@ async fn evaluate_all(
             // a state that never landed, so they are dropped, not sent.
             continue;
         }
+        st.metrics
+            .alert_completed
+            .fetch_add(completed, Ordering::Relaxed);
+        st.metrics.alert_shed.fetch_add(shed, Ordering::Relaxed);
+        st.metrics.alert_failed.fetch_add(failed, Ordering::Relaxed);
+        st.metrics
+            .alert_disabled
+            .fetch_add(disabled, Ordering::Relaxed);
         for (url, payload) in notifications {
             tokio::spawn(async move {
                 if let Err(e) = notify_webhook(&url, payload).await {
@@ -1500,36 +1567,30 @@ pub async fn serve_with_clock(
     // state), seed illustrative rules the first time, evaluate once immediately
     // so the first GET has real state, then re-evaluate on a fixed cadence.
     if role.serves_writes() {
-        if let Ok(s) = store(&state) {
-            let table = state.table.clone();
-            let lock = state.alerts_lock.clone();
-            let lim = limits(&state);
-            let clock = state.clock.clone();
-            let admission = state.admission.clone();
-            let cfg = state.cfg.query.clone();
-            let _ = seed_example_alerts(&s, table.as_str(), &lock, &clock).await;
-            let _ = evaluate_all(
-                &s,
-                table.as_str(),
-                &lock,
-                &lim,
-                &clock,
-                &state.admission,
-                &state.cfg.query,
-            )
-            .await;
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(15)).await;
-                    if let Err(e) =
-                        evaluate_all(&s, table.as_str(), &lock, &lim, &clock, &admission, &cfg)
-                            .await
-                    {
-                        tracing::warn!(error = %e, "alert scheduler tick failed");
-                    }
-                }
-            });
-        }
+        let _ = seed_example_alerts(
+            &state.store,
+            state.table.as_str(),
+            &state.alerts_lock,
+            &state.clock,
+        )
+        .await;
+        let evaluator = AlertEvaluator {
+            store: state.store.clone(),
+            table: state.table.clone(),
+            alerts_lock: state.alerts_lock.clone(),
+            limits: limits(&state),
+            clock: state.clock.clone(),
+            admission: state.admission.clone(),
+            query: state.cfg.query.clone(),
+            metrics: state.metrics.clone(),
+        };
+        evaluate_all(&evaluator).await;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                evaluate_all(&evaluator).await;
+            }
+        });
     }
 
     // Background auto-compaction. Only the writer role compacts (it owns the
@@ -3815,6 +3876,81 @@ mod tests {
             query_cache: Arc::new(QueryCache::new(1024 * 1024)),
             audit_tx: tx,
         }
+    }
+
+    #[tokio::test]
+    async fn background_alert_metrics_record_persisted_outcomes() {
+        let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let st = audit_test_state(store.clone(), tx);
+        let table = st.table.as_str();
+        verdigris_ingest::Ingestor::new(store.clone(), table)
+            .ingest(
+                verdigris_ingest::generate::generate(10, 0, 0),
+                &st.cfg.routing,
+                st.cfg.ingest.batch_policy(),
+            )
+            .await
+            .unwrap();
+        let doc = AlertsDoc {
+            alerts: [
+                ("complete", "SELECT count(*) AS v FROM t", true),
+                ("invalid", "SELECT absent AS v FROM t", true),
+                ("disabled", "SELECT count(*) AS v FROM t", false),
+            ]
+            .into_iter()
+            .map(|(name, sql, enabled)| Alert {
+                rule: AlertRule {
+                    id: name.into(),
+                    name: name.into(),
+                    sql: sql.into(),
+                    comparator: Comparator::Gt,
+                    threshold: 100.0,
+                    severity: "info".into(),
+                    webhook: None,
+                    enabled,
+                },
+                status: AlertStatus::initial(0),
+            })
+            .collect(),
+        };
+        assert!(save_alerts_cas(&store, table, &doc, None).await.unwrap());
+        let evaluator = AlertEvaluator {
+            store: store.clone(),
+            table: st.table.clone(),
+            alerts_lock: st.alerts_lock.clone(),
+            limits: limits(&st),
+            clock: st.clock.clone(),
+            admission: Arc::new(Admission::new(1, st.clock.clone())),
+            query: st.cfg.query.clone(),
+            metrics: st.metrics.clone(),
+        };
+        evaluate_all(&evaluator).await;
+        assert_eq!(
+            load_alerts(&store, table).await.unwrap().alerts[0]
+                .status
+                .value,
+            10.0
+        );
+        let permit = evaluator
+            .admission
+            .admit(false, Duration::ZERO)
+            .await
+            .unwrap();
+        evaluate_all(&evaluator).await;
+        drop(permit);
+        let rendered = st.metrics.render();
+        for (outcome, count) in [
+            ("completed", 1),
+            ("shed", 2),
+            ("failed", 1),
+            ("disabled", 2),
+        ] {
+            assert!(rendered.contains(&format!(
+                "verdigris_alert_evaluations_total{{outcome=\"{outcome}\"}} {count}\n"
+            )));
+        }
+        assert!(rendered.contains("verdigris_alert_evaluation_pass_failures_total 0\n"));
     }
 
     #[tokio::test]
