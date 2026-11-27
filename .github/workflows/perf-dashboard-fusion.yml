@@ -1,0 +1,35 @@
+name: Verdigris dashboard scan fusion experiment
+
+on:
+  push:
+    branches: [codex/perf-dashboard-fusion]
+
+permissions:
+  contents: read
+
+jobs:
+  experiment:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the experiment image
+        run: docker build -f bench/Dockerfile.vdg -t verdigris-dashboard-fusion:local .
+      - name: Test separate and fused dashboard scans under the same load
+        env:
+          VDG_IMAGE: verdigris-dashboard-fusion:local
+          RESULT_ROOT: ${{ runner.temp }}/verdigris-dashboard-fusion
+        run: |
+          mkdir -p "$RESULT_ROOT"
+          for fused in false true; do
+            CHEAP_PERMITS=2 DASHBOARD_SINGLE_SCAN="$fused" OUT="$RESULT_ROOT/fused-$fused" bench/admission/run-fixed.sh
+          done
+      - name: Upload both treatment arms
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-dashboard-fusion
+          path: ${{ runner.temp }}/verdigris-dashboard-fusion
+          retention-days: 7

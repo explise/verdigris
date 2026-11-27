@@ -2454,6 +2454,11 @@ fn time_range(m: &Manifest) -> (i64, i64) {
     (min, max)
 }
 
+fn histogram_bin(min_ts: i64, max_ts: i64) -> String {
+    let interval_secs = ((max_ts - min_ts).max(1) / 60 / 1000).max(1);
+    format!("date_bin(INTERVAL '{interval_secs} seconds', ts, TIMESTAMP '1970-01-01T00:00:00')")
+}
+
 /// Time-bucketed histogram (total vs error counts), bucketed into ~60 bins tied
 /// to the table's time range so the strip is stable across queries.
 async fn histogram(
@@ -2465,11 +2470,7 @@ async fn histogram(
     limits: &QueryLimits,
     cache: &QueryCache,
 ) -> anyhow::Result<Vec<Value>> {
-    let range_ms = (max_ts - min_ts).max(1);
-    let interval_secs = (range_ms / 60 / 1000).max(1);
-    let bin = format!(
-        "date_bin(INTERVAL '{interval_secs} seconds', ts, TIMESTAMP '1970-01-01T00:00:00')"
-    );
+    let bin = histogram_bin(min_ts, max_ts);
     let sql = format!(
         "SELECT count(*) AS total, \
                 count(*) FILTER (WHERE level = 'ERROR') AS errors \
@@ -2817,7 +2818,83 @@ async fn h_config(State(st): State<AppState>) -> ApiResult {
 
 // ──────────────────── partial / placeholder endpoints ────────────────────
 
-async fn h_metrics(State(st): State<AppState>) -> ApiResult {
+struct DashboardCounts {
+    services: Vec<Value>,
+    buckets: Vec<Value>,
+}
+
+fn fused_dashboard_sql(table: &str, min_ts: i64, max_ts: i64) -> String {
+    let bin = histogram_bin(min_ts, max_ts);
+    format!(
+        "SELECT service, {bin} AS bucket, GROUPING(service) AS bucket_group, \
+                count(*) AS total, count(*) FILTER (WHERE level = 'ERROR') AS errors \
+         FROM {table} GROUP BY GROUPING SETS ((service), ({bin})) ORDER BY bucket"
+    )
+}
+
+async fn fused_dashboard_counts(
+    s: &Store,
+    table: &str,
+    files: &[IndexedFile],
+    min_ts: i64,
+    max_ts: i64,
+    limits: &QueryLimits,
+    cache: &QueryCache,
+) -> anyhow::Result<DashboardCounts> {
+    let sql = fused_dashboard_sql(table, min_ts, max_ts);
+    let rows = verdigris_query::engine::query_table_json_cached(
+        s.clone(),
+        table,
+        files,
+        &sql,
+        limits,
+        Some(cache),
+    )
+    .await?;
+    let mut services = Vec::new();
+    let mut buckets = Vec::new();
+    for row in rows {
+        match row["bucket_group"].as_i64() {
+            Some(0) => services.push(json!({"service": row["service"], "n": row["total"]})),
+            Some(1) => buckets.push(json!({"total": row["total"], "errors": row["errors"]})),
+            _ => anyhow::bail!("dashboard grouping set did not identify its result row"),
+        }
+    }
+    services.sort_by_key(|row| std::cmp::Reverse(row["n"].as_i64().unwrap_or(0)));
+    Ok(DashboardCounts { services, buckets })
+}
+
+async fn separate_dashboard_counts(
+    s: &Store,
+    table: &str,
+    files: &[IndexedFile],
+    min_ts: i64,
+    max_ts: i64,
+    limits: &QueryLimits,
+    cache: &QueryCache,
+) -> DashboardCounts {
+    let sql =
+        format!("SELECT service, count(*) AS n FROM {table} GROUP BY service ORDER BY n DESC");
+    let services = verdigris_query::engine::query_table_json(s.clone(), table, files, &sql, limits)
+        .await
+        .unwrap_or_default();
+    let buckets = histogram(s, table, files, min_ts, max_ts, limits, cache)
+        .await
+        .unwrap_or_default();
+    DashboardCounts { services, buckets }
+}
+
+async fn h_metrics(State(st): State<AppState>, headers: HeaderMap) -> Result<Response, AppError> {
+    let mut profile = headers
+        .get("x-vdg-query-profile")
+        .filter(|h| *h == "1")
+        .map(|_| {
+            verdigris_query::profile::QueryProfile::new(
+                st.clock.clone(),
+                st.clock.monotonic_micros(),
+                false,
+            )
+        });
     let (s, m) = manifest(&st).await?;
     let total_gib = m.total_bytes() as f64 / cost::GIB;
     let files: Vec<IndexedFile> = m.files.iter().map(IndexedFile::whole).collect();
@@ -2835,6 +2912,9 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
     // One permit covers both dashboard aggregations (service volume and the
     // time histogram). Previously the service-volume query ran outside
     // admission.
+    if let Some(profile) = &mut profile {
+        profile.mark("manifest");
+    }
     let _admission = if files.is_empty() {
         None
     } else {
@@ -2850,37 +2930,58 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
             .await?,
         )
     };
+    if let Some(profile) = &mut profile {
+        profile.mark("admission");
+    }
     if !files.is_empty() {
-        let sql =
-            format!("SELECT service, count(*) AS n FROM {table} GROUP BY service ORDER BY n DESC");
-        if let Ok(rows) =
-            verdigris_query::engine::query_table_json(s.clone(), table, &files, &sql, &limits(&st))
-                .await
-        {
-            let total_rows = m.total_rows().max(1) as f64;
-            for r in rows {
-                let n = r.get("n").and_then(Value::as_i64).unwrap_or(0) as f64;
-                volume_by_service.push(json!({
-                    "name": r.get("service").and_then(Value::as_str).unwrap_or("?"),
-                    "gb": (n / total_rows) * total_gib,
-                }));
-            }
-        }
-
         let (min_ts, max_ts) = time_range(&m);
+        let limits = limits(&st);
+        let fused = if st.cfg.query.dashboard_single_scan {
+            match fused_dashboard_counts(
+                &s,
+                table,
+                &files,
+                min_ts,
+                max_ts,
+                &limits,
+                &st.query_cache,
+            )
+            .await
+            {
+                Ok(counts) => Some(counts),
+                Err(error) => {
+                    tracing::warn!(%error, "dashboard scan fusion fell back to separate queries");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let counts = match fused {
+            Some(counts) => counts,
+            None => {
+                separate_dashboard_counts(
+                    &s,
+                    table,
+                    &files,
+                    min_ts,
+                    max_ts,
+                    &limits,
+                    &st.query_cache,
+                )
+                .await
+            }
+        };
+        let total_rows = m.total_rows().max(1) as f64;
+        for row in counts.services {
+            let n = row.get("n").and_then(Value::as_i64).unwrap_or(0) as f64;
+            volume_by_service.push(json!({
+                "name": row.get("service").and_then(Value::as_str).unwrap_or("?"),
+                "gb": (n / total_rows) * total_gib,
+            }));
+        }
         let interval_secs = ((max_ts - min_ts).max(1) / 60 / 1000).max(1) as f64;
-        for b in histogram(
-            &s,
-            table,
-            &files,
-            min_ts,
-            max_ts,
-            &limits(&st),
-            &st.query_cache,
-        )
-        .await
-        .unwrap_or_default()
-        {
+        for b in counts.buckets {
             let total = b.get("total").and_then(Value::as_i64).unwrap_or(0);
             let errors = b.get("errors").and_then(Value::as_i64).unwrap_or(0);
             total_events += total;
@@ -2895,6 +2996,10 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
             // No latency field in logs yet, so p99 is MODELED from error rate.
             p99.push(800.0 + er * 18.0);
         }
+    }
+
+    if let Some(profile) = &mut profile {
+        profile.mark("execute");
     }
 
     let avg = |v: &[f64]| {
@@ -2916,7 +3021,7 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
     let last_run = st.compaction.last_run_ms.load(Ordering::Relaxed);
     let (cache_entries, cache_bytes, cache_hits) = st.query_cache.metadata_stats();
 
-    Ok(Json(json!({
+    let response = Json(json!({
         "ingestRate": ingest_rate,
         "errorRate": error_rate,
         "p99": p99, // modeled (no real latency field yet)
@@ -2959,7 +3064,8 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
             "runsTotal": st.compaction.runs_total.load(Ordering::Relaxed),
             "lastRunMs": if last_run == 0 { Value::Null } else { json!(last_run) },
         },
-    })))
+    })).into_response();
+    Ok(profile_response(response, profile))
 }
 
 /// Query params for `/v1/cost`. `days` selects the projection horizon (the
@@ -3881,6 +3987,81 @@ mod tests {
             query_cache: Arc::new(QueryCache::new(1024 * 1024)),
             audit_tx: tx,
         }
+    }
+
+    #[tokio::test]
+    async fn fused_dashboard_counts_match_both_original_aggregates() {
+        let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let st = audit_test_state(store.clone(), tx);
+        let table = st.table.as_str();
+        let ingestor = verdigris_ingest::Ingestor::new(store.clone(), table);
+        ingestor
+            .ingest(
+                verdigris_ingest::generate::generate(1_000, 7, 1_762_000_000_000),
+                &st.cfg.routing,
+                st.cfg.ingest.batch_policy(),
+            )
+            .await
+            .unwrap();
+        let manifest = ingestor.load_manifest().await.unwrap();
+        let files: Vec<_> = manifest.files.iter().map(IndexedFile::whole).collect();
+        let (min_ts, max_ts) = time_range(&manifest);
+        let limits = limits(&st);
+        let separate = separate_dashboard_counts(
+            &store,
+            table,
+            &files,
+            min_ts,
+            max_ts,
+            &limits,
+            &st.query_cache,
+        )
+        .await;
+        let fused = fused_dashboard_counts(
+            &store,
+            table,
+            &files,
+            min_ts,
+            max_ts,
+            &limits,
+            &st.query_cache,
+        )
+        .await
+        .unwrap();
+        let service_map = |rows: Vec<Value>| {
+            rows.into_iter()
+                .map(|row| {
+                    (
+                        row["service"].as_str().unwrap().to_string(),
+                        row["n"].as_u64().unwrap(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        assert!(!separate.services.is_empty());
+        assert!(!separate.buckets.is_empty());
+        assert_eq!(service_map(fused.services), service_map(separate.services));
+        assert_eq!(fused.buckets, separate.buckets);
+        let explain = verdigris_query::engine::query_table_json(
+            store.clone(),
+            table,
+            &files,
+            &format!("EXPLAIN {}", fused_dashboard_sql(table, min_ts, max_ts)),
+            &limits,
+        )
+        .await
+        .unwrap();
+        let physical_plan = explain
+            .iter()
+            .find(|row| row["plan_type"] == "physical_plan")
+            .and_then(|row| row["plan"].as_str())
+            .expect("physical plan");
+        assert_eq!(
+            physical_plan.matches("DataSourceExec").count(),
+            1,
+            "{physical_plan}"
+        );
     }
 
     #[tokio::test]

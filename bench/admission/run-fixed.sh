@@ -54,7 +54,13 @@ if [[ "$cheap_permits" != 1 && "$cheap_permits" != 2 ]]; then
   echo "CHEAP_PERMITS must be 1 or 2 for this experiment" >&2
   exit 2
 fi
+dashboard_single_scan=${DASHBOARD_SINGLE_SCAN:-false}
+if [[ "$dashboard_single_scan" != false && "$dashboard_single_scan" != true ]]; then
+  echo "DASHBOARD_SINGLE_SCAN must be false or true" >&2
+  exit 2
+fi
 sed -e 's/perf81-mixed-minio/minio/g' -e "/^\[query\]$/a cheap_permits = $cheap_permits" \
+  -e "/^\[query\]$/a dashboard_single_scan = $dashboard_single_scan" \
   bench/results/issue29/vdg.toml > "$out/config.toml"
 chmod 644 "$out/config.toml"
 vdg=$(docker run -d --pull never --network "$net" --cpus=4 --memory=2g -p 127.0.0.1::8080 \
