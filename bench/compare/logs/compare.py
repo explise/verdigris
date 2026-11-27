@@ -420,11 +420,11 @@ class Vdg(Backend):
             "FROM bench GROUP BY bucket ORDER BY bucket"
         )
 
-    def cache_stats(self):
+    def runtime_stats(self):
         status, _, data = self.client.request("GET", "/v1/metrics")
         if status != 200:
             return {}
-        return json.loads(data).get("queryCache") or {}
+        return json.loads(data)
 
 
 class ClickHouse(Backend):
@@ -746,7 +746,7 @@ def main():
             trace_plan_ms.append(backend.last_stats.get("planMs"))
         return rows
 
-    cache_before = backend.cache_stats() if args.system == "vdg" else {}
+    runtime_before = backend.runtime_stats() if args.system == "vdg" else {}
     q_search = timed(backend.search_recent, args.iterations, args.warmup,
                      lambda got: validate_search(got, search_expected))
     q_trace = timed(next_trace, args.iterations, args.warmup,
@@ -761,7 +761,17 @@ def main():
     )
     q_aggregate = timed(backend.aggregate_minute, args.iterations, args.warmup,
                         lambda got: validate_aggregation(got, bucket_expected))
-    cache_after = backend.cache_stats() if args.system == "vdg" else {}
+    runtime_after = backend.runtime_stats() if args.system == "vdg" else {}
+    cache_before = runtime_before.get("queryCache") or {}
+    cache_after = runtime_after.get("queryCache") or {}
+    audit_before = runtime_before.get("audit")
+    audit_after = runtime_after.get("audit")
+    if args.system == "vdg":
+        expected_acks = 5 * (args.iterations + args.warmup)
+        if (not audit_before or not audit_after
+            or audit_after["ackedTotal"] - audit_before["ackedTotal"] != expected_acks
+            or any(audit_after[k] for k in ("failedTotal", "timedOutTotal", "saturatedTotal"))):
+            raise RuntimeError(f"Verdigris audit unhealthy: {audit_before=} {audit_after=}, expected {expected_acks} acknowledgements")
 
     results = {
         "system": args.system,
@@ -797,6 +807,7 @@ def main():
             "manifest": trace_manifest_ms,
             "plan": trace_plan_ms,
         },
+        "audit": {"before": audit_before, "after": audit_after},
         "query_cache": {
             "before": cache_before,
             "after": cache_after,
