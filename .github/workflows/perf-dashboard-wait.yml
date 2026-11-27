@@ -1,0 +1,36 @@
+name: Verdigris dashboard admission wait experiment
+
+on:
+  push:
+    branches: [codex/perf-dashboard-wait]
+
+permissions:
+  contents: read
+
+jobs:
+  experiment:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the experiment image
+        run: docker build -f bench/Dockerfile.vdg -t verdigris-dashboard-wait:local .
+      - name: Test dashboard admission wait with proven trace and alert settings
+        env:
+          VDG_IMAGE: verdigris-dashboard-wait:local
+          RESULT_ROOT: ${{ runner.temp }}/verdigris-dashboard-wait
+        run: |
+          mkdir -p "$RESULT_ROOT"
+          for wait_ms in 250 1000; do
+            CHEAP_PERMITS=2 SCHEDULED_ALERT_WAIT_MS=1000 DASHBOARD_ADMISSION_WAIT_MS="$wait_ms" \
+              OUT="$RESULT_ROOT/wait-$wait_ms" bench/admission/run-fixed.sh
+          done
+      - name: Upload both treatment arms
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-dashboard-wait
+          path: ${{ runner.temp }}/verdigris-dashboard-wait
+          retention-days: 7

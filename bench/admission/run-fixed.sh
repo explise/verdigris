@@ -59,7 +59,13 @@ if [[ "$scheduled_wait_ms" != 50 && "$scheduled_wait_ms" != 1000 ]]; then
   echo "SCHEDULED_ALERT_WAIT_MS must be 50 or 1000 for this experiment" >&2
   exit 2
 fi
+dashboard_wait_ms=${DASHBOARD_ADMISSION_WAIT_MS:-250}
+if [[ "$dashboard_wait_ms" != 250 && "$dashboard_wait_ms" != 1000 ]]; then
+  echo "DASHBOARD_ADMISSION_WAIT_MS must be 250 or 1000 for this experiment" >&2
+  exit 2
+fi
 sed -e 's/perf81-mixed-minio/minio/g' -e "/^\[query\]$/a cheap_permits = $cheap_permits" \
+  -e "/^\[query\]$/a dashboard_admission_wait_ms = $dashboard_wait_ms" \
   -e "/^\[query\]$/a scheduled_alert_wait_ms = $scheduled_wait_ms" \
   bench/results/issue29/vdg.toml > "$out/config.toml"
 chmod 644 "$out/config.toml"

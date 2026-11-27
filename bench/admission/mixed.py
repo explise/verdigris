@@ -153,6 +153,7 @@ def main():
         headers = {"content-type": "application/json"}
         if kind == "dashboard":
             method, path, body = "GET", "/v1/metrics", None
+            headers["x-vdg-query-profile"] = "1"
         elif kind == "alert":
             method, path = "POST", "/v1/alerts"
             body = json.dumps({
@@ -193,7 +194,15 @@ def main():
                 phases = json.loads(reply_headers["x-vdg-query-profile"])["phases_us"]
             if kind == "alert" and status == 201:
                 alert_id = json.loads(data)["id"]
-            if status not in (200, 201, 429):
+            if kind == "dashboard" and status == 200:
+                payload = json.loads(data)
+                if (len(payload.get("volumeByService", [])) != len(SERVICES)
+                    or not payload.get("ingestRate")
+                    or len(payload.get("ingestRate", [])) != len(payload.get("errorRate", []))):
+                    status, detail = 0, "dashboard_incomplete"
+                else:
+                    phases = json.loads(reply_headers["x-vdg-query-profile"])["phases_us"]
+            if detail is None and status not in (200, 201, 429):
                 detail = data[:200].decode(errors="replace")
         except (OSError, http.client.HTTPException) as exc:
             status, detail = 0, type(exc).__name__

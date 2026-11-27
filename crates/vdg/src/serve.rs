@@ -2831,7 +2831,17 @@ async fn h_config(State(st): State<AppState>) -> ApiResult {
 
 // ──────────────────── partial / placeholder endpoints ────────────────────
 
-async fn h_metrics(State(st): State<AppState>) -> ApiResult {
+async fn h_metrics(State(st): State<AppState>, headers: HeaderMap) -> Result<Response, AppError> {
+    let mut profile = headers
+        .get("x-vdg-query-profile")
+        .filter(|h| *h == "1")
+        .map(|_| {
+            verdigris_query::profile::QueryProfile::new(
+                st.clock.clone(),
+                st.clock.monotonic_micros(),
+                false,
+            )
+        });
     let (s, m) = manifest(&st).await?;
     let total_gib = m.total_bytes() as f64 / cost::GIB;
     let files: Vec<IndexedFile> = m.files.iter().map(IndexedFile::whole).collect();
@@ -2849,6 +2859,9 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
     // One permit covers both dashboard aggregations (service volume and the
     // time histogram). Previously the service-volume query ran outside
     // admission.
+    if let Some(profile) = &mut profile {
+        profile.mark("manifest");
+    }
     let _admission = if files.is_empty() {
         None
     } else {
@@ -2859,11 +2872,19 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
                 &st.cfg.query,
                 scan_bytes,
                 false,
-                Duration::from_millis(st.cfg.query.admission_wait_ms),
+                Duration::from_millis(
+                    st.cfg
+                        .query
+                        .dashboard_admission_wait_ms
+                        .unwrap_or(st.cfg.query.admission_wait_ms),
+                ),
             )
             .await?,
         )
     };
+    if let Some(profile) = &mut profile {
+        profile.mark("admission");
+    }
     if !files.is_empty() {
         let sql =
             format!("SELECT service, count(*) AS n FROM {table} GROUP BY service ORDER BY n DESC");
@@ -2911,6 +2932,10 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
         }
     }
 
+    if let Some(profile) = &mut profile {
+        profile.mark("execute");
+    }
+
     let avg = |v: &[f64]| {
         if v.is_empty() {
             0.0
@@ -2930,7 +2955,7 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
     let last_run = st.compaction.last_run_ms.load(Ordering::Relaxed);
     let (cache_entries, cache_bytes, cache_hits) = st.query_cache.metadata_stats();
 
-    Ok(Json(json!({
+    let response = Json(json!({
         "ingestRate": ingest_rate,
         "errorRate": error_rate,
         "p99": p99, // modeled (no real latency field yet)
@@ -2973,7 +2998,8 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
             "runsTotal": st.compaction.runs_total.load(Ordering::Relaxed),
             "lastRunMs": if last_run == 0 { Value::Null } else { json!(last_run) },
         },
-    })))
+    })).into_response();
+    Ok(profile_response(response, profile))
 }
 
 /// Query params for `/v1/cost`. `days` selects the projection horizon (the
