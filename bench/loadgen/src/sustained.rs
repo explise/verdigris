@@ -344,6 +344,9 @@ pub(super) async fn run(args: &Args, rate: usize) -> Result<()> {
             "incomplete preload"
         );
         eprintln!("preloaded {acknowledged} rows");
+        if std::env::var("VDG_BENCH_PRELOAD_ONLY").as_deref() == Ok("1") {
+            return Ok(());
+        }
     }
 
     let (tx, mut rx) = mpsc::channel(args.concurrency);
