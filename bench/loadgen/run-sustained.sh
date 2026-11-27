@@ -62,6 +62,9 @@ done
 printf 'fixture preflight\n' | mc_run pipe local/verdigris/_benchmark_probe
 mc_run rm local/verdigris/_benchmark_probe
 sed "s/^cores = .*/cores = $query_cores/" bench/config/loadtest.toml > "$out/config.toml"
+if [[ "${PROFILE_INGEST_PHASES:-0}" == 1 ]]; then
+  sed -i '/^\[ingest\]$/a profile_phases = true' "$out/config.toml"
+fi
 chmod 644 "$out/config.toml"
 start_vdg() {
   vdg=$(docker run -d --pull never --network "$net" --cpus="$vdg_cpus" --memory=4g -p 127.0.0.1::8080 \
@@ -116,17 +119,30 @@ fi
   uname -srm
   lscpu
 } > "$out/machine.txt"
+capture_phases() {
+  curl -fsS --max-time 5 "$url/metrics" > "$out/phases-$1.prom"
+}
+if [[ "${PROFILE_INGEST_PHASES:-0}" == 1 ]]; then
+  capture_phases initial
+fi
 "$LOADGEN" --url "$url" --table logs --sustain-rows-per-sec "${ROWS_PER_S:-220000}" \
   --duration-secs "${DURATION_SECS:-600}" --batch-rows "${BATCH_ROWS:-10000}" \
   --concurrency "${LOADGEN_CONCURRENCY:-16}" --out "$out/run.json" > "$out/loadgen.log" 2>&1 &
 load_pid=$!
 while kill -0 "$load_pid" 2>/dev/null; do
+  if [[ "${PROFILE_INGEST_PHASES:-0}" == 1 ]]; then
+    capture_phases "$(date -u +%s)" || true
+  fi
   date -u +%FT%TZ >> "$out/containers.txt"
   docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' "$vdg" "$minio" \
     >> "$out/containers.txt" || true
   sleep 10
 done
 wait "$load_pid"
+if [[ "${PROFILE_INGEST_PHASES:-0}" == 1 ]]; then
+  capture_phases final
+  grep -qE '^verdigris_ingest_phase_observations_total\{phase="manifest_cas"\} [1-9][0-9]*$' "$out/phases-final.prom"
+fi
 snapshot_args=()
 if [[ "${VDG_BENCH_ALLOW_PRELOAD:-0}" == 1 ]]; then
   snapshot_args+=(--allow-preload)
