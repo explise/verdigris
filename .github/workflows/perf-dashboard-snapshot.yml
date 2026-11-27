@@ -2,7 +2,7 @@ name: Verdigris dashboard snapshot reuse experiment
 
 on:
   push:
-    branches: [codex/perf-dashboard-snapshot]
+    branches: [codex/perf-dashboard-snapshot, codex/perf-dashboard-snapshot-test]
 
 permissions:
   contents: read
@@ -19,6 +19,7 @@ jobs:
       - name: Check dashboard snapshot freshness and compaction
         run: cargo test --locked -p vdg --features serve --bin vdg dashboard_snapshot_refreshes_after_ingest_and_compaction
   experiment:
+    if: github.ref_name == 'codex/perf-dashboard-snapshot'
     runs-on: ubuntu-24.04
     timeout-minutes: 55
     steps:

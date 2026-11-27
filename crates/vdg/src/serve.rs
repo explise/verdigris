@@ -3993,8 +3993,10 @@ mod tests {
         let store: Store = Arc::new(object_store::memory::InMemory::new());
         let (tx, _) = tokio::sync::mpsc::channel(1);
         let mut st = audit_test_state(store.clone(), tx);
-        let cache = Arc::new(DashboardCache::default());
-        st.dashboard_cache = Some(cache.clone());
+        // Route this fixture to readable tiers. Cold-file eligibility is
+        // tested separately below to preserve the archive restore policy.
+        Arc::make_mut(&mut st.cfg).routing.debug = Tier::Warm;
+        st.dashboard_cache = Some(Arc::new(DashboardCache::default()));
         let ingestor = verdigris_ingest::Ingestor::new(store, st.table.as_str());
         let before = verdigris_ingest::generate::generate(20, 0, 0);
         ingest_write_then_commit(&st, &ingestor, before)
@@ -4030,9 +4032,13 @@ mod tests {
         assert_eq!(rebuilt["ingestRate"], fresh["ingestRate"]);
         assert_eq!(metrics(&st).await["dashboardSnapshotHits"], 3);
 
-        let mut legacy = ingestor.load_manifest().await.unwrap();
-        legacy.files[0].path = "logs/hot/part-00001.parquet".into();
-        assert!(!DashboardSnapshot::accepts(&legacy));
+        let mut manifest = ingestor.load_manifest().await.unwrap();
+        let tier = manifest.files[0].tier;
+        manifest.files[0].tier = Tier::Cold;
+        assert!(!DashboardSnapshot::accepts(&manifest));
+        manifest.files[0].tier = tier;
+        manifest.files[0].path = "logs/hot/part-00001.parquet".into();
+        assert!(!DashboardSnapshot::accepts(&manifest));
     }
 
     #[tokio::test]
