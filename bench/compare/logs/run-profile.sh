@@ -44,9 +44,9 @@ sed 's/vdgbench-minio/minio/g' bench/compare/logs/vdg.toml > "$scratch/config.to
 chmod 644 "$scratch/config.toml"
 
 vdg=$(docker run -d --pull never --network "$net" --cpus=4 --memory=3g   -p 127.0.0.1::8080 -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS=4   -e RUST_LOG=warn -v "$scratch/config.toml:/app/config/bench.toml:ro"   "$VDG_IMAGE" serve --port 8080 --table bench --role all)
-port=$(docker port "$vdg" 8080/tcp)
-port=${port##*:}
 wait_ready() {
+  port=$(docker port "$vdg" 8080/tcp)
+  port=${port##*:}
   for _ in {1..90}; do
     if curl -fsS --max-time 1 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; then return; fi
     sleep 1
@@ -68,11 +68,11 @@ wait_ready
 cp "$scratch/config.toml" "$OUT/config.toml"
 
 python3 -B bench/compare/logs/compare.py --system vdg --port "$port" --rows "$ROWS"   --iterations 1 --warmup 0 --out "$OUT/seed.json"
-profile=(python3 -B bench/compare/logs/profile.py --port "$port" --seed-report "$OUT/seed.json")
-"${profile[@]}" --iterations "$ITERATIONS" --warmup "$WARMUP" --out "$OUT/warm.json"
+profile=(python3 -B bench/compare/logs/profile.py --seed-report "$OUT/seed.json")
+"${profile[@]}" --port "$port" --iterations "$ITERATIONS" --warmup "$WARMUP" --out "$OUT/warm.json"
 
 for shape in trace_hit trace_miss trace_cross_tier recent_search minute_aggregation; do
   docker restart "$vdg" >/dev/null
   wait_ready
-  "${profile[@]}" --first "$shape" --out "$OUT/restart-$shape.json"
+  "${profile[@]}" --port "$port" --first "$shape" --out "$OUT/restart-$shape.json"
 done
