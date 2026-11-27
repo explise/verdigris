@@ -55,10 +55,14 @@ done
 sed -e 's/vdgbench-minio/minio/g' -e "s/^cores = .*/cores = $SERVICE_CPUS/" bench/compare/logs/vdg.toml > "$scratch/config.toml"
 chmod 644 "$scratch/config.toml"
 
+serve_args=(serve --port 8080 --table bench --role all)
+if [[ "${ROWS_FIRST_CHECK:-0}" == 1 ]]; then
+  serve_args+=(--frontend /app/web)
+fi
 vdg=$(docker run -d --pull never --network "$net" --cpus="$SERVICE_CPUS" --memory=3g \
   -p 127.0.0.1::8080 -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS="$SERVICE_CPUS" \
   -e RUST_LOG=warn -v "$scratch/config.toml:/app/config/bench.toml:ro" \
-  "$VDG_IMAGE" serve --port 8080 --table bench --role all)
+  "$VDG_IMAGE" "${serve_args[@]}")
 wait_ready() {
   port=$(docker port "$vdg" 8080/tcp)
   port=${port##*:}
@@ -85,6 +89,11 @@ cp "$scratch/config.toml" "$OUT/config.toml"
 
 python3 -B bench/compare/logs/compare.py --system vdg --port "$port" --rows "$ROWS" --batch-rows "$BATCH_ROWS" \
   --iterations 1 --warmup 0 --out "$OUT/seed.json"
+if [[ "${ROWS_FIRST_CHECK:-0}" == 1 ]]; then
+  python3 -B bench/compare/logs/rows-first.py --port "$port" --seed-report "$OUT/seed.json" \
+    --iterations "$ITERATIONS" --warmup "$WARMUP" --out "$OUT/rows-first.json"
+  exit
+fi
 profile=(python3 -B bench/compare/logs/profile.py --seed-report "$OUT/seed.json")
 "${profile[@]}" --port "$port" --iterations "$ITERATIONS" --warmup "$WARMUP" --out "$OUT/warm.json"
 if [[ "${SEARCH_CONTROL:-0}" == 1 ]]; then

@@ -2122,17 +2122,7 @@ async fn h_query(
     let arrow = wants_arrow(&headers);
     st.metrics.queries.fetch_add(1, Ordering::Relaxed);
     let t_request = st.clock.monotonic_micros();
-    let mut profile = match headers
-        .get("x-vdg-query-profile")
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(mode @ ("1" | "plan")) => Some(verdigris_query::profile::QueryProfile::new(
-            st.clock.clone(),
-            t_request,
-            mode == "plan",
-        )),
-        _ => None,
-    };
+    let mut profile = request_profile(&st, &headers, t_request);
     // Predicates first: they decide whether the trigram sidecar is worth
     // fetching, so the manifest load can skip it for non-text queries.
     let preds = verdigris_core::search::stat_predicates(&req.sql);
@@ -2225,18 +2215,28 @@ async fn h_query(
     // the same files. A rows-only caller (`"histogram": false`) gets the rows and
     // a row count from the scan it already ran.
     let histogram = if req.histogram {
-        let (min_ts, max_ts) = time_range(&m);
-        histogram(
+        let mut histogram_profile = profile.as_ref().map(|_| {
+            verdigris_query::profile::QueryProfile::new(
+                st.clock.clone(),
+                st.clock.monotonic_micros(),
+                false,
+            )
+        });
+        let result = histogram(
             &s,
             st.table.as_str(),
             &files,
-            min_ts,
-            max_ts,
+            time_range(&m),
             &limits(&st),
             &st.query_cache,
+            histogram_profile.as_mut(),
         )
         .await
-        .unwrap_or_default()
+        .unwrap_or_default();
+        if let (Some(profile), Some(histogram)) = (&mut profile, histogram_profile) {
+            profile.record_histogram(histogram);
+        }
+        result
     } else {
         Vec::new()
     };
@@ -2339,6 +2339,24 @@ async fn h_query(
     Ok(profile_response(response, profile))
 }
 
+fn request_profile(
+    st: &AppState,
+    headers: &HeaderMap,
+    t_request: u64,
+) -> Option<verdigris_query::profile::QueryProfile> {
+    match headers
+        .get("x-vdg-query-profile")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(mode @ ("1" | "plan")) => Some(verdigris_query::profile::QueryProfile::new(
+            st.clock.clone(),
+            t_request,
+            mode == "plan",
+        )),
+        _ => None,
+    }
+}
+
 fn profile_response(
     mut response: Response,
     profile: Option<verdigris_query::profile::QueryProfile>,
@@ -2365,8 +2383,13 @@ struct ActivityReq {
     tiers: Vec<String>,
 }
 
-async fn h_activity(State(st): State<AppState>, Json(req): Json<ActivityReq>) -> ApiResult {
+async fn h_activity(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ActivityReq>,
+) -> Result<Response, AppError> {
     let t0 = st.clock.monotonic_micros();
+    let mut profile = request_profile(&st, &headers, t0);
     let preds = verdigris_core::search::stat_predicates(&req.sql);
     let (s, m) = manifest_for(&st, &preds).await?;
     let tiers: Vec<Tier> = req.tiers.iter().filter_map(|t| parse_tier(t)).collect();
@@ -2393,15 +2416,14 @@ async fn h_activity(State(st): State<AppState>, Json(req): Json<ActivityReq>) ->
     let histogram = if files.is_empty() {
         Vec::new()
     } else {
-        let (min_ts, max_ts) = time_range(&m);
         histogram(
             &s,
             st.table.as_str(),
             &files,
-            min_ts,
-            max_ts,
+            time_range(&m),
             &limits(&st),
             &st.query_cache,
+            profile.as_mut(),
         )
         .await?
     };
@@ -2410,7 +2432,7 @@ async fn h_activity(State(st): State<AppState>, Json(req): Json<ActivityReq>) ->
         .filter_map(|b| b.get("total").and_then(Value::as_i64))
         .sum();
     let elapsed_ms = st.clock.monotonic_micros().saturating_sub(t0) / 1_000;
-    Ok(Json(json!({
+    let response = Json(json!({
         "histogram": histogram,
         "stats": {
             "events": events,
@@ -2418,7 +2440,9 @@ async fn h_activity(State(st): State<AppState>, Json(req): Json<ActivityReq>) ->
             "elapsedMs": elapsed_ms,
             "engine": "datafusion",
         }
-    })))
+    }))
+    .into_response();
+    Ok(profile_response(response, profile))
 }
 
 /// Build a `/v1/query` response in the requested wire. Arrow: the rows are the
@@ -2456,10 +2480,10 @@ async fn histogram(
     s: &Store,
     table: &str,
     files: &[IndexedFile],
-    min_ts: i64,
-    max_ts: i64,
+    (min_ts, max_ts): (i64, i64),
     limits: &QueryLimits,
     cache: &QueryCache,
+    profile: Option<&mut verdigris_query::profile::QueryProfile>,
 ) -> anyhow::Result<Vec<Value>> {
     let range_ms = (max_ts - min_ts).max(1);
     let interval_secs = (range_ms / 60 / 1000).max(1);
@@ -2471,13 +2495,14 @@ async fn histogram(
                 count(*) FILTER (WHERE level = 'ERROR') AS errors \
          FROM {table} GROUP BY {bin} ORDER BY {bin}"
     );
-    let rows = verdigris_query::engine::query_table_json_cached(
+    let rows = verdigris_query::engine::query_table_json_profiled(
         s.clone(),
         table,
         files,
         &sql,
         limits,
         Some(cache),
+        profile,
     )
     .await?;
     Ok(rows
@@ -2869,10 +2894,10 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
             &s,
             table,
             &files,
-            min_ts,
-            max_ts,
+            (min_ts, max_ts),
             &limits(&st),
             &st.query_cache,
+            None,
         )
         .await
         .unwrap_or_default()

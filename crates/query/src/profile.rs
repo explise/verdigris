@@ -18,6 +18,8 @@ pub struct QueryProfile {
     phases: serde_json::Map<String, Value>,
     capture_plan: bool,
     plan: Option<String>,
+    executions: usize,
+    histogram: Option<Value>,
     pub(crate) io: Arc<ReadCounters>,
     parquet_bytes: usize,
     row_groups_pruned: usize,
@@ -33,6 +35,8 @@ impl QueryProfile {
             phases: Default::default(),
             capture_plan,
             plan: None,
+            executions: 0,
+            histogram: None,
             io: Default::default(),
             parquet_bytes: 0,
             row_groups_pruned: 0,
@@ -48,18 +52,28 @@ impl QueryProfile {
     }
 
     pub fn finish(self) -> Value {
-        json!({
+        let mut value = json!({
             "phases_us": self.phases,
+            "executions": self.executions,
             "total_us": self.last.saturating_sub(self.started),
             "object_reads": self.io.snapshot(),
             "parquet_bytes": self.parquet_bytes,
             "row_groups_pruned": self.row_groups_pruned,
             "pages_pruned": self.pages_pruned,
             "physical_plan": self.plan,
-        })
+        });
+        if let Some(histogram) = self.histogram {
+            value["histogram"] = histogram;
+        }
+        value
+    }
+
+    pub fn record_histogram(&mut self, histogram: Self) {
+        self.histogram = Some(histogram.finish());
     }
 
     pub(crate) fn record_plan(&mut self, plan: &dyn ExecutionPlan) {
+        self.executions += 1;
         self.collect_metrics(plan);
         if self.capture_plan {
             // Bound the size of this optional response header. JSON escapes newlines.

@@ -1,0 +1,49 @@
+name: Verdigris rows-first release measurements
+
+on:
+  push:
+    branches: [codex/perf-rows-first-measure]
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the release image with the shipping UI and pull fixture services
+        run: |
+          docker build -t verdigris-rows-first:local .
+          docker pull cgr.dev/chainguard/minio@sha256:634c989a2f1029162fc2676c263caa181213b9410449968532f750a6fb77532d
+          docker pull cgr.dev/chainguard/minio-client@sha256:36ac7ab6d181f259ab62defe0bb55ad1dbf89b152f0b8f49b1c63049374d812f
+          docker pull busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+      - name: Install Chromium
+        run: |
+          python3 -m venv "$RUNNER_TEMP/rows-first-python"
+          "$RUNNER_TEMP/rows-first-python/bin/pip" install playwright==1.63.0
+          "$RUNNER_TEMP/rows-first-python/bin/python" -m playwright install --with-deps chromium
+      - name: Measure rows-only, combined and activity on one settled 1M corpus
+        env:
+          ROWS_FIRST_CHECK: '1'
+          VDG_IMAGE: verdigris-rows-first:local
+          SERVICE_CPUS: '2'
+          ROWS: '1000000'
+          BATCH_ROWS: '10000'
+          ITERATIONS: '100'
+          WARMUP: '10'
+          CORPUS_TS_MS: '1795764240000'
+          OUT: ${{ runner.temp }}/verdigris-rows-first
+        run: |
+          export PATH="$RUNNER_TEMP/rows-first-python/bin:$PATH"
+          bench/compare/logs/run-profile.sh
+      - name: Upload measurements and profile samples
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-rows-first
+          path: ${{ runner.temp }}/verdigris-rows-first
+          retention-days: 7
