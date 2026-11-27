@@ -141,11 +141,48 @@ struct AppState {
     /// Shared, bounded Parquet metadata + schema cache. Scoped to this store and
     /// table; per-query execution memory remains isolated in the engine.
     query_cache: Arc<QueryCache>,
+    dashboard_cache: Option<Arc<DashboardCache>>,
     /// Audit records are persisted by one background writer. Handlers enqueue a
     /// job and wait (bounded) for its acknowledgement, so a healthy store makes
     /// the record durable before the response is released. The queue bounds
     /// memory; a full queue falls back to a direct append.
     audit_tx: tokio::sync::mpsc::Sender<AuditJob>,
+}
+
+#[derive(Default)]
+struct DashboardCache {
+    latest: tokio::sync::Mutex<Option<DashboardSnapshot>>,
+    hits: AtomicU64,
+}
+
+struct DashboardSnapshot {
+    files: Vec<Box<str>>,
+    span: (i64, i64),
+    aggregates: Arc<DashboardAggregates>,
+}
+
+#[derive(Default)]
+struct DashboardAggregates {
+    services: Vec<Value>,
+    histogram: Vec<Value>,
+}
+
+impl DashboardSnapshot {
+    fn accepts(manifest: &Manifest) -> bool {
+        manifest.files.len() <= 1024
+            && manifest.files.iter().all(|file| {
+                file.tier != Tier::Cold && file.path.len() <= 256 && file.is_immutable_key()
+            })
+    }
+
+    fn matches(&self, manifest: &Manifest, span: (i64, i64)) -> bool {
+        self.span == span
+            && self
+                .files
+                .iter()
+                .map(Box::as_ref)
+                .eq(manifest.files.iter().map(|f| f.path.as_str()))
+    }
 }
 
 /// Counters for background auto-compaction. The live "pending files" figure is
@@ -259,17 +296,17 @@ impl Drop for QueueDepthGuard<'_> {
 }
 
 impl Admission {
-    fn new(max_concurrent: usize, clock: Arc<dyn Clock>) -> Self {
+    fn new(max_concurrent: usize, cheap_permits: usize, clock: Arc<dyn Clock>) -> Self {
         let max = max_concurrent.max(1);
         // One slot is reserved for cheap traffic only when there is more than
         // one slot. At max=1 there is exactly one permit in total; cheap and
         // heavy share it rather than creating a second, over-budget permit.
-        let cheap_lane = max > 1;
-        let heavy = max.saturating_sub(1).max(1);
+        let cheap = cheap_permits.min(max - 1);
+        let heavy = max - cheap;
         Self {
             heavy: Arc::new(tokio::sync::Semaphore::new(heavy)),
-            cheap: Arc::new(tokio::sync::Semaphore::new(if cheap_lane { 1 } else { 0 })),
-            cheap_lane,
+            cheap: Arc::new(tokio::sync::Semaphore::new(cheap)),
+            cheap_lane: cheap > 0,
             max,
             clock,
             metrics: AdmissionMetrics::default(),
@@ -964,16 +1001,10 @@ fn store(st: &AppState) -> anyhow::Result<Store> {
     Ok(st.store.clone())
 }
 
-/// Apply the cost gate and acquire a node admission permit. The permit is held
-/// for the whole request (rows and any optional histogram), then released on
-/// drop. Cheap traffic gets the reserved lane.
-async fn admit_scan_with(
-    admission: &Admission,
+fn check_scan_budget(
     cfg: &verdigris_core::config::QueryConfig,
     scan_bytes: u64,
-    cheap: bool,
-    wait: Duration,
-) -> Result<AdmissionPermit, AppError> {
+) -> Result<(), AppError> {
     let max_scan_gib = cfg.max_scan_gib;
     if max_scan_gib > 0.0 {
         let max_bytes = (max_scan_gib * cost::GIB) as u64;
@@ -993,6 +1024,20 @@ async fn admit_scan_with(
             return Err(AppError::scan_over_budget(&est, max_scan_gib));
         }
     }
+    Ok(())
+}
+
+/// Apply the cost gate and acquire a node admission permit. The permit is held
+/// for the whole request (rows and any optional histogram), then released on
+/// drop. Cheap traffic gets the reserved lane.
+async fn admit_scan_with(
+    admission: &Admission,
+    cfg: &verdigris_core::config::QueryConfig,
+    scan_bytes: u64,
+    cheap: bool,
+    wait: Duration,
+) -> Result<AdmissionPermit, AppError> {
+    check_scan_budget(cfg, scan_bytes)?;
     admission
         .admit(cheap, wait)
         .await
@@ -1129,6 +1174,23 @@ async fn save_alerts_cas(
 /// Retry budget for alert-doc CAS commits under contention.
 const ALERTS_CAS_RETRIES: usize = 4;
 
+async fn admit_alert_query(
+    admission: &Admission,
+    cfg: &verdigris_core::config::QueryConfig,
+    files: &[IndexedFile],
+    wait_ms: u64,
+) -> Result<AdmissionPermit, AppError> {
+    let scan_bytes = files.iter().map(|f| f.bytes).sum();
+    admit_scan_with(
+        admission,
+        cfg,
+        scan_bytes,
+        false,
+        Duration::from_millis(wait_ms),
+    )
+    .await
+}
+
 /// Run a rule's SQL and pull out its single numeric result — the `v` column if
 /// present, else the first numeric column of the first row.
 async fn measure(
@@ -1137,12 +1199,8 @@ async fn measure(
     files: &[IndexedFile],
     sql: &str,
     limits: &QueryLimits,
-    admission: &Admission,
-    cfg: &verdigris_core::config::QueryConfig,
+    _permit: AdmissionPermit,
 ) -> Result<f64, AppError> {
-    let scan_bytes: u64 = files.iter().map(|f| f.bytes).sum();
-    let _permit =
-        admit_scan_with(admission, cfg, scan_bytes, false, Duration::from_millis(50)).await?;
     let rows = verdigris_query::engine::query_table_json(s.clone(), table, files, sql, limits)
         .await
         .map_err(AppError::from_query)?;
@@ -1205,17 +1263,18 @@ async fn evaluate_alert_pass(st: &AlertEvaluator) -> anyhow::Result<()> {
                 disabled += 1;
                 continue;
             }
-            let value = match measure(
-                s,
-                table,
-                &files,
-                &a.rule.sql,
-                &st.limits,
+            let result = match admit_alert_query(
                 &st.admission,
                 &st.query,
+                &files,
+                st.query.scheduled_alert_wait_ms,
             )
             .await
             {
+                Ok(permit) => measure(s, table, &files, &a.rule.sql, &st.limits, permit).await,
+                Err(error) => Err(error),
+            };
+            let value = match result {
                 Ok(v) => v,
                 Err(e) => {
                     if e.status == StatusCode::TOO_MANY_REQUESTS {
@@ -1505,7 +1564,11 @@ pub async fn serve_with_clock(
     // footers that cannot have changed (files are immutable).
     let query_store = verdigris_storage::build(&cfg.storage).context("building object store")?;
     let query_cache = Arc::new(QueryCache::from_config(&cfg.query));
-    let admission = Arc::new(Admission::new(cfg.query.max_concurrent, clock.clone()));
+    let admission = Arc::new(Admission::new(
+        cfg.query.max_concurrent,
+        cfg.query.cheap_permits,
+        clock.clone(),
+    ));
     // Replica-unique audit prefix from the same OS entropy used for API tokens.
     // A local counter alone is not unique across containers.
     let audit_replica: Arc<str> = Arc::from(gen_replica_id());
@@ -1543,6 +1606,10 @@ pub async fn serve_with_clock(
     };
 
     let state = AppState {
+        dashboard_cache: cfg
+            .query
+            .dashboard_snapshot_cache
+            .then(|| Arc::new(DashboardCache::default())),
         cfg: Arc::new(cfg),
         table: Arc::new(table),
         ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -2813,84 +2880,136 @@ async fn h_config(State(st): State<AppState>) -> ApiResult {
 
 // ──────────────────── partial / placeholder endpoints ────────────────────
 
+async fn dashboard_aggregates(
+    st: &AppState,
+    s: &Store,
+    manifest: &Manifest,
+) -> Result<(Arc<DashboardAggregates>, Option<AdmissionPermit>), AppError> {
+    if manifest.files.is_empty() {
+        return Ok((Arc::new(DashboardAggregates::default()), None));
+    }
+
+    let span = time_range(manifest);
+    let cache = st
+        .dashboard_cache
+        .as_ref()
+        .filter(|_| DashboardSnapshot::accepts(manifest));
+    // Let a contended request use the normal admission path. A fill never
+    // creates a second request queue outside the query admission limits.
+    let slot = cache.and_then(|cache| cache.latest.try_lock().ok());
+    if let Some(snapshot) = slot
+        .as_deref()
+        .and_then(Option::as_ref)
+        .filter(|snapshot| snapshot.matches(manifest, span))
+    {
+        check_scan_budget(&st.cfg.query, manifest.total_bytes())?;
+        if let Some(cache) = cache {
+            cache.hits.fetch_add(1, Ordering::Relaxed);
+        }
+        return Ok((snapshot.aggregates.clone(), None));
+    }
+
+    let files: Vec<IndexedFile> = manifest.files.iter().map(IndexedFile::whole).collect();
+    let scan_bytes = files.iter().map(|f| f.bytes).sum();
+    let admission = admit_scan_with(
+        &st.admission,
+        &st.cfg.query,
+        scan_bytes,
+        false,
+        Duration::from_millis(st.cfg.query.admission_wait_ms),
+    )
+    .await?;
+    let table = st.table.as_str();
+    let sql =
+        format!("SELECT service, count(*) AS n FROM {table} GROUP BY service ORDER BY n DESC");
+    let services =
+        verdigris_query::engine::query_table_json(s.clone(), table, &files, &sql, &limits(st))
+            .await;
+    let buckets = histogram(
+        s,
+        table,
+        &files,
+        span.0,
+        span.1,
+        &limits(st),
+        &st.query_cache,
+    )
+    .await;
+    if let Err(error) = &services {
+        tracing::warn!(%error, "dashboard service aggregate failed");
+    }
+    if let Err(error) = &buckets {
+        tracing::warn!(%error, "dashboard histogram failed");
+    }
+    let complete = services.is_ok() && buckets.is_ok();
+    let aggregates = Arc::new(DashboardAggregates {
+        services: services.unwrap_or_default(),
+        histogram: buckets.unwrap_or_default(),
+    });
+
+    // A single bounded entry. Keep the existing partial response behavior on
+    // scan failures, while allowing the next request to retry the failed scan.
+    if let Some(mut slot) = slot.filter(|_| {
+        complete
+            && aggregates.services.len() <= 1024
+            && aggregates.services.iter().all(|row| {
+                row.get("service")
+                    .and_then(Value::as_str)
+                    .is_none_or(|name| name.len() <= 256)
+            })
+            && aggregates.histogram.len() <= 128
+    }) {
+        *slot = Some(DashboardSnapshot {
+            files: manifest
+                .files
+                .iter()
+                .map(|f| f.path.as_str().into())
+                .collect(),
+            span,
+            aggregates: aggregates.clone(),
+        });
+    }
+    Ok((aggregates, Some(admission)))
+}
+
 async fn h_metrics(State(st): State<AppState>) -> ApiResult {
     let (s, m) = manifest(&st).await?;
     let total_gib = m.total_bytes() as f64 / cost::GIB;
-    let files: Vec<IndexedFile> = m.files.iter().map(IndexedFile::whole).collect();
-    let table = st.table.as_str();
+    let (aggregates, _admission) = dashboard_aggregates(&st, &s, &m).await?;
+    let total_rows = m.total_rows().max(1) as f64;
+    let volume_by_service: Vec<Value> = aggregates
+        .services
+        .iter()
+        .map(|r| {
+            let n = r.get("n").and_then(Value::as_i64).unwrap_or(0) as f64;
+            json!({
+                "name": r.get("service").and_then(Value::as_str).unwrap_or("?"),
+                "gb": (n / total_rows) * total_gib,
+            })
+        })
+        .collect();
 
-    // Per-service volume (real), proportional to row share.
-    let mut volume_by_service = Vec::new();
-    // Time series derived from the same buckets as the histogram.
+    let (min_ts, max_ts) = time_range(&m);
+    let interval_secs = ((max_ts - min_ts).max(1) / 60 / 1000).max(1) as f64;
     let mut ingest_rate: Vec<f64> = Vec::new();
     let mut error_rate: Vec<f64> = Vec::new();
     let mut p99: Vec<f64> = Vec::new();
     let mut total_events = 0i64;
     let mut total_errors = 0i64;
-
-    // One permit covers both dashboard aggregations (service volume and the
-    // time histogram). Previously the service-volume query ran outside
-    // admission.
-    let _admission = if files.is_empty() {
-        None
-    } else {
-        let scan_bytes: u64 = files.iter().map(|f| f.bytes).sum();
-        Some(
-            admit_scan_with(
-                &st.admission,
-                &st.cfg.query,
-                scan_bytes,
-                false,
-                Duration::from_millis(st.cfg.query.admission_wait_ms),
-            )
-            .await?,
-        )
-    };
-    if !files.is_empty() {
-        let sql =
-            format!("SELECT service, count(*) AS n FROM {table} GROUP BY service ORDER BY n DESC");
-        if let Ok(rows) =
-            verdigris_query::engine::query_table_json(s.clone(), table, &files, &sql, &limits(&st))
-                .await
-        {
-            let total_rows = m.total_rows().max(1) as f64;
-            for r in rows {
-                let n = r.get("n").and_then(Value::as_i64).unwrap_or(0) as f64;
-                volume_by_service.push(json!({
-                    "name": r.get("service").and_then(Value::as_str).unwrap_or("?"),
-                    "gb": (n / total_rows) * total_gib,
-                }));
-            }
-        }
-
-        let (min_ts, max_ts) = time_range(&m);
-        let interval_secs = ((max_ts - min_ts).max(1) / 60 / 1000).max(1) as f64;
-        for b in histogram(
-            &s,
-            table,
-            &files,
-            min_ts,
-            max_ts,
-            &limits(&st),
-            &st.query_cache,
-        )
-        .await
-        .unwrap_or_default()
-        {
-            let total = b.get("total").and_then(Value::as_i64).unwrap_or(0);
-            let errors = b.get("errors").and_then(Value::as_i64).unwrap_or(0);
-            total_events += total;
-            total_errors += errors;
-            ingest_rate.push(total as f64 / interval_secs);
-            let er = if total > 0 {
-                errors as f64 / total as f64 * 100.0
-            } else {
-                0.0
-            };
-            error_rate.push(er);
-            // No latency field in logs yet, so p99 is MODELED from error rate.
-            p99.push(800.0 + er * 18.0);
-        }
+    for b in &aggregates.histogram {
+        let total = b.get("total").and_then(Value::as_i64).unwrap_or(0);
+        let errors = b.get("errors").and_then(Value::as_i64).unwrap_or(0);
+        total_events += total;
+        total_errors += errors;
+        ingest_rate.push(total as f64 / interval_secs);
+        let er = if total > 0 {
+            errors as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
+        error_rate.push(er);
+        // No latency field in logs yet, so p99 is MODELED from error rate.
+        p99.push(800.0 + er * 18.0);
     }
 
     let avg = |v: &[f64]| {
@@ -2923,6 +3042,8 @@ async fn h_metrics(State(st): State<AppState>) -> ApiResult {
             "errors": { "value": format!("{overall_err:.1}"), "unit": "%", "delta": 0.0 },
             "p99":    { "value": format!("{:.2}", avg(&p99) / 1000.0), "unit": "s", "delta": 0.0 },
         },
+        "dashboardSnapshotHits": st.dashboard_cache.as_ref()
+            .map_or(0, |cache| cache.hits.load(Ordering::Relaxed)),
         "queryCache": {
             "metadataEntries": cache_entries,
             "metadataBytes": cache_bytes,
@@ -3111,14 +3232,16 @@ async fn h_alert_create(
         .load_manifest()
         .await?;
     let files: Vec<IndexedFile> = m.files.iter().map(IndexedFile::whole).collect();
+    // Interactive validation keeps its existing admission wait. The longer
+    // background wait only applies to the scheduler.
+    let permit = admit_alert_query(&st.admission, &st.cfg.query, &files, 50).await?;
     let value = measure(
         &s,
         st.table.as_str(),
         &files,
         &rule.sql,
         &limits(&st),
-        &st.admission,
-        &st.cfg.query,
+        permit,
     )
     .await?;
     let (status, _t) = alert::evaluate(&rule, &AlertStatus::initial(now), value, now);
@@ -3864,6 +3987,7 @@ mod tests {
             audit: Arc::new(AuditMetrics::default()),
             admission: Arc::new(Admission::new(
                 4,
+                1,
                 Arc::new(verdigris_core::clock::SimClock::new(0)),
             )),
             ingest_sem: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -3874,8 +3998,65 @@ mod tests {
             clock: Arc::new(verdigris_core::clock::SimClock::new(1_700_000_000_000)),
             store,
             query_cache: Arc::new(QueryCache::new(1024 * 1024)),
+            dashboard_cache: None,
             audit_tx: tx,
         }
+    }
+
+    #[tokio::test]
+    async fn dashboard_snapshot_refreshes_after_ingest_and_compaction() {
+        let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let mut st = audit_test_state(store.clone(), tx);
+        // Route this fixture to readable tiers. Cold-file eligibility is
+        // tested separately below to preserve the archive restore policy.
+        Arc::make_mut(&mut st.cfg).routing.debug = Tier::Warm;
+        st.dashboard_cache = Some(Arc::new(DashboardCache::default()));
+        let ingestor = verdigris_ingest::Ingestor::new(store, st.table.as_str());
+        let before = verdigris_ingest::generate::generate(20, 0, 0);
+        ingest_write_then_commit(&st, &ingestor, before)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.message));
+
+        async fn metrics(st: &AppState) -> Value {
+            h_metrics(State(st.clone()))
+                .await
+                .unwrap_or_else(|e| panic!("{}", e.message))
+                .0
+        }
+
+        let first = metrics(&st).await;
+        assert_eq!(first["dashboardSnapshotHits"], 0);
+        let hit = metrics(&st).await;
+        assert_eq!(hit["dashboardSnapshotHits"], 1);
+        assert_eq!(first["ingestRate"], hit["ingestRate"]);
+
+        let after = verdigris_ingest::generate::generate(20, 1, 0);
+        ingest_write_then_commit(&st, &ingestor, after)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        let fresh = metrics(&st).await;
+        assert_eq!(fresh["dashboardSnapshotHits"], 1);
+        assert_ne!(first["ingestRate"], fresh["ingestRate"]);
+        assert_eq!(metrics(&st).await["dashboardSnapshotHits"], 2);
+
+        let compacted = ingestor.compact(1024 * 1024).await.unwrap();
+        assert!(!compacted.is_empty());
+        let rebuilt = metrics(&st).await;
+        assert_eq!(rebuilt["dashboardSnapshotHits"], 2);
+        assert_eq!(rebuilt["ingestRate"], fresh["ingestRate"]);
+        assert_eq!(metrics(&st).await["dashboardSnapshotHits"], 3);
+        Arc::make_mut(&mut st.cfg).query.max_scan_gib = 1e-10;
+        let rejected = h_metrics(State(st.clone())).await.err().unwrap();
+        assert_eq!(rejected.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+        let mut manifest = ingestor.load_manifest().await.unwrap();
+        let tier = manifest.files[0].tier;
+        manifest.files[0].tier = Tier::Cold;
+        assert!(!DashboardSnapshot::accepts(&manifest));
+        manifest.files[0].tier = tier;
+        manifest.files[0].path = "logs/hot/part-00001.parquet".into();
+        assert!(!DashboardSnapshot::accepts(&manifest));
     }
 
     #[tokio::test]
@@ -3921,7 +4102,7 @@ mod tests {
             alerts_lock: st.alerts_lock.clone(),
             limits: limits(&st),
             clock: st.clock.clone(),
-            admission: Arc::new(Admission::new(1, st.clock.clone())),
+            admission: Arc::new(Admission::new(1, 1, st.clock.clone())),
             query: st.cfg.query.clone(),
             metrics: st.metrics.clone(),
         };
@@ -4138,7 +4319,7 @@ mod tests {
     #[tokio::test]
     async fn admission_sheds_heavy_but_reserves_cheap_lane() {
         let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
-        let admission = Admission::new(4, clock);
+        let admission = Admission::new(4, 1, clock);
         let _a = admission
             .admit(false, Duration::from_millis(5))
             .await
@@ -4164,10 +4345,24 @@ mod tests {
         assert_eq!(admission.metrics.shed.load(Ordering::Relaxed), 1);
     }
 
+    #[test]
+    fn reserved_permits_share_one_node_cap() {
+        let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
+        for (max, requested, heavy, cheap) in
+            [(4, 1, 3, 1), (4, 2, 2, 2), (4, 9, 1, 3), (1, 2, 1, 0)]
+        {
+            let gate = Admission::new(max, requested, clock.clone());
+            assert_eq!(gate.heavy.available_permits(), heavy);
+            assert_eq!(gate.cheap.available_permits(), cheap);
+            assert_eq!(heavy + cheap, max);
+            assert_eq!(gate.cheap_lane, cheap > 0);
+        }
+    }
+
     #[tokio::test]
     async fn max_concurrent_one_has_exactly_one_permit() {
         let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
-        let admission = Admission::new(1, clock);
+        let admission = Admission::new(1, 1, clock);
         // The first (cheap or heavy) request gets the one permit.
         let _one = admission
             .admit(true, Duration::from_millis(5))
@@ -4187,7 +4382,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_waiter_releases_queue_accounting() {
         let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
-        let admission = Arc::new(Admission::new(2, clock));
+        let admission = Arc::new(Admission::new(2, 1, clock));
         let _heavy = admission
             .admit(false, Duration::from_millis(5))
             .await
