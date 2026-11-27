@@ -317,6 +317,8 @@ pub struct QueryConfig {
     /// reserved for cheap queries so a dashboard LIMIT query cannot starve
     /// behind full-scan aggregates.
     pub max_concurrent: usize,
+    /// Permit slots reserved for cheap work, capped below the total capacity.
+    pub cheap_permits: usize,
     /// How long a heavy query waits for a permit before 429.
     pub admission_wait_ms: u64,
     /// A query with `LIMIT <= this` uses the cheap lane. `0` disables the
@@ -342,6 +344,7 @@ impl Default for QueryConfig {
             max_result_mib: 256,
             metadata_cache_mib: 64,
             max_concurrent: 4,
+            cheap_permits: 1,
             admission_wait_ms: 250,
             cheap_limit_rows: 1_000,
             cheap_scan_mib: 8,

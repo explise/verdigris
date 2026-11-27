@@ -49,7 +49,13 @@ done
 # minimum free-drive threshold while every upload is rejected.
 printf 'fixture preflight\n' | mc_run pipe local/verdigris/_benchmark_probe
 mc_run rm local/verdigris/_benchmark_probe
-sed 's/perf81-mixed-minio/minio/g' bench/results/issue29/vdg.toml > "$out/config.toml"
+cheap_permits=${CHEAP_PERMITS:-1}
+if [[ "$cheap_permits" != 1 && "$cheap_permits" != 2 ]]; then
+  echo "CHEAP_PERMITS must be 1 or 2 for this experiment" >&2
+  exit 2
+fi
+sed -e 's/perf81-mixed-minio/minio/g' -e "/^\[query\]$/a cheap_permits = $cheap_permits" \
+  bench/results/issue29/vdg.toml > "$out/config.toml"
 chmod 644 "$out/config.toml"
 vdg=$(docker run -d --pull never --network "$net" --cpus=4 --memory=2g -p 127.0.0.1::8080 \
   -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS=4 -e RUST_LOG=warn \
@@ -89,3 +95,4 @@ for trial in 1 2 3; do
     --out "$out/trial-$trial.json" > "$out/trial-$trial.log"
   echo "Completed trial $trial"
 done
+curl -fsS --max-time 10 "http://127.0.0.1:$port/v1/metrics" > "$out/metrics-after.json"

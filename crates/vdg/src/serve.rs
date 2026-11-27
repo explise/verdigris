@@ -259,17 +259,17 @@ impl Drop for QueueDepthGuard<'_> {
 }
 
 impl Admission {
-    fn new(max_concurrent: usize, clock: Arc<dyn Clock>) -> Self {
+    fn new(max_concurrent: usize, cheap_permits: usize, clock: Arc<dyn Clock>) -> Self {
         let max = max_concurrent.max(1);
         // One slot is reserved for cheap traffic only when there is more than
         // one slot. At max=1 there is exactly one permit in total; cheap and
         // heavy share it rather than creating a second, over-budget permit.
-        let cheap_lane = max > 1;
-        let heavy = max.saturating_sub(1).max(1);
+        let cheap = cheap_permits.min(max - 1);
+        let heavy = max - cheap;
         Self {
             heavy: Arc::new(tokio::sync::Semaphore::new(heavy)),
-            cheap: Arc::new(tokio::sync::Semaphore::new(if cheap_lane { 1 } else { 0 })),
-            cheap_lane,
+            cheap: Arc::new(tokio::sync::Semaphore::new(cheap)),
+            cheap_lane: cheap > 0,
             max,
             clock,
             metrics: AdmissionMetrics::default(),
@@ -1505,7 +1505,11 @@ pub async fn serve_with_clock(
     // footers that cannot have changed (files are immutable).
     let query_store = verdigris_storage::build(&cfg.storage).context("building object store")?;
     let query_cache = Arc::new(QueryCache::from_config(&cfg.query));
-    let admission = Arc::new(Admission::new(cfg.query.max_concurrent, clock.clone()));
+    let admission = Arc::new(Admission::new(
+        cfg.query.max_concurrent,
+        cfg.query.cheap_permits,
+        clock.clone(),
+    ));
     // Replica-unique audit prefix from the same OS entropy used for API tokens.
     // A local counter alone is not unique across containers.
     let audit_replica: Arc<str> = Arc::from(gen_replica_id());
@@ -3864,6 +3868,7 @@ mod tests {
             audit: Arc::new(AuditMetrics::default()),
             admission: Arc::new(Admission::new(
                 4,
+                1,
                 Arc::new(verdigris_core::clock::SimClock::new(0)),
             )),
             ingest_sem: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -3921,7 +3926,7 @@ mod tests {
             alerts_lock: st.alerts_lock.clone(),
             limits: limits(&st),
             clock: st.clock.clone(),
-            admission: Arc::new(Admission::new(1, st.clock.clone())),
+            admission: Arc::new(Admission::new(1, 1, st.clock.clone())),
             query: st.cfg.query.clone(),
             metrics: st.metrics.clone(),
         };
@@ -4082,7 +4087,7 @@ mod tests {
     #[tokio::test]
     async fn admission_sheds_heavy_but_reserves_cheap_lane() {
         let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
-        let admission = Admission::new(4, clock);
+        let admission = Admission::new(4, 1, clock);
         let _a = admission
             .admit(false, Duration::from_millis(5))
             .await
@@ -4108,10 +4113,24 @@ mod tests {
         assert_eq!(admission.metrics.shed.load(Ordering::Relaxed), 1);
     }
 
+    #[test]
+    fn reserved_permits_share_one_node_cap() {
+        let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
+        for (max, requested, heavy, cheap) in
+            [(4, 1, 3, 1), (4, 2, 2, 2), (4, 9, 1, 3), (1, 2, 1, 0)]
+        {
+            let gate = Admission::new(max, requested, clock.clone());
+            assert_eq!(gate.heavy.available_permits(), heavy);
+            assert_eq!(gate.cheap.available_permits(), cheap);
+            assert_eq!(heavy + cheap, max);
+            assert_eq!(gate.cheap_lane, cheap > 0);
+        }
+    }
+
     #[tokio::test]
     async fn max_concurrent_one_has_exactly_one_permit() {
         let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
-        let admission = Admission::new(1, clock);
+        let admission = Admission::new(1, 1, clock);
         // The first (cheap or heavy) request gets the one permit.
         let _one = admission
             .admit(true, Duration::from_millis(5))
@@ -4131,7 +4150,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_waiter_releases_queue_accounting() {
         let clock: Arc<dyn Clock> = Arc::new(verdigris_core::clock::SimClock::new(0));
-        let admission = Arc::new(Admission::new(2, clock));
+        let admission = Arc::new(Admission::new(2, 1, clock));
         let _heavy = admission
             .admit(false, Duration::from_millis(5))
             .await
