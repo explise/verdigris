@@ -10,6 +10,12 @@ if [[ ! "$vdg_cpus" =~ ^[1-9][0-9]*$ || ! "$minio_cpus" =~ ^[1-9][0-9]*$ ]]; the
   echo 'CPU limits must be positive integers' >&2
   exit 2
 fi
+if [[ "${REQUIRE_REFERENCE_PROFILE:-0}" == 1 ]]; then
+  if [[ "$vdg_cpus" != 8 || "$minio_cpus" != 4 ]] || (( $(nproc) < 14 )); then
+    echo "reference profile requires 8 Verdigris CPUs, 4 MinIO CPUs and at least 2 host CPUs for the driver" >&2
+    exit 2
+  fi
+fi
 query_cores=$(( vdg_cpus < 4 ? vdg_cpus : 4 ))
 out=$(realpath -m "${OUT:-$(mktemp -d)}")
 mkdir -p "$out"
