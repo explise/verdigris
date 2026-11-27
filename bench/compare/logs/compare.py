@@ -327,13 +327,25 @@ class Vdg(Backend):
             raise RuntimeError(f"vdg ingest {status}: {data[:300]!r}")
         return int(json.loads(data)["ingested"])
 
+    profile_mode = None
+    last_profile = None
+
     def _query(self, sql: str, tiers=()):
         body = json.dumps({"sql": sql, "tiers": list(tiers), "histogram": False}).encode()
-        status, _, data = self.client.request("POST", "/v1/query", body, {"content-type": "application/json"})
+        request_headers = {"content-type": "application/json"}
+        if self.profile_mode:
+            request_headers["x-vdg-query-profile"] = self.profile_mode
+        status, headers, data = self.client.request("POST", "/v1/query", body, request_headers)
         if status != 200:
             raise RuntimeError(f"vdg query {status}: {data[:300]!r}")
         payload = json.loads(data)
         self.last_stats = payload.get("stats") or {}
+        self.last_profile = None
+        if self.profile_mode:
+            value = next((v for k, v in headers if k.lower() == "x-vdg-query-profile"), None)
+            if value is None:
+                raise RuntimeError("server did not return the requested query profile")
+            self.last_profile = json.loads(value)
         return payload["rows"]
 
     def settle(self):

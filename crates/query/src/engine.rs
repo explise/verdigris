@@ -31,12 +31,14 @@ use datafusion::execution::cache::DefaultFilesMetadataCache;
 use datafusion::execution::memory_pool::{FairSpillPool, TrackConsumersPool};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
+use datafusion::physical_plan::execute_stream;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use object_store::ObjectStore;
 use verdigris_core::config::QueryConfig;
 
 use crate::index::{IndexedFile, IndexedParquetTable};
+use crate::profile::QueryProfile;
 
 /// Bound on cached schemas. A table normally has one, but compaction changes
 /// the first selected path; keep a small window so a long-lived process cannot
@@ -228,6 +230,7 @@ async fn collect_batches(
     sql: &str,
     limits: &QueryLimits,
     cache: Option<&QueryCache>,
+    mut profile: Option<&mut QueryProfile>,
 ) -> anyhow::Result<Vec<RecordBatch>> {
     anyhow::ensure!(!files.is_empty(), "table '{table}' has no files to query");
 
@@ -286,7 +289,14 @@ async fn collect_batches(
 
     // Register our object store under a synthetic scheme/authority.
     let base = ObjectStoreUrl::parse("verdigris://store").context("parsing object store url")?;
+    let store = match profile.as_ref() {
+        Some(profile) => profile.wrap(store),
+        None => store,
+    };
     ctx.register_object_store(base.as_ref(), store);
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.mark("session_setup");
+    }
 
     // Register the exact files from the manifest as the table's paths.
     //
@@ -323,8 +333,28 @@ async fn collect_batches(
     ctx.register_table(table, Arc::new(provider))
         .context("registering table")?;
 
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.mark("table_setup");
+    }
     let df = ctx.sql(sql).await.context("planning sql")?;
-    collect_bounded(df, limits).await
+    if let Some(profile) = profile {
+        profile.mark("logical_plan");
+        let task = Arc::new(df.task_ctx());
+        let plan = df
+            .create_physical_plan()
+            .await
+            .context("planning execution")?;
+        profile.mark("physical_plan");
+        let stream = execute_stream(plan.clone(), task).context("executing sql")?;
+        let batches = collect_bounded(stream, limits).await?;
+        profile.mark("execute");
+        profile.record_plan(plan.as_ref());
+        profile.mark("collect_metrics");
+        Ok(batches)
+    } else {
+        let stream = df.execute_stream().await.context("executing sql")?;
+        collect_bounded(stream, limits).await
+    }
 }
 
 /// Drain a plan's output stream, enforcing the result-set ceiling as it goes.
@@ -337,8 +367,10 @@ async fn collect_batches(
 ///
 /// `get_array_memory_size` is the batch's true Arrow footprint (buffers included),
 /// which is what actually occupies the box — not the encoded-Parquet size.
-async fn collect_bounded(df: DataFrame, limits: &QueryLimits) -> anyhow::Result<Vec<RecordBatch>> {
-    let mut stream = df.execute_stream().await.context("executing sql")?;
+async fn collect_bounded(
+    mut stream: datafusion::physical_plan::SendableRecordBatchStream,
+    limits: &QueryLimits,
+) -> anyhow::Result<Vec<RecordBatch>> {
     let mut out = Vec::new();
     let mut rows: u64 = 0;
     let mut bytes: u64 = 0;
@@ -372,7 +404,7 @@ pub async fn query_table(
     sql: &str,
     limits: &QueryLimits,
 ) -> anyhow::Result<QueryOutput> {
-    let batches = collect_batches(store, table, files, sql, limits, None).await?;
+    let batches = collect_batches(store, table, files, sql, limits, None, None).await?;
     let rows = batches.iter().map(|b| b.num_rows()).sum();
     let pretty = pretty_format_batches(&batches)
         .context("formatting results")?
@@ -404,7 +436,28 @@ pub async fn query_table_json_cached(
     limits: &QueryLimits,
     cache: Option<&QueryCache>,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    let batches = collect_batches(store, table, files, sql, limits, cache).await?;
+    query_table_json_profiled(store, table, files, sql, limits, cache, None).await
+}
+
+pub async fn query_table_json_profiled(
+    store: Arc<dyn ObjectStore>,
+    table: &str,
+    files: &[IndexedFile],
+    sql: &str,
+    limits: &QueryLimits,
+    cache: Option<&QueryCache>,
+    mut profile: Option<&mut QueryProfile>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let batches = collect_batches(
+        store,
+        table,
+        files,
+        sql,
+        limits,
+        cache,
+        profile.as_deref_mut(),
+    )
+    .await?;
     let mut buf = Vec::new();
     {
         let mut writer = ArrayWriter::new(&mut buf);
@@ -413,10 +466,15 @@ pub async fn query_table_json_cached(
         }
         writer.finish().context("finishing json")?;
     }
-    if buf.is_empty() {
-        return Ok(vec![]);
+    let rows = if buf.is_empty() {
+        vec![]
+    } else {
+        serde_json::from_slice(&buf).context("parsing json rows")?
+    };
+    if let Some(profile) = profile {
+        profile.mark("encode_rows");
     }
-    serde_json::from_slice(&buf).context("parsing json rows")
+    Ok(rows)
 }
 
 /// Arrow-IPC bytes plus the number of rows they encode. The row count is what
@@ -452,9 +510,33 @@ pub async fn query_table_arrow_with_rows_cached(
     limits: &QueryLimits,
     cache: Option<&QueryCache>,
 ) -> anyhow::Result<ArrowOutput> {
-    let batches = collect_batches(store, table, files, sql, limits, cache).await?;
+    query_table_arrow_with_rows_profiled(store, table, files, sql, limits, cache, None).await
+}
+
+pub async fn query_table_arrow_with_rows_profiled(
+    store: Arc<dyn ObjectStore>,
+    table: &str,
+    files: &[IndexedFile],
+    sql: &str,
+    limits: &QueryLimits,
+    cache: Option<&QueryCache>,
+    mut profile: Option<&mut QueryProfile>,
+) -> anyhow::Result<ArrowOutput> {
+    let batches = collect_batches(
+        store,
+        table,
+        files,
+        sql,
+        limits,
+        cache,
+        profile.as_deref_mut(),
+    )
+    .await?;
     let rows = batches.iter().map(|b| b.num_rows()).sum();
     if batches.is_empty() {
+        if let Some(profile) = profile {
+            profile.mark("encode_rows");
+        }
         return Ok(ArrowOutput {
             bytes: Vec::new(),
             rows,
@@ -478,6 +560,9 @@ pub async fn query_table_arrow_with_rows_cached(
             writer.write(b).context("arrow-encoding batch")?;
         }
         writer.finish().context("finishing arrow stream")?;
+    }
+    if let Some(profile) = profile {
+        profile.mark("encode_rows");
     }
     Ok(ArrowOutput { bytes: buf, rows })
 }
