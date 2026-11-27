@@ -1,5 +1,8 @@
 # Issue #29 · Query admission under sustained mixed load
 
+The [disk-backed replay](disk-backed/README.md) missed the trace target and
+measured scheduled alert starvation.
+
 See the [fixed-rate follow-up](fixed-rate/README.md) for the evaluated arrival
 mix, queue timings, and dashboard and alert outcomes. The trials below are the
 original closed-loop baseline.
