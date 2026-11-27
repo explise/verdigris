@@ -48,6 +48,8 @@ def run_one(backend, shape, index, corpus, mode):
         "elapsed_ms": elapsed_ms,
         "rows": len(rows),
         "audit_ms": backend.last_stats.get("auditMs"),
+        "planned_files": backend.last_stats.get("files"),
+        "planned_bytes": backend.last_stats.get("scannedBytes"),
         "profile": backend.last_profile,
     }
 
@@ -116,6 +118,7 @@ def main():
                 out["queries"][shape] = {mode: summarize(samples[mode]) for mode in samples}
 
             out["representative_plan"] = run_one(backend, "trace_hit", 0, corpus, "plan")["profile"]
+            out["recent_search_plan"] = run_one(backend, "recent_search", 0, corpus, "plan")
             status, _, data = backend.client.request("GET", "/v1/metrics")
             if status != 200:
                 raise RuntimeError(f"query metrics failed with HTTP {status}")
