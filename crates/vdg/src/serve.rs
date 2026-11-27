@@ -1752,10 +1752,24 @@ async fn h_query(
     let arrow = wants_arrow(&headers);
     st.metrics.queries.fetch_add(1, Ordering::Relaxed);
     let t_request = st.clock.monotonic_micros();
+    let mut profile = match headers
+        .get("x-vdg-query-profile")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(mode @ ("1" | "plan")) => Some(verdigris_query::profile::QueryProfile::new(
+            st.clock.as_ref(),
+            t_request,
+            mode == "plan",
+        )),
+        _ => None,
+    };
     // Predicates first: they decide whether the trigram sidecar is worth
     // fetching, so the manifest load can skip it for non-text queries.
     let preds = verdigris_core::search::stat_predicates(&req.sql);
     let (s, m) = manifest_for(&st, &preds).await?;
+    if let Some(profile) = &mut profile {
+        profile.mark("manifest");
+    }
     let manifest_us = st.clock.monotonic_micros().saturating_sub(t_request);
 
     // Build ONE scan plan, the same call `POST /v1/query/estimate` makes. It
@@ -1780,7 +1794,13 @@ async fn h_query(
     let selected = &plan.files;
     if selected.is_empty() {
         let stats = json!({ "events": 0, "scannedBytes": 0, "elapsedMs": 0, "engine": "datafusion", "files": 0 });
-        return Ok(query_response(arrow, Vec::new(), &stats, &Vec::new()));
+        if let Some(profile) = &mut profile {
+            profile.mark("scan_plan");
+        }
+        return Ok(profile_response(
+            query_response(arrow, Vec::new(), &stats, &[]),
+            profile,
+        ));
     }
     let scanned_bytes: u64 = plan.scanned_bytes();
     // Same predicates again, one level down: `select_files` decided which files to
@@ -1796,27 +1816,32 @@ async fn h_query(
     let sql = plan.sql.clone();
 
     // Run the query once, in the negotiated wire (never both).
+    if let Some(profile) = &mut profile {
+        profile.mark("scan_plan");
+    }
     let t0 = st.clock.monotonic_micros();
     let (arrow_body, json_rows, rows_returned) = if arrow {
-        let out = verdigris_query::engine::query_table_arrow_with_rows_cached(
+        let out = verdigris_query::engine::query_table_arrow_with_rows_profiled(
             s.clone(),
             st.table.as_str(),
             &files,
             &sql,
             &limits(&st),
             Some(&st.query_cache),
+            profile.as_mut(),
         )
         .await
         .map_err(AppError::from_query)?;
         (out.bytes, Value::Null, out.rows)
     } else {
-        let rows = verdigris_query::engine::query_table_json_cached(
+        let rows = verdigris_query::engine::query_table_json_profiled(
             s.clone(),
             st.table.as_str(),
             &files,
             &sql,
             &limits(&st),
             Some(&st.query_cache),
+            profile.as_mut(),
         )
         .await
         .map_err(AppError::from_query)?;
@@ -1844,6 +1869,9 @@ async fn h_query(
     } else {
         Vec::new()
     };
+    if let Some(profile) = &mut profile {
+        profile.mark("histogram");
+    }
     // With a histogram, `events` is the exact total matched count (histogram
     // sum). Without one, it is the page of rows this response actually carries —
     // no second scan is spent inferring a total the caller did not ask for.
@@ -1922,7 +1950,13 @@ async fn h_query(
     // healthy store makes the record immediately visible to other replicas.
     // Persistence errors are counted and remain fail-open.
     let audit_start = st.clock.monotonic_micros();
+    if let Some(profile) = &mut profile {
+        profile.mark("audit_prepare");
+    }
     persist_audit(&st, rec).await;
+    if let Some(profile) = &mut profile {
+        profile.mark("audit_wait");
+    }
     let audit_us = st.clock.monotonic_micros().saturating_sub(audit_start);
     let total_us = st.clock.monotonic_micros().saturating_sub(t_request);
     if let Some(obj) = stats.as_object_mut() {
@@ -1930,14 +1964,25 @@ async fn h_query(
         obj.insert("totalMs".into(), json!(total_us / 1_000));
     }
 
-    if arrow {
-        Ok(query_response(true, arrow_body, &stats, &histogram))
+    let response = if arrow {
+        query_response(true, arrow_body, &stats, &histogram)
     } else {
-        Ok(
-            Json(json!({ "rows": json_rows, "stats": stats, "histogram": histogram }))
-                .into_response(),
-        )
+        Json(json!({ "rows": json_rows, "stats": stats, "histogram": histogram })).into_response()
+    };
+    Ok(profile_response(response, profile))
+}
+
+fn profile_response(
+    mut response: Response,
+    profile: Option<verdigris_query::profile::QueryProfile<'_>>,
+) -> Response {
+    if let Some(mut profile) = profile {
+        profile.mark("encode_response");
+        if let Ok(value) = axum::http::HeaderValue::from_str(&profile.finish().to_string()) {
+            response.headers_mut().insert("x-vdg-query-profile", value);
+        }
     }
+    response
 }
 
 /// Build a `/v1/query` response in the requested wire. Arrow: the rows are the

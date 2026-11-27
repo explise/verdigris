@@ -98,6 +98,8 @@ impl ScanExecutor for ModeledExecutor {
 pub mod engine;
 #[cfg(feature = "datafusion")]
 pub mod index;
+#[cfg(feature = "datafusion")]
+pub mod profile;
 
 #[cfg(test)]
 mod tests {

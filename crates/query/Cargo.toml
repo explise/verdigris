@@ -13,7 +13,7 @@ publish = false
 # it is native C++ and opaque to the deterministic simulator (see ADR-001).
 [features]
 default = []
-datafusion = ["dep:datafusion", "dep:object_store", "dep:serde_json", "dep:futures"]
+datafusion = ["dep:datafusion", "dep:object_store", "dep:serde_json", "dep:futures", "dep:bytes"]
 
 [dependencies]
 verdigris-core.workspace = true
@@ -24,6 +24,7 @@ tracing.workspace = true
 # Only needed by the (gated) DataFusion engine; must be the same object_store
 # version DataFusion uses so Arc<dyn ObjectStore> unifies.
 object_store = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 # Result batches are drained as a stream (bounded execution, issue #2).
 futures = { workspace = true, optional = true }

@@ -116,3 +116,41 @@ its budget as the production deployment would be.
 The retained-bytes column is the on-disk footprint after settling, not S3
 storage-class charges. A cold-storage comparison needs a lifecycle/restore run
 (see `docs/cost.md`), not this harness.
+
+## Profile Verdigris query latency
+
+Build the release image with the repository Dockerfile. Then run:
+
+```sh
+docker build -t verdigris-bench:issue83 .
+VDG_IMAGE=verdigris-bench:issue83 OUT=/tmp/verdigris-profile-1 \
+  bench/compare/logs/run-profile.sh
+```
+
+Use a new output path for each deployment. Run three fresh 1M-row
+deployments and one with `ROWS=20000000`. Each run prunes its own benchmark
+network and volume. The pinned MinIO server, client and BusyBox images need
+to be present locally. The runner enables the checked-out branch's audit
+policy and records audit counters. Compare results only against builds with
+the intended durable audit policy.
+
+The seed step checks result counts and waits for compaction. The warm step
+uses the same schedule with diagnostics enabled and disabled in alternating
+order. Each restart result is the first query of its shape after restarting
+the Verdigris process. MinIO and the operating system's file cache stay warm.
+
+`X-VDG-Query-Profile: 1` enables query timing in microseconds and returns it
+in the response header of the same name for JSON or Arrow. The `plan` value
+also adds a bounded display of the physical plan. The header is a diagnostic
+interface. It does not change rows or the normal response body. Enable it
+only on sample requests because it adds instrumentation and header overhead.
+There is no query admission timer in builds without the admission gate.
+
+Execution includes object reads, decode and runtime scheduling. Parquet
+physical metrics cover the primary scan, while the timed histogram is a
+separate phase if requested. The request-local object counters distinguish
+GETs, HEADs and logical range batches. Range bytes are before backend
+coalescing and are not provider-billed metrics. Manifest and audit I/O are
+outside the Parquet counters. The client latency includes HTTP transfer and
+response parsing. Server phase totals end after encoding the response,
+before profiling-header serialization and network transmission.
