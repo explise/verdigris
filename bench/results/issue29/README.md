@@ -51,7 +51,7 @@ next performance problem. The read-wait evidence is in `bench/results/issue83/`.
 ## Check a fixed-rate replay
 
 ```sh
-python3 -B bench/admission/check-fixed.py <result-directory>
+python3 -B bench/admission/check-fixed.py --expect-backing disk <result-directory>
 ```
 
 Use Python 3.11 or newer. The checker accepts raw or gzipped trials, verifies

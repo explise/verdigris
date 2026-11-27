@@ -82,7 +82,16 @@ def verify_trial(data, trial):
     }
 
 
-def summarize(directory):
+def summarize(directory, expected_backing):
+    machine = (directory / "machine.txt").read_text().lower()
+    if "tmpfs" in machine:
+        backing = "ram"
+    elif "disk-backed minio" in machine:
+        backing = "disk"
+    else:
+        backing = "unknown"
+    if expected_backing is not None and backing != expected_backing:
+        raise ValueError(f"expected {expected_backing} backing, recorded {backing}")
     with (directory / "config.toml").open("rb") as config:
         query = tomllib.load(config)["query"]
     if query["max_concurrent"] != 4:
@@ -107,6 +116,7 @@ def summarize(directory):
     passed = healthy and all(trial["trace_gate"] and trial["heavy_progress"] for trial in trials)
     return {
         "decision": "pass" if passed else "no-go",
+        "storage_backing": backing,
         "configured_query_permits": query["max_concurrent"],
         "configured_reserved_permits": query.get("cheap_permits", 1),
         "containers": states,
@@ -117,9 +127,10 @@ def summarize(directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
+    parser.add_argument("--expect-backing", choices=("disk", "ram"))
     args = parser.parse_args()
     try:
-        report = summarize(args.directory)
+        report = summarize(args.directory, args.expect_backing)
     except (OSError, ValueError, TypeError, KeyError) as exc:
         print(f"invalid benchmark evidence: {exc}", file=sys.stderr)
         return 2
