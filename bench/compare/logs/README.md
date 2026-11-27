@@ -128,7 +128,7 @@ VDG_IMAGE=verdigris-bench:issue83 OUT=/tmp/verdigris-profile-1 \
 ```
 
 Use a new output path for each deployment. Run three fresh 1M-row
-deployments and one with `ROWS=20000000`. Each run prunes its own benchmark
+deployments and one sizing run with `ROWS=20000000 BATCH_ROWS=50000 ITERATIONS=20 WARMUP=5`. Each run prunes its own benchmark
 network and volume. The pinned MinIO server, client and BusyBox images need
 to be present locally. The runner enables the checked-out branch's audit
 policy and records audit counters. Compare results only against builds with
