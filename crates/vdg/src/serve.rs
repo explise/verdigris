@@ -4002,6 +4002,84 @@ mod tests {
         assert_eq!(doc.queries[0].id, "audit-1");
     }
 
+    async fn verify_stale_audit_update(store: Store) {
+        let table = "test-audit-stale-update";
+        let path = audit_path(table);
+        match store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => panic!("clearing test audit object: {error}"),
+        }
+        append_audit(&store, table, audit_rec(0)).await.unwrap();
+        let (established, version) = load_audit(&store, table).await.unwrap();
+        let version = version.unwrap();
+        let initial_etag = version.e_tag.clone().expect("CAS requires an ETag");
+        // Establish the same cached version in both replicas before either writes.
+        let mut first = Some(AuditCache {
+            doc: established.clone(),
+            version: Some(version.clone()),
+            no_cas: false,
+        });
+        let mut stale = Some(AuditCache {
+            doc: established,
+            version: Some(version),
+            no_cas: false,
+        });
+        commit_audit_batch(&store, table, &mut first, vec![audit_rec(1)])
+            .await
+            .unwrap();
+        let (_, written_version) = load_audit(&store, table).await.unwrap();
+        assert_ne!(
+            written_version.unwrap().e_tag.as_deref(),
+            Some(initial_etag.as_str())
+        );
+        assert_eq!(
+            stale
+                .as_ref()
+                .unwrap()
+                .version
+                .as_ref()
+                .unwrap()
+                .e_tag
+                .as_deref(),
+            Some(initial_etag.as_str()),
+        );
+        commit_audit_batch(&store, table, &mut stale, vec![audit_rec(2)])
+            .await
+            .unwrap();
+        let (durable, _) = load_audit(&store, table).await.unwrap();
+        let ids: Vec<_> = durable
+            .queries
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect();
+        assert_eq!(ids, ["audit-0", "audit-1", "audit-2"]);
+        assert!(!stale.unwrap().no_cas);
+    }
+
+    #[tokio::test]
+    async fn audit_batch_reloads_after_stale_etag() {
+        verify_stale_audit_update(Arc::new(object_store::memory::InMemory::new())).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the disposable S3-compatible contract fixture"]
+    async fn audit_batch_reloads_after_stale_s3_etag() {
+        let storage = verdigris_core::config::StorageConfig::S3 {
+            bucket: std::env::var("VERDIGRIS_S3_BUCKET").expect("disposable bucket"),
+            region: Some("us-east-1".to_string()),
+            endpoint: Some(std::env::var("VERDIGRIS_S3_ENDPOINT").expect("disposable endpoint")),
+            allow_http: true,
+            access_key_id: Some(
+                std::env::var("VERDIGRIS_S3_ACCESS_KEY").expect("fixture access key"),
+            ),
+            secret_access_key: Some(
+                std::env::var("VERDIGRIS_S3_SECRET_KEY").expect("fixture secret key"),
+            ),
+            prefix: None,
+        };
+        verify_stale_audit_update(verdigris_storage::build(&storage).unwrap()).await;
+    }
+
     #[tokio::test]
     async fn same_clock_and_counter_replicas_keep_both_records() {
         let s: Store = Arc::new(object_store::memory::InMemory::new());

@@ -10,7 +10,7 @@ permissions:
 jobs:
   s3-cas:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     env:
       CAS_CONTAINER: vdg-cas-${{ github.run_id }}-${{ github.run_attempt }}
       VERDIGRIS_S3_BUCKET: verdigris-test
@@ -35,6 +35,8 @@ jobs:
           printf 'VERDIGRIS_S3_ENDPOINT=%s\n' "$endpoint" >> "$GITHUB_ENV"
       - name: Verify conditional writes and concurrent committed rows
         run: cargo test --locked -p verdigris-ingest --test minio_s3 -- --include-ignored
+      - name: Verify cached audit writers reload after a stale S3 ETag
+        run: cargo test --locked -p vdg --features serve --bin vdg audit_batch_reloads_after_stale -- --include-ignored
       - name: Stop the fixture
         if: always()
         run: docker rm -f "$CAS_CONTAINER" >/dev/null || true
