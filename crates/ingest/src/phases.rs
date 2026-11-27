@@ -9,6 +9,10 @@ pub enum IngestPhase {
     ObjectPut,
     LockWait,
     TrigramMerge,
+    TrigramGetDecode,
+    TrigramInsert,
+    TrigramSerialize,
+    TrigramPut,
     ManifestLoad,
     ManifestCas,
     CompactLockWait,
@@ -16,12 +20,16 @@ pub enum IngestPhase {
 }
 
 impl IngestPhase {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 13] = [
         Self::Parse,
         Self::Encode,
         Self::ObjectPut,
         Self::LockWait,
         Self::TrigramMerge,
+        Self::TrigramGetDecode,
+        Self::TrigramInsert,
+        Self::TrigramSerialize,
+        Self::TrigramPut,
         Self::ManifestLoad,
         Self::ManifestCas,
         Self::CompactLockWait,
@@ -35,6 +43,10 @@ impl IngestPhase {
             Self::ObjectPut => "object_put",
             Self::LockWait => "lock_wait",
             Self::TrigramMerge => "trigram_merge",
+            Self::TrigramGetDecode => "trigram_get_decode",
+            Self::TrigramInsert => "trigram_insert",
+            Self::TrigramSerialize => "trigram_serialize",
+            Self::TrigramPut => "trigram_put",
             Self::ManifestLoad => "manifest_load",
             Self::ManifestCas => "manifest_cas",
             Self::CompactLockWait => "compact_lock_wait",

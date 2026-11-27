@@ -186,18 +186,30 @@ impl Ingestor {
         if add.is_empty() {
             return Ok(());
         }
-        let mut idx = self.load_trigrams().await?;
-        for (path, set) in &add.by_path {
-            idx.insert(path.clone(), set.clone());
+        let mut idx = {
+            let _timer = self.phase_timer(IngestPhase::TrigramGetDecode);
+            self.load_trigrams().await?
+        };
+        {
+            let _timer = self.phase_timer(IngestPhase::TrigramInsert);
+            for (path, set) in &add.by_path {
+                idx.insert(path.clone(), set.clone());
+            }
+            for (path, sets) in &add.row_groups_by_path {
+                idx.insert_row_groups(path.clone(), sets.clone());
+            }
         }
-        for (path, sets) in &add.row_groups_by_path {
-            idx.insert_row_groups(path.clone(), sets.clone());
+        let bytes = {
+            let _timer = self.phase_timer(IngestPhase::TrigramSerialize);
+            serde_json::to_vec(&idx).context("serializing trigram sidecar")?
+        };
+        {
+            let _timer = self.phase_timer(IngestPhase::TrigramPut);
+            self.store
+                .put(&self.trigrams_path(), bytes.into())
+                .await
+                .context("writing trigram sidecar")?;
         }
-        let bytes = serde_json::to_vec(&idx).context("serializing trigram sidecar")?;
-        self.store
-            .put(&self.trigrams_path(), bytes.into())
-            .await
-            .context("writing trigram sidecar")?;
         Ok(())
     }
 
