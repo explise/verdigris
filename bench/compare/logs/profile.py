@@ -132,6 +132,28 @@ def compare_search(backend, expected, iterations, warmup):
     return comparison
 
 
+def verify_trace_quotes(backend, queries):
+    quotes = {}
+    for shape in ("trace_hit", "trace_miss", "trace_cross_tier"):
+        for cohort in queries[shape].values():
+            for sample in cohort["samples"]:
+                trace_id = sample["trace_id"]
+                if trace_id not in quotes:
+                    body = json.dumps({"sql": f"trace_id:{trace_id}", "tiers": []}).encode()
+                    status, _, data = backend.client.request(
+                        "POST", "/v1/query/estimate", body, {"content-type": "application/json"}
+                    )
+                    if status != 200:
+                        raise RuntimeError(f"trace quote HTTP {status}: {data[:300]!r}")
+                    quotes[trace_id] = json.loads(data)
+                quote = quotes[trace_id]
+                if (quote["filesTouched"], quote["scanBytes"]) != (
+                    sample["planned_files"], sample["planned_bytes"]
+                ):
+                    raise RuntimeError(f"trace quote differs from execution for {trace_id}")
+    return quotes
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -140,6 +162,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--check-trace-quotes", action="store_true")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--first", choices=SHAPES)
     mode.add_argument("--compare-search", action="store_true")
@@ -179,6 +202,8 @@ def main():
 
             out["representative_plan"] = run_one(backend, "trace_hit", 0, corpus, "plan", expected)["profile"]
             out["recent_search_plan"] = run_one(backend, "recent_search", 0, corpus, "plan", expected)
+            if args.check_trace_quotes:
+                out["trace_quotes"] = verify_trace_quotes(backend, out["queries"])
             status, _, data = backend.client.request("GET", "/v1/metrics")
             if status != 200:
                 raise RuntimeError(f"query metrics failed with HTTP {status}")

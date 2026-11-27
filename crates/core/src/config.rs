@@ -8,6 +8,7 @@
 use crate::batch::BatchPolicy;
 use crate::model::{Level, Tier};
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -93,6 +94,8 @@ pub struct CompactionConfig {
     /// scheduler runs repeated bounded passes to drain a large backlog, yielding
     /// the lock between them so ingest can interleave.
     pub max_merge_files_per_pass: usize,
+    /// Optional Parquet data-page row limit for profiling compaction output.
+    pub profile_data_page_rows: Option<NonZeroUsize>,
     /// How often the scheduler checks for pending compaction (seconds).
     pub interval_secs: u64,
     /// How long a file merged away by compaction stays readable before its
@@ -110,6 +113,7 @@ impl Default for CompactionConfig {
             target_mib: 256,
             trigger_pending_files: 16,
             max_merge_files_per_pass: 128,
+            profile_data_page_rows: None,
             interval_secs: 300,        // 5 min
             retired_grace_secs: 3_600, // 1 h
         }

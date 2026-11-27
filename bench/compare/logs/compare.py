@@ -28,6 +28,7 @@ import json
 import math
 import os
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -614,8 +615,11 @@ def main():
     ap.add_argument("--iterations", type=int, default=DEFAULT_ITERATIONS)
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--vdg-compact-container", help="compact a disposable Verdigris fixture once after ingest")
     args = ap.parse_args()
 
+    if args.vdg_compact_container and args.system != "vdg":
+        ap.error("--vdg-compact-container requires --system vdg")
     rows = args.rows
     # Spread hit lookups across the corpus instead of timing one convenient id.
     # Every id is a real row; keep away from the cross-tier sentinel rows.
@@ -682,7 +686,18 @@ def main():
     if visible != rows:
         raise SystemExit(f"{args.system}: visible {visible}, expected {rows}")
 
-    backend.settle()
+    compact_result = None
+    if args.vdg_compact_container:
+        command = ["docker", "exec", args.vdg_compact_container, "vdg"]
+        manifest_cmd = [*command, "manifest", "--table", "bench"]
+        before = subprocess.check_output(manifest_cmd, text=True)
+        compact_start = time.perf_counter()
+        summary = subprocess.check_output([*command, "compact", "--table", "bench"], text=True)
+        compact_seconds = time.perf_counter() - compact_start
+        after = subprocess.check_output(manifest_cmd, text=True)
+        compact_result = {"before": before, "after": after, "summary": summary, "elapsed_s": compact_seconds}
+    else:
+        backend.settle()
     # Let background merge work fall out of the measurement window. Verdigris has
     # already compacted (run.sh invokes `vdg compact`), ClickHouse has run
     # OPTIMIZE, and VictoriaLogs merges asynchronously.
@@ -815,6 +830,8 @@ def main():
             "minute_aggregation": q_aggregate,
         },
     }
+    if compact_result is not None:
+        results["explicit_compaction"] = compact_result
     backend.close()
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:

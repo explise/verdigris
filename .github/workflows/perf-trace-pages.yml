@@ -1,0 +1,67 @@
+name: Verdigris compacted Parquet page size control
+
+on:
+  push:
+    branches: [codex/perf-trace-pages]
+
+permissions:
+  contents: read
+
+jobs:
+  profiles:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rows: 1000000
+            batch_rows: 10000
+            order: '20000 4096'
+          - rows: 20000000
+            batch_rows: 50000
+            order: '4096 20000'
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the integrated release image
+        run: docker build -f bench/Dockerfile.vdg -t verdigris-trace-pages:local .
+      - name: Pull the pinned benchmark fixture images
+        run: |
+          set -o pipefail
+          sed -nE 's/^(MINIO|MC|BUSYBOX)=//p' bench/compare/logs/run-profile.sh |
+            while IFS= read -r image; do docker pull "$image" || exit; done
+      - name: Compare compacted page sizes on the same serially seeded corpus
+        env:
+          VDG_IMAGE: verdigris-trace-pages:local
+          SERVICE_CPUS: '2'
+          ROWS: ${{ matrix.rows }}
+          BATCH_ROWS: ${{ matrix.batch_rows }}
+          PAGE_ORDER: ${{ matrix.order }}
+          ITERATIONS: '100'
+          WARMUP: '10'
+          CORPUS_TS_MS: '1795764240000'
+          RAW: ${{ runner.temp }}/verdigris-trace-pages
+        run: |
+          mkdir -p "$RAW"
+          for page_rows in $PAGE_ORDER; do
+            COMPACT_DATA_PAGE_ROWS="$page_rows" OUT="$RAW/page-$page_rows" bench/compare/logs/run-profile.sh
+          done
+          python3 -B - "$RAW" <<'PYTHON'
+          import json
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          control, treatment = [json.loads((root / f"page-{n}" / "seed.json").read_text()) for n in (20000, 4096)]
+          if control["explicit_compaction"]["before"] != treatment["explicit_compaction"]["before"]:
+              raise SystemExit("layout arms started with different uncompacted files")
+          PYTHON
+      - name: Upload raw timings and physical plans
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-trace-pages-${{ matrix.rows }}
+          path: ${{ runner.temp }}/verdigris-trace-pages
+          retention-days: 7

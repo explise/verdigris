@@ -1298,11 +1298,13 @@ async fn maybe_compact(
     trigger: usize,
     max_merge_files: usize,
     retired_grace_ms: u64,
+    profile_data_page_rows: Option<std::num::NonZeroUsize>,
     metrics: &CompactionMetrics,
 ) -> anyhow::Result<()> {
     let ingestor = verdigris_ingest::Ingestor::new(s.clone(), table)
         .with_clock(clock.clone())
-        .with_retired_grace_ms(retired_grace_ms);
+        .with_retired_grace_ms(retired_grace_ms)
+        .with_compaction_data_page_rows(profile_data_page_rows);
     // Reclaim expired tombstones even when there is no merge work this tick:
     // otherwise the last compaction's old files would stay forever once the
     // backlog falls below the trigger.
@@ -1617,6 +1619,7 @@ pub async fn serve_with_clock(
                         ccfg.trigger_pending_files,
                         ccfg.max_merge_files_per_pass,
                         ccfg.retired_grace_ms(),
+                        ccfg.profile_data_page_rows,
                         &cm,
                     )
                     .await
@@ -3577,6 +3580,7 @@ mod tests {
             10_000,
             128,
             verdigris_ingest::DEFAULT_RETIRED_GRACE_MS,
+            None,
             &metrics,
         )
         .await
@@ -3599,6 +3603,7 @@ mod tests {
             2,
             2,
             verdigris_ingest::DEFAULT_RETIRED_GRACE_MS,
+            None,
             &metrics,
         )
         .await

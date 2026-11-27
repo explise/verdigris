@@ -29,15 +29,18 @@ use verdigris_core::text::TrigramSet;
 /// it is pruned instead by the trigram sets `MergeWriter` folds per row group —
 /// coarser than a full inverted index (no positions, no ranking) but enough to skip
 /// the row groups a term provably cannot appear in.
-fn writer_props(row_group_rows: usize) -> Result<WriterProperties> {
-    Ok(WriterProperties::builder()
+fn writer_props(row_group_rows: usize, data_page_rows: Option<usize>) -> Result<WriterProperties> {
+    let mut properties = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
         .set_column_bloom_filter_enabled(ColumnPath::from("trace_id"), true)
         .set_column_bloom_filter_enabled(ColumnPath::from("service"), true)
         .set_column_bloom_filter_enabled(ColumnPath::from("level"), true)
         .set_column_bloom_filter_enabled(ColumnPath::from("message"), true)
-        .set_max_row_group_row_count(Some(row_group_rows))
-        .build())
+        .set_max_row_group_row_count(Some(row_group_rows));
+    if let Some(rows) = data_page_rows {
+        properties = properties.set_data_page_row_count_limit(rows);
+    }
+    Ok(properties.build())
 }
 
 /// Rows per row group — the granularity of the per-row-group trigram index.
@@ -162,10 +165,22 @@ impl MergeWriter {
     /// at any size — only the constant differs — so a test at 512 rows covers the
     /// same code the production path takes.
     pub fn with_row_group_rows(schema: SchemaRef, row_group_rows: usize) -> Result<Self> {
+        Self::with_layout(schema, row_group_rows, None)
+    }
+
+    pub(crate) fn with_layout(
+        schema: SchemaRef,
+        row_group_rows: usize,
+        data_page_rows: Option<usize>,
+    ) -> Result<Self> {
         anyhow::ensure!(row_group_rows > 0, "row group size must be positive");
         Ok(Self {
-            writer: ArrowWriter::try_new(Vec::new(), schema, Some(writer_props(row_group_rows)?))
-                .context("creating parquet merge writer")?,
+            writer: ArrowWriter::try_new(
+                Vec::new(),
+                schema,
+                Some(writer_props(row_group_rows, data_page_rows)?),
+            )
+            .context("creating parquet merge writer")?,
             rows: 0,
             min_ts: i64::MAX,
             max_ts: i64::MIN,
@@ -386,6 +401,53 @@ mod tests {
     #[test]
     fn empty_batch_is_rejected() {
         assert!(encode_parquet(&[]).is_err());
+    }
+
+    #[test]
+    fn smaller_pages_preserve_batches_and_row_group_indexes() {
+        use parquet::arrow::arrow_reader::ArrowReaderOptions;
+        use parquet::file::metadata::PageIndexPolicy;
+
+        let records: Vec<_> = (0..17_000).map(rec).collect();
+        let batch = records_to_batch(&records).unwrap();
+        let encode = |page_rows| {
+            let mut writer = MergeWriter::with_layout(log_schema(), 8192, page_rows).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap()
+        };
+        let (control, control_stats) = encode(None);
+        let (treatment, treatment_stats) = encode(Some(4096));
+        assert_eq!(control_stats, treatment_stats);
+        assert_eq!(treatment_stats.row_groups, 3);
+
+        let read = |bytes| {
+            let options =
+                ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
+            let builder =
+                ParquetRecordBatchReaderBuilder::try_new_with_options(Bytes::from(bytes), options)
+                    .unwrap();
+            // Compare the timestamp pages in a row group with a fixed row count.
+            let pages = builder.metadata().offset_index().unwrap()[0][0]
+                .page_locations()
+                .len();
+            let batches = builder
+                .build()
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            (pages, batches)
+        };
+        let (control_pages, control_rows) = read(control);
+        let (treatment_pages, treatment_rows) = read(treatment);
+        assert!(treatment_pages > control_pages);
+        assert_eq!(treatment_rows, control_rows);
+        assert_eq!(
+            treatment_rows
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            records.len()
+        );
     }
 
     #[test]

@@ -78,6 +78,7 @@ pub struct Ingestor {
     clock: Arc<dyn Clock>,
     /// Grace period between retiring a compacted-away file and deleting it.
     retired_grace_ms: u64,
+    compaction_data_page_rows: Option<std::num::NonZeroUsize>,
 }
 
 impl Ingestor {
@@ -87,6 +88,7 @@ impl Ingestor {
             table: table.into(),
             clock: Arc::new(SimClock::default()),
             retired_grace_ms: DEFAULT_RETIRED_GRACE_MS,
+            compaction_data_page_rows: None,
         }
     }
 
@@ -99,6 +101,12 @@ impl Ingestor {
     /// Override how long retired files remain readable before reclamation.
     pub fn with_retired_grace_ms(mut self, grace_ms: u64) -> Self {
         self.retired_grace_ms = grace_ms;
+        self
+    }
+
+    /// Override the page limit on rewritten files while keeping ingest layout.
+    pub fn with_compaction_data_page_rows(mut self, rows: Option<std::num::NonZeroUsize>) -> Self {
+        self.compaction_data_page_rows = rows;
         self
     }
 
@@ -567,7 +575,12 @@ impl Ingestor {
                     // go. Peak memory is one batch plus the encoder's in-progress
                     // row group, NOT the bin's whole decompressed size — see
                     // `MergeWriter` (issue #13).
-                    let mut w = encode::MergeWriter::new(schema::log_schema())?;
+                    let mut w = encode::MergeWriter::with_layout(
+                        schema::log_schema(),
+                        encode::ROWS_PER_ROW_GROUP,
+                        self.compaction_data_page_rows
+                            .map(std::num::NonZeroUsize::get),
+                    )?;
                     for f in &bin {
                         let bytes = self
                             .store

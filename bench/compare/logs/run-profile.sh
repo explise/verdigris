@@ -53,6 +53,14 @@ for attempt in {1..30}; do
   sleep 1
 done
 sed -e 's/vdgbench-minio/minio/g' -e "s/^cores = .*/cores = $SERVICE_CPUS/" bench/compare/logs/vdg.toml > "$scratch/config.toml"
+if [[ -n "${COMPACT_DATA_PAGE_ROWS:-}" ]]; then
+  if [[ ! "$COMPACT_DATA_PAGE_ROWS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "COMPACT_DATA_PAGE_ROWS must be a positive integer" >&2
+    exit 2
+  fi
+  sed -i '/^\[compaction\]/,$ s/^enabled = true$/enabled = false/' "$scratch/config.toml"
+  sed -i "/^\[compaction\]$/a profile_data_page_rows = $COMPACT_DATA_PAGE_ROWS" "$scratch/config.toml"
+fi
 chmod 644 "$scratch/config.toml"
 
 vdg=$(docker run -d --pull never --network "$net" --cpus="$SERVICE_CPUS" --memory=3g \
@@ -83,10 +91,20 @@ wait_ready
 } > "$OUT/machine.txt"
 cp "$scratch/config.toml" "$OUT/config.toml"
 
+seed_args=()
+if [[ -n "${COMPACT_DATA_PAGE_ROWS:-}" ]]; then
+  seed_args=(--threads 1 --vdg-compact-container "$vdg")
+fi
 python3 -B bench/compare/logs/compare.py --system vdg --port "$port" --rows "$ROWS" --batch-rows "$BATCH_ROWS" \
-  --iterations 1 --warmup 0 --out "$OUT/seed.json"
+  "${seed_args[@]}" --iterations 1 --warmup 0 --out "$OUT/seed.json"
+if [[ -n "${COMPACT_DATA_PAGE_ROWS:-}" ]]; then
+  docker exec "$minio" du -sb /data/verdigris > "$OUT/bucket-bytes.txt"
+  docker inspect --format 'OOMKilled={{.State.OOMKilled}} restarts={{.RestartCount}}' "$vdg" > "$OUT/vdg-state.txt"
+fi
 profile=(python3 -B bench/compare/logs/profile.py --seed-report "$OUT/seed.json")
-"${profile[@]}" --port "$port" --iterations "$ITERATIONS" --warmup "$WARMUP" --out "$OUT/warm.json"
+warm_args=()
+if [[ -n "${COMPACT_DATA_PAGE_ROWS:-}" ]]; then warm_args=(--check-trace-quotes); fi
+"${profile[@]}" --port "$port" --iterations "$ITERATIONS" --warmup "$WARMUP" "${warm_args[@]}" --out "$OUT/warm.json"
 if [[ "${SEARCH_CONTROL:-0}" == 1 ]]; then
   "${profile[@]}" --port "$port" --compare-search --iterations 20 --warmup 5 --out "$OUT/search-comparison.json"
 fi
