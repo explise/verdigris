@@ -31,6 +31,16 @@ ITERATIONS=${ITERATIONS:-10}
 WARMUP=${WARMUP:-3}
 OUT=${OUT:-bench/results/compare-logs}
 VDG_IMAGE=${VDG_IMAGE:-verdigris-bench}
+TOTAL_CPUS=${TOTAL_CPUS:-8}
+if [[ ! "$TOTAL_CPUS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TOTAL_CPUS must be an even integer of at least 2" >&2
+  exit 2
+fi
+if (( TOTAL_CPUS < 2 || TOTAL_CPUS % 2 != 0 )); then
+  echo "TOTAL_CPUS must be divisible by two for the Verdigris split" >&2
+  exit 2
+fi
+SERVICE_CPUS=$((TOTAL_CPUS / 2))
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%d%H%M%S)-$$}
 NET=verdigris-logs-bench-$RUN_ID
 VOL=verdigris-logs-bench-$RUN_ID-minio
@@ -55,7 +65,7 @@ mkdir -p "$OUT"
   echo "corpus_ts_ms=$CORPUS_TS_MS"
   echo "run_id=$RUN_ID"
   echo "vdg_image=$VDG_IMAGE"
-  echo "budget=8cpu/6GiB per system; vdg=4cpu/3GiB + minio=4cpu/3GiB"
+  echo "budget=${TOTAL_CPUS}cpu/6GiB per system; vdg=${SERVICE_CPUS}cpu/3GiB + minio=${SERVICE_CPUS}cpu/3GiB"
 } > "$OUT/machine.txt"
 
 ids=()
@@ -139,7 +149,11 @@ PY
 }
 
 run_vdg() {
-  echo "==> Verdigris (vdg 4 CPU / 3 GiB + MinIO 4 CPU / 3 GiB)"
+  echo "==> Verdigris (${SERVICE_CPUS} CPU / 3 GiB each for vdg and MinIO)"
+  local config
+  config=$(realpath "$OUT")/verdigris-config.toml
+  sed "s/^cores = .*/cores = $SERVICE_CPUS/" bench/compare/logs/vdg.toml > "$config"
+  chmod 644 "$config"
   docker network create "$NET" >/dev/null
   net_created=1
   docker volume create "$VOL" >/dev/null
@@ -149,7 +163,7 @@ run_vdg() {
   local minio minio_port
   minio=$(docker run -d --rm --name "$MINIO_C" --network "$NET" \
     --network-alias vdgbench-minio \
-    --cpus=4 --memory=3g -p 127.0.0.1::9000 \
+    --cpus="$SERVICE_CPUS" --memory=3g -p 127.0.0.1::9000 \
     -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
     -e MINIO_UPDATE=off -v "$VOL:/data" "$MINIO" server /data)
   ids+=("$minio")
@@ -161,10 +175,10 @@ run_vdg() {
 
   local vdg port
   vdg=$(docker run -d --rm --name "$VDG_C" --network "$NET" \
-    --cpus=4 --memory=3g -p 127.0.0.1::8080 \
+    --cpus="$SERVICE_CPUS" --memory=3g -p 127.0.0.1::8080 \
     -e VERDIGRIS_CONFIG=/app/config/bench.toml \
-    -e TOKIO_WORKER_THREADS=4 -e RUST_LOG=warn \
-    -v "$repo/bench/compare/logs/vdg.toml:/app/config/bench.toml:ro" \
+    -e TOKIO_WORKER_THREADS="$SERVICE_CPUS" -e RUST_LOG=warn \
+    -v "$config:/app/config/bench.toml:ro" \
     "$VDG_IMAGE" serve --port 8080 --table bench --role all)
   ids+=("$vdg")
   port=$(local_port "$vdg" 8080)
@@ -183,7 +197,7 @@ run_vdg() {
     port=$(local_port "$vdg" 8080)
   fi
 
-  write_meta vdg "$VDG_IMAGE" 8 "vdg 3g + minio 3g" "$bytes"
+  write_meta vdg "$VDG_IMAGE" "$TOTAL_CPUS" "vdg 3g + minio 3g" "$bytes"
   storage=$(curl -fsS --max-time 5 "http://127.0.0.1:$port/v1/storage/tiers" 2>/dev/null || echo '{}')
   bucket_bytes=$(docker exec "$MINIO_C" du -sb /data/verdigris 2>/dev/null | awk '{print $1}' || echo 0)
   internal_bytes=$(docker exec "$MINIO_C" du -sb /data/.minio.sys 2>/dev/null | awk '{print $1}' || echo 0)
@@ -208,9 +222,9 @@ PY
 }
 
 run_clickhouse() {
-  echo "==> ClickHouse (8 CPU / 6 GiB)"
+  echo "==> ClickHouse ($TOTAL_CPUS CPU / 6 GiB)"
   local ch port
-  ch=$(docker run -d --rm --name "$CH_C" --cpus=8 --memory=6g \
+  ch=$(docker run -d --rm --name "$CH_C" --cpus="$TOTAL_CPUS" --memory=6g \
     -p 127.0.0.1::8123 \
     -e CLICKHOUSE_USER=default -e CLICKHOUSE_PASSWORD=benchpass \
     -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 "$CH")
@@ -230,7 +244,7 @@ run_clickhouse() {
     restart_first_queries clickhouse 8123 "$ch" /ping
   fi
 
-  write_meta clickhouse "$CH" 8 "6g" "$bytes"
+  write_meta clickhouse "$CH" "$TOTAL_CPUS" "6g" "$bytes"
   python3 - "$OUT/clickhouse.meta.json" "$mem" <<'PY'
 import json, sys
 p = sys.argv[1]; d = json.load(open(p)); d["container_memory"] = sys.argv[2]
@@ -240,13 +254,13 @@ PY
 }
 
 run_victorialogs() {
-  echo "==> VictoriaLogs (8 CPU / 6 GiB)"
+  echo "==> VictoriaLogs ($TOTAL_CPUS CPU / 6 GiB)"
   local vl data_dir port
   # The VictoriaLogs image is a single static binary with no shell/du, so bind
   # its data path to the host and measure retained bytes from here.
   data_dir=$(mktemp -d "${TMPDIR:-/tmp}/vl-bench.XXXXXX")
   vl_data_dir=$data_dir
-  vl=$(docker run -d --rm --name "$VL_C" --cpus=8 --memory=6g \
+  vl=$(docker run -d --rm --name "$VL_C" --cpus="$TOTAL_CPUS" --memory=6g \
     -p 127.0.0.1::9428 \
     -v "$data_dir:/victoria-logs-data" \
     "$VL" -storageDataPath=/victoria-logs-data)
@@ -269,7 +283,7 @@ run_victorialogs() {
     restart_first_queries victorialogs 9428 "$vl" /health
   fi
 
-  write_meta victorialogs "$VL" 8 "6g" "$bytes"
+  write_meta victorialogs "$VL" "$TOTAL_CPUS" "6g" "$bytes"
   python3 - "$OUT/victorialogs.meta.json" "$mem" <<'PY'
 import json, sys
 p = sys.argv[1]; d = json.load(open(p)); d["container_memory"] = sys.argv[2]

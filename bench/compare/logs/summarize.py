@@ -32,11 +32,15 @@ labels = {
 
 lines = []
 lines.append("# Equivalent log-query comparison\n")
-lines.append(
-    "Same deterministic corpus, same 8 CPU / 6 GiB total budget per complete "
-    "deployment, one system at a time. Verdigris's budget includes its MinIO "
-    "object store (4 CPU / 3 GiB + 4 CPU / 3 GiB).\n"
-)
+cpu_limits = {m["cpu_limit"] for m in meta.values()}
+if len(cpu_limits) == 1:
+    total_cpu = cpu_limits.pop()
+    lines.append(
+        f"Same deterministic corpus, {total_cpu} CPU / 6 GiB per complete "
+        f"deployment, one system at a time. Verdigris and MinIO each receive "
+        f"{total_cpu // 2} CPU / 3 GiB.\n"
+    )
+
 lines.append("| System | Retained | Container memory after queries |")
 lines.append("|---|---:|---:|")
 for s in systems:
