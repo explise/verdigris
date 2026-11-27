@@ -39,10 +39,12 @@ jobs:
           ROOT: ${{ runner.temp }}/verdigris-group-commit
           INGEST_CORPUS_TS_MS: '1795764240000'
         run: |
+          status=0
           for size in 1 8; do
             LOADGEN="$PWD/bench/loadgen/target/release/verdigris-loadgen" OUT="$ROOT/group-$size" \
-              INGEST_GROUP_SIZE="$size" bench/loadgen/run-sustained.sh
+              INGEST_GROUP_SIZE="$size" bench/loadgen/run-sustained.sh || status=1
           done
+          exit "$status"
       - name: Upload the offered-arrival ledger and recovery evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

@@ -3,44 +3,82 @@
 import argparse
 import json
 import re
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 
-def snapshot(url, table):
-    sql = f"""
-        WITH fixture AS (
-            SELECT trace_id, substr(trace_id, 1, 22) AS batch_id,
-                   try_cast(substr(trace_id, 24) AS bigint) AS row_index
-            FROM {table}
-        )
-        SELECT batch_id, count(*) AS n, count(DISTINCT row_index) AS unique_offsets,
-               min(row_index) AS first_offset, max(row_index) AS last_offset,
-               count(*) FILTER (
-                   WHERE trace_id = concat(batch_id, '-',
-                       lpad(cast(row_index AS varchar),
-                            greatest(6, character_length(cast(row_index AS varchar))), '0'))
-               ) AS canonical_ids
-        FROM fixture GROUP BY batch_id
-    """
+SNAPSHOT_CHUNK_ROWS = 250_000
+
+
+def query_rows(url, sql):
     request = urllib.request.Request(url.rstrip("/") + "/v1/query",
                                      data=json.dumps({"sql": sql, "histogram": False}).encode(),
                                      headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=300) as response:
-        rows = json.load(response)["rows"]
-    stored = {}
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            return json.load(response)["rows"]
+    except urllib.error.HTTPError as error:
+        detail = error.read(512).decode(errors="replace")
+        raise RuntimeError(f"recovery query HTTP {error.code}: {detail}") from error
+
+
+def batch_counts(rows):
+    counts = {}
     for row in rows:
         marker = row["batch_id"]
-        if not isinstance(marker, str) or not re.fullmatch(r"sustained-[0-9]{12}", marker) or marker in stored:
+        if not isinstance(marker, str) or not re.fullmatch(r"sustained-[0-9]{12}", marker) or marker in counts:
             raise ValueError("expected only unique sustained batch markers in the fixture")
-        count = int(row["n"])
-        if (row["unique_offsets"], row["first_offset"], row["last_offset"], row["canonical_ids"]) != (
-            count, 0, count - 1, count
-        ):
-            raise ValueError(f"missing, duplicated, or invalid record IDs in {marker}")
-        stored[marker] = count
-    return stored
+        counts[marker] = int(row["n"])
+    return counts
 
+
+def batch_windows(counts):
+    """Keep distinct-offset checks around 250k rows without splitting a batch."""
+    window = {}
+    window_rows = 0
+    for marker, count in sorted(counts.items()):
+        if window and window_rows + count > SNAPSHOT_CHUNK_ROWS:
+            yield window
+            window, window_rows = {}, 0
+        window[marker] = count
+        window_rows += count
+    if window:
+        yield window
+
+
+def snapshot(url, table):
+    # Count every prefix first, including unexpected or malformed ones, then
+    # check distinct offsets in disjoint windows to stay within query memory.
+    counts = batch_counts(query_rows(
+        url, f"SELECT substr(trace_id, 1, 22) AS batch_id, count(*) AS n FROM {table} GROUP BY 1"
+    ))
+    for window in batch_windows(counts):
+        first, last = min(window), max(window)
+        rows = query_rows(url, f"""
+            WITH fixture AS (
+                SELECT trace_id, substr(trace_id, 1, 22) AS batch_id,
+                       try_cast(substr(trace_id, 24) AS bigint) AS row_index
+                FROM {table} WHERE trace_id >= '{first}' AND trace_id < '{last}~'
+            )
+            SELECT batch_id, count(*) AS n, count(DISTINCT row_index) AS unique_offsets,
+                   min(row_index) AS first_offset, max(row_index) AS last_offset,
+                   count(*) FILTER (
+                       WHERE trace_id = concat(batch_id, '-',
+                           lpad(cast(row_index AS varchar),
+                                greatest(6, character_length(cast(row_index AS varchar))), '0'))
+                   ) AS canonical_ids
+            FROM fixture GROUP BY batch_id
+        """)
+        if batch_counts(rows) != window:
+            raise ValueError(f"incomplete or changed recovery window {first} through {last}")
+        for row in rows:
+            count = int(row["n"])
+            if (row["unique_offsets"], row["first_offset"], row["last_offset"], row["canonical_ids"]) != (
+                count, 0, count - 1, count
+            ):
+                raise ValueError(f"missing, duplicated, or invalid record IDs in {row['batch_id']}")
+    return counts
 
 def reconcile(report, before, after):
     acked = {f"sustained-{row['id']:012}": row["acked_rows"] for row in report["outcomes"]
