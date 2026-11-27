@@ -463,12 +463,32 @@ pub(super) async fn run(args: &Args, rate: usize) -> Result<()> {
         .checked_sub(1)
         .and_then(|p| visible.get(p))
         .copied();
+    let sampled_acks = sampled_batches
+        .iter()
+        .filter(|&&id| {
+            outcomes
+                .get(id)
+                .is_some_and(|outcome| outcome.acked_rows.is_some())
+        })
+        .count();
+    let mut ack_to_visible: Vec<_> = visibility
+        .iter()
+        .filter_map(|sample| sample.ack_to_visible_ms)
+        .collect();
+    ack_to_visible.sort_by(f64::total_cmp);
+    let ack_to_visible_p95 = (sampled_acks * 95)
+        .div_ceil(100)
+        .checked_sub(1)
+        .and_then(|position| ack_to_visible.get(position))
+        .copied();
     let report = json!({"table": args.table, "seed": args.seed, "corpus_start_ms": epoch,
         "duration_s": args.duration_secs, "offered_rows_per_s": rate, "planned_rows": rows,
         "planned_batches": scheduled_batches, "outcomes": outcomes, "acked_rows": acked,
         "acked_in_window": acked_in_window, "acked_rows_per_s": acked_in_window as f64 / duration.as_secs_f64(),
         "visibility_poll_ms": VISIBILITY_POLL.as_millis(), "visibility_deadline_ms": VISIBILITY_TIMEOUT.as_millis(),
         "sampled_batches": sampled_batches, "visibility": visibility, "visibility_p95_ms": p95,
+        "sampled_acks": sampled_acks, "sampled_acks_without_visibility": sampled_acks.saturating_sub(ack_to_visible.len()),
+        "ack_to_visible_p95_ms": ack_to_visible_p95,
         "concurrency": args.concurrency, "buffered_batches": args.concurrency,
         "storage_samples": storage,
         "body_bytes_limit": args.body_bytes, "generation_error": generation.as_ref().err().map(ToString::to_string)});
