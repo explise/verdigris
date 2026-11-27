@@ -102,6 +102,19 @@ round-trip). Any other `Accept` yields the JSON envelope above. The web UI negot
 column, so the Arrow wire delivers it as epoch-ms; the client normalizes it to the same ISO
 string the JSON wire sends.
 
+### `POST /v1/query/activity`  *(read role)*
+Aggregation-only companion to `/v1/query`: returns the same severity histogram
+without running the row query. The Logs explorer loads rows first with
+`"histogram": false`, then requests this strip separately.
+
+Request: `{ "sql": "service:auth | last 1h", "tiers": ["hot","warm"] }`
+
+Response: `{ "histogram": [ { "total": 807, "errors": 331 }, … ],
+"stats": { "events": 807, "files": 3, "elapsedMs": 4, "engine": "datafusion" } }`
+
+It builds the same scan plan and selects the same files as the row query, so the
+chart and the estimate stay aligned.
+
 ### `POST /v1/query/estimate`  *(read role)*
 Pre-query scan-size + dollar estimate — powers the cold-scan confirm gate.
 

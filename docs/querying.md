@@ -107,8 +107,12 @@ Response:
 ```
 
 - `stats.events` is the **total matched count** (the histogram sum), not the returned row page.
+  With `"histogram": false`, `eventsExact` is false and `events` is the returned row count.
 - `stats.engine` is always `datafusion`.
 - `histogram` is ~60 buckets (total vs error counts) over the table's time range.
+- The Logs explorer requests rows with `"histogram": false`, then calls
+  `POST /v1/query/activity` for the chart. That keeps the first response to one scan and
+  lets the chart load (and fail) independently.
 
 ## Arrow vs JSON responses
 
