@@ -101,6 +101,11 @@ def row_ts_ms(row):
 
 
 MISSING_TRACE = "ffffffffffffffff"
+RECENT_SEARCH_SQL = (
+    "SELECT ts, level, service, status, message, trace_id, attrs_json "
+    "FROM bench WHERE service = 'checkout' AND level = 'ERROR' "
+    "ORDER BY ts DESC LIMIT 200"
+)
 
 
 def trace_schedule(rows):
@@ -138,7 +143,7 @@ def validate_trace(trace_id: str, got, rows: int):
     else:
         indices = (int(trace_id, 16),)
     actual = sorted((canonical_row(r) for r in got), key=lambda r: (r[0], r[4]))
-    expected = [expected_row(i, rows) for i in indices]
+    expected = sorted((expected_row(i, rows) for i in indices), key=lambda r: (r[0], r[4]))
     if actual != expected:
         raise SystemExit(f"trace {trace_id} returned {len(actual)} rows with different fields or identities (expected {len(expected)})")
 
@@ -394,11 +399,7 @@ class Vdg(Backend):
         # SQL over the same columns/predicate/order as the other engines. A
         # relative `last 1h` would drift between separately started runs; the
         # corpus is one fixed window, so the explicit query schedule is stable.
-        return self._query(
-            "SELECT ts, level, service, status, message, trace_id, attrs_json "
-            "FROM bench WHERE service = 'checkout' AND level = 'ERROR' "
-            "ORDER BY ts DESC LIMIT 200"
-        )
+        return self._query(RECENT_SEARCH_SQL)
 
     def trace_lookup(self, trace_id=None):
         trace_id = trace_id or self.args.trace_id
@@ -652,6 +653,9 @@ def main():
         for n in ex.map(send, range(len(batches))):
             ingested += n
     ingest_s = time.perf_counter() - t0
+    # The 20M fixture holds several GiB of encoded ingest requests. Release
+    # them before settling compaction and sampling query latency.
+    del bodies
     print(
         f"{args.system}: acked {ingested} rows in {ingest_s:.2f}s "
         f"({ingested / ingest_s:,.0f} rows/s, {total_bytes / ingest_s / 1048576:.1f} MiB/s)",
