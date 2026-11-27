@@ -1,0 +1,33 @@
+name: Verdigris disk-backed admission replay
+
+on:
+  push:
+    branches: [codex/perf-disk-replay]
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the release benchmark image
+        run: |
+          docker build -f bench/Dockerfile.vdg -t verdigris-disk-replay:local .
+          df -h
+      - name: Run three fixed-rate trials on a disk-backed volume
+        env:
+          VDG_IMAGE: verdigris-disk-replay:local
+          OUT: ${{ runner.temp }}/verdigris-disk-replay
+        run: bench/admission/run-fixed.sh
+      - name: Upload raw results and fixture state
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-disk-replay
+          path: ${{ runner.temp }}/verdigris-disk-replay
+          retention-days: 7
