@@ -16,6 +16,7 @@ ROWS=200000 ITERATIONS=5 SYSTEMS="vdg clickhouse" bench/compare/logs/run.sh
 VDG_SKIP_BUILD=1 VDG_IMAGE=verdigris-bench:<tag> bench/compare/logs/run.sh
 RESTART=1 bench/compare/logs/run.sh             # also restart once per first-query shape
 TOTAL_CPUS=4 bench/compare/logs/run.sh          # equal budget on a 4-vCPU host
+TOTAL_CPUS=4 ROWS=100000 VERIFY_ALL_ROW_IDS=1 bench/compare/logs/run.sh
 ```
 
 Results land in `bench/results/compare-logs/` (`<system>.json`,
@@ -47,6 +48,9 @@ exit.
   is checked against the fixture. Search rows are checked in newest-first order.
   Trace hits, misses, and cross-tier traces are checked for exact row values.
   Every minute bucket is checked for timestamp, total, and error count in order.
+  The optional smoke gate also compares the full multiset of generated row
+  identities after timing. Row identity comes from the unique index in the log
+  message. Three fixture rows intentionally share a trace ID.
 - **Latency** is one warm connection per backend, with `WARMUP` warmups and
   `ITERATIONS` measured requests. Validation runs outside the measured interval.
   p50 is the median, with nearest rank for p95 and p99. The restart run makes a

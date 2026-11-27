@@ -29,6 +29,10 @@ BATCH_ROWS=${BATCH_ROWS:-10000}
 THREADS=${THREADS:-4}
 ITERATIONS=${ITERATIONS:-10}
 WARMUP=${WARMUP:-3}
+identity_args=()
+if [[ "${VERIFY_ALL_ROW_IDS:-0}" == 1 ]]; then
+  identity_args+=(--verify-all-row-ids)
+fi
 OUT=${OUT:-bench/results/compare-logs}
 VDG_IMAGE=${VDG_IMAGE:-verdigris-bench}
 TOTAL_CPUS=${TOTAL_CPUS:-8}
@@ -186,7 +190,7 @@ run_vdg() {
 
   python3 bench/compare/logs/compare.py \
     --system vdg --port "$port" --rows "$ROWS" --batch-rows "$BATCH_ROWS" \
-    --threads "$THREADS" --iterations "$ITERATIONS" --warmup "$WARMUP" \
+    --threads "$THREADS" --iterations "$ITERATIONS" --warmup "$WARMUP" "${identity_args[@]}" \
     --out "$OUT/vdg.json"
 
   local bytes mem
@@ -235,7 +239,7 @@ run_clickhouse() {
 
   python3 bench/compare/logs/compare.py \
     --system clickhouse --port "$port" --rows "$ROWS" --batch-rows "$BATCH_ROWS" \
-    --threads "$THREADS" --iterations "$ITERATIONS" --warmup "$WARMUP" \
+    --threads "$THREADS" --iterations "$ITERATIONS" --warmup "$WARMUP" "${identity_args[@]}" \
     --out "$OUT/clickhouse.json"
 
   local bytes mem
@@ -271,7 +275,7 @@ run_victorialogs() {
 
   python3 bench/compare/logs/compare.py \
     --system victorialogs --port "$port" --rows "$ROWS" --batch-rows "$BATCH_ROWS" \
-    --threads "$THREADS" --iterations "$ITERATIONS" --warmup "$WARMUP" \
+    --threads "$THREADS" --iterations "$ITERATIONS" --warmup "$WARMUP" "${identity_args[@]}" \
     --out "$OUT/victorialogs.json"
 
   local bytes mem
