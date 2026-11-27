@@ -9,6 +9,7 @@ MINIO=cgr.dev/chainguard/minio@sha256:634c989a2f1029162fc2676c263caa181213b94104
 MC=cgr.dev/chainguard/minio-client@sha256:36ac7ab6d181f259ab62defe0bb55ad1dbf89b152f0b8f49b1c63049374d812f
 BUSYBOX=busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
 ROWS=${ROWS:-1000000}
+BATCH_ROWS=${BATCH_ROWS:-10000}
 ITERATIONS=${ITERATIONS:-100}
 WARMUP=${WARMUP:-10}
 mkdir "$OUT"
@@ -63,11 +64,11 @@ wait_ready
   echo "minio_image=$(docker image inspect "$MINIO" --format '{{.Id}}')"
   echo "cpu=$(uname -m) host_threads=$(nproc) $(awk '/^MemTotal/{print $1,$2,$3}' /proc/meminfo)"
   echo "kernel=$(uname -r) budget=4cpu/3GiB per service"
-  echo "rows=$ROWS iterations=$ITERATIONS warmup=$WARMUP audit=durable-before-response"
+  echo "rows=$ROWS batch_rows=$BATCH_ROWS iterations=$ITERATIONS warmup=$WARMUP audit=durable-before-response"
 } > "$OUT/machine.txt"
 cp "$scratch/config.toml" "$OUT/config.toml"
 
-python3 -B bench/compare/logs/compare.py --system vdg --port "$port" --rows "$ROWS"   --iterations 1 --warmup 0 --out "$OUT/seed.json"
+python3 -B bench/compare/logs/compare.py --system vdg --port "$port" --rows "$ROWS" --batch-rows "$BATCH_ROWS" --iterations 1 --warmup 0 --out "$OUT/seed.json"
 profile=(python3 -B bench/compare/logs/profile.py --seed-report "$OUT/seed.json")
 "${profile[@]}" --port "$port" --iterations "$ITERATIONS" --warmup "$WARMUP" --out "$OUT/warm.json"
 
