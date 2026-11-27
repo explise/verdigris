@@ -22,6 +22,7 @@ jobs:
           VDG_CPUS: '3'
           MINIO_CPUS: '1'
           VDG_BENCH_ALLOW_PRELOAD: '1'
+          PROFILE_INGEST_PHASES: "1"
           VDG_BENCH_PRELOAD_ROWS: '100000'
           ROWS_PER_S: '10000'
           DURATION_SECS: '30'
