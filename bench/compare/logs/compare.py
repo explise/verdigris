@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 import urllib.parse
+from collections import Counter
 
 SERVICES = [
     "gateway", "checkout", "auth", "billing", "search",
@@ -46,6 +47,7 @@ DEFAULT_BATCH_ROWS = 10_000
 DEFAULT_THREADS = 4
 DEFAULT_ITERATIONS = 10
 DEFAULT_WARMUP = 3
+MAX_IDENTITY_SMOKE_ROWS = 100_000
 
 # One trace id is deliberately written to one row in each tier. A full lookup
 # must return all three; a tier-scoped Verdigris query must return exactly one.
@@ -206,6 +208,21 @@ def message_for(i: int, level: str, service: str) -> str:
     )
 
 
+def validate_row_identity(messages, rows):
+    # Each generated message contains its unique input index even when three
+    # rows deliberately share a trace ID. Compare multiplicities exactly.
+    expected = Counter(message_for(i, level_for(i), service_for(i)) for i in range(rows))
+    actual = Counter(messages)
+    if actual != expected:
+        missing = expected - actual
+        unexpected = actual - expected
+        raise SystemExit(
+            f"row identity mismatch: {sum(missing.values())} missing; "
+            f"{sum(unexpected.values())} duplicate or unexpected "
+            f"(examples: {next(iter(missing), None)!r}, {next(iter(unexpected), None)!r})"
+        )
+
+
 def record(i: int, rows: int, system: str) -> dict:
     level = level_for(i)
     service = service_for(i)
@@ -329,6 +346,9 @@ class Backend:
     def validate(self):
         raise NotImplementedError
 
+    def fixture_messages(self, limit):
+        raise NotImplementedError
+
     def count_recent(self):
         raise NotImplementedError
 
@@ -398,6 +418,9 @@ class Vdg(Backend):
     def validate(self):
         rows = self._query("SELECT count(*) AS n FROM bench")
         return int(rows[0]["n"])
+
+    def fixture_messages(self, limit):
+        return [row["message"] for row in self._query(f"SELECT message FROM bench LIMIT {limit}")]
 
     def count_recent(self):
         rows = self._query(
@@ -489,6 +512,9 @@ class ClickHouse(Backend):
     def validate(self):
         return int(self._sql_json("SELECT count() AS n FROM bench")[0]["n"])
 
+    def fixture_messages(self, limit):
+        return [row["message"] for row in self._sql_json(f"SELECT message FROM bench LIMIT {limit}")]
+
     def count_recent(self):
         return int(self._sql_json(
             "SELECT count() AS n FROM bench WHERE service = 'checkout' AND level = 'ERROR'"
@@ -547,6 +573,9 @@ class VictoriaLogs(Backend):
     def validate(self):
         rows = self._query_rows("* | stats count() total")
         return int(rows[0]["total"])
+
+    def fixture_messages(self, limit):
+        return [row["_msg"] for row in self._query_rows(f"* | fields _msg | limit {limit}")]
 
     def count_recent(self):
         rows = self._query_rows(
@@ -617,6 +646,8 @@ def main():
     ap.add_argument("--threads", type=int, default=DEFAULT_THREADS)
     ap.add_argument("--iterations", type=int, default=DEFAULT_ITERATIONS)
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
+    ap.add_argument("--verify-all-row-ids", action="store_true",
+                    help="verify every generated identity on a smoke corpus (up to 100,000 rows)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--vdg-compact-container", help="compact a disposable Verdigris fixture once after ingest")
     args = ap.parse_args()
@@ -628,6 +659,8 @@ def main():
     # Every id is a real row; keep away from the cross-tier sentinel rows.
     if rows < 5:
         ap.error("--rows requires at least five fixture rows")
+    if args.verify_all_row_ids and rows > MAX_IDENTITY_SMOKE_ROWS:
+        ap.error(f"--verify-all-row-ids supports up to {MAX_IDENTITY_SMOKE_ROWS:,} smoke rows")
     args.trace_ids = trace_schedule(rows)
     args.trace_id = args.trace_ids[len(args.trace_ids) // 2]
     args.missing_trace_id = MISSING_TRACE
@@ -835,6 +868,11 @@ def main():
     }
     if compact_result is not None:
         results["explicit_compaction"] = compact_result
+    if args.verify_all_row_ids:
+        # Run outside the measured workloads and audit/cache counter windows.
+        validate_row_identity(backend.fixture_messages(rows + 1), rows)
+        results["equivalence"]["verified_row_identities"] = rows
+        print(f"{args.system}: verified all {rows} row identities", flush=True)
     backend.close()
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:

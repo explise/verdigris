@@ -16,6 +16,7 @@ ROWS=200000 ITERATIONS=5 SYSTEMS="vdg clickhouse" bench/compare/logs/run.sh
 VDG_SKIP_BUILD=1 VDG_IMAGE=verdigris-bench:<tag> bench/compare/logs/run.sh
 RESTART=1 bench/compare/logs/run.sh             # also restart once per first-query shape
 TOTAL_CPUS=4 bench/compare/logs/run.sh          # equal budget on a 4-vCPU host
+TOTAL_CPUS=4 ROWS=100000 VERIFY_ALL_ROW_IDS=1 bench/compare/logs/run.sh
 ```
 
 Results land in `bench/results/compare-logs/` (`<system>.json`,
@@ -47,6 +48,9 @@ exit.
   is checked against the fixture. Search rows are checked in newest-first order.
   Trace hits, misses, and cross-tier traces are checked for exact row values.
   Every minute bucket is checked for timestamp, total, and error count in order.
+  The optional smoke gate also compares the full multiset of generated row
+  identities after timing. Row identity comes from the unique index in the log
+  message. Three fixture rows intentionally share a trace ID.
 - **Latency** is one warm connection per backend, with `WARMUP` warmups and
   `ITERATIONS` measured requests. Validation runs outside the measured interval.
   p50 is the median, with nearest rank for p95 and p99. The restart run makes a
@@ -100,23 +104,29 @@ run](../../results/issue83/four-cpu/README.md)
 The [earlier eight-CPU cohort](../../results/issue63/README.md) used a different
 host and budget. Its values are retained as a separate reference.
 
-## First matched 20M sizing comparison
+## Matched 20M comparison
 
-The same four-CPU budget now has one matched 20M deployment per
-engine. Every warm query and first query after restart passed the
-same result checks as the 1M cohort.
+Each range is p95 across three fresh deployments per engine, with a
+different engine order on each runner. Every warm sample and first
+query after a restart passed the result checks.
 
 | Warm p95 (ms) | Verdigris + MinIO | ClickHouse | VictoriaLogs |
 | --- | ---: | ---: | ---: |
-| Exact trace hit | 18.68 | 119.06 | 4.61 |
-| Exact trace miss | 4.48 | 1.95 | 3.85 |
-| Cross-tier trace | 28.62 | 6.11 | 5.57 |
-| Recent service search | 104.47 | 3.99 | 30.73 |
-| Raw minute aggregation | 388.72 | 166.00 | 142.76 |
+| Exact trace hit | 18.68–26.79 | 119.06–199.66 | 4.61–7.22 |
+| Exact trace miss | 4.48–7.72 | 1.95–2.63 | 3.85–5.74 |
+| Cross-tier trace | 28.62–36.19 | 6.11–8.64 | 5.57–7.77 |
+| Recent service search | 104.47–133.38 | 3.99–6.90 | 30.73–39.96 |
+| Raw minute aggregation | 388.72–485.53 | 166.00–233.60 | 142.76–228.41 |
 
-ClickHouse exact hits had a 2.96 ms median, with six of 100 requests
-above 119 ms. Repeat the matched 20M run before drawing a conclusion
-from that tail. Verdigris completed all 550 expected warm audit
-acknowledgements within the configured deadline. The short ingest
-comparison reports acknowledgement, visibility and storage separately.
+The exact-hit schedule rotates through 16 IDs and warms ten before timing.
+In both chronological replications, ClickHouse's first six measured
+requests were the only samples above 100 ms. They were the first visits
+to the six IDs outside the warmup. The remaining 94 repeat-ID requests
+had 3.87 and 5.07 ms p95. Verdigris completed all 1,650 expected warm
+audit acknowledgements across the three trials.
+
+Verdigris's biggest remaining gaps are recent search and raw minute
+aggregation. The exact-hit p95 and cross-tier trace still miss their
+20M targets in repeated runs. The short ingest, first-query and retained
+storage measurements are reported separately.
 [Raw samples and method](../../results/issue63/matched-20m/README.md)

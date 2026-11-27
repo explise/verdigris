@@ -5,6 +5,7 @@
 import { createResource, createSignal, createMemo, For, Show, createEffect, onMount } from "solid-js";
 import { createVirtualizer } from "@tanstack/solid-virtual";
 import { useApi } from "@/store";
+import type { Api } from "@/lib/api";
 import type { LogRow, TierId } from "@/lib/types";
 import { fmtBytes, usd } from "@/lib/format";
 
@@ -17,6 +18,10 @@ const ALL_TIERS: { id: TierId; t: string }[] = [
 
 export default function Logs() {
   const api = useApi();
+  return <Show when={api()} keyed>{(workspace) => <WorkspaceLogs api={workspace} />}</Show>;
+}
+
+function WorkspaceLogs(props: { api: Api }) {
   const [sql, setSql] = createSignal("service:auth status>=500 | last 1h");
   const [tiers, setTiers] = createSignal<TierId[]>(["hot", "warm"]);
   const [gate, setGate] = createSignal(true);
@@ -27,16 +32,11 @@ export default function Logs() {
   // so editing the box doesn't refetch until Run/Enter. A fresh object each time
   // means Run always re-executes, even with unchanged text.
   const [submitted, setSubmitted] = createSignal({ sql: sql(), tiers: tiers() });
-  const [query] = createResource(
-    () => ({ a: api(), q: submitted() }),
-    ({ a, q }) => a.queryLogs({ sql: q.sql, tiers: q.tiers }),
-  );
-  // The activity strip is a separate aggregation request tied to the submitted
-  // query/tiers/workspace. Solid's keyed resource discards an older response when
-  // the key changes, so a late chart cannot overwrite the current query's chart.
+  const [query] = createResource(submitted, (q) => props.api.queryLogs(q));
+  // A new workspace starts its own resources and cold approval. Inside one
+  // workspace, the submitted query keys both independent responses.
   const [activity, { refetch: refetchActivity }] = createResource(
-    () => ({ a: api(), q: submitted() }),
-    ({ a, q }) => a.queryActivity({ sql: q.sql, tiers: q.tiers }),
+    submitted, (q) => props.api.queryActivity(q),
   );
   const activityTotal = createMemo(() => {
     // Do not read the resource value while it is errored: Solid re-throws the
@@ -44,7 +44,7 @@ export default function Logs() {
     if (activity.error || activity.loading) return 0;
     return (activity()?.histogram ?? []).reduce((n, b) => n + (b.total || 0), 0);
   });
-  const [est] = createResource(tiers, (t) => api().estimate(t));
+  const [est] = createResource(tiers, (t) => props.api.estimate(t));
 
   const execute = () => setSubmitted({ sql: sql(), tiers: tiers() });
 
