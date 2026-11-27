@@ -154,9 +154,14 @@ impl TrigramSet {
             let mut out = Vec::with_capacity(SPARSE_HEADER + 2 * n);
             out.push(SPARSE_TAG);
             out.extend_from_slice(&(n as u16).to_le_bytes());
-            for idx in 0..NUM_TRIGRAMS {
-                if self.get(idx) {
+            for (byte_index, mut bits) in self.bits.iter().copied().enumerate() {
+                while bits != 0 {
+                    let idx = byte_index * 8 + bits.trailing_zeros() as usize;
+                    if idx >= NUM_TRIGRAMS {
+                        break;
+                    }
                     out.extend_from_slice(&(idx as u16).to_le_bytes());
+                    bits &= bits - 1;
                 }
             }
             base64_encode(&out)
