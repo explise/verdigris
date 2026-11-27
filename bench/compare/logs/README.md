@@ -99,3 +99,30 @@ run](../../results/issue83/four-cpu/README.md)
 
 The [earlier eight-CPU cohort](../../results/issue63/README.md) used a different
 host and budget. Its values are retained as a separate reference.
+
+## Matched 20M comparison
+
+Each range is p95 across three fresh deployments per engine, with a
+different engine order on each runner. Every warm sample and first
+query after a restart passed the result checks.
+
+| Warm p95 (ms) | Verdigris + MinIO | ClickHouse | VictoriaLogs |
+| --- | ---: | ---: | ---: |
+| Exact trace hit | 18.68–26.79 | 119.06–199.66 | 4.61–7.22 |
+| Exact trace miss | 4.48–7.72 | 1.95–2.63 | 3.85–5.74 |
+| Cross-tier trace | 28.62–36.19 | 6.11–8.64 | 5.57–7.77 |
+| Recent service search | 104.47–133.38 | 3.99–6.90 | 30.73–39.96 |
+| Raw minute aggregation | 388.72–485.53 | 166.00–233.60 | 142.76–228.41 |
+
+The exact-hit schedule rotates through 16 IDs and warms ten before timing.
+In both chronological replications, ClickHouse's first six measured
+requests were the only samples above 100 ms. They were the first visits
+to the six IDs outside the warmup. The remaining 94 repeat-ID requests
+had 3.87 and 5.07 ms p95. Verdigris completed all 1,650 expected warm
+audit acknowledgements across the three trials.
+
+Verdigris's biggest remaining gaps are recent search and raw minute
+aggregation. The exact-hit p95 and cross-tier trace still miss their
+20M targets in repeated runs. The short ingest, first-query and retained
+storage measurements are reported separately.
+[Raw samples and method](../../results/issue63/matched-20m/README.md)

@@ -1,0 +1,8 @@
+source_commit=1a904079327abbb3b0f530e8bce32d5cef34ebca
+source_dirty_paths=0
+verdigris_image=sha256:0f0898692084b2e967421289376dbbfd0a5bf298cdceeb3c029182e998c6371b
+minio_image=sha256:a31b5d900fa9a6704040f7a6dadd9330383bab28aef8d9ae8be576c98d6ef3b8
+cpu=x86_64 host_threads=4 MemTotal: 16367496 kB
+kernel=7.0.0-1020-azure budget=2cpu/3GiB per service
+rows=1000000 batch_rows=10000 iterations=100 warmup=10 audit=durable-before-response
+corpus_ts_ms=1795764240000
