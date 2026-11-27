@@ -24,12 +24,14 @@ struct Batch {
 struct Probe {
     id: usize,
     sent: Instant,
+    ack: Instant,
 }
 
 #[derive(Serialize)]
 struct Visibility {
     id: usize,
     visible_ms: Option<f64>,
+    ack_to_visible_ms: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -72,12 +74,13 @@ fn produce(
     rate: usize,
     rows: usize,
     epoch: i64,
+    namespace: &str,
     tx: mpsc::Sender<Batch>,
 ) -> Result<()> {
     let mut records = generate_iter(rows, args.seed, 0);
     for (id, first_row) in (0..rows).step_by(args.batch_rows).enumerate() {
         let batch_rows = args.batch_rows.min(rows - first_row);
-        let trace = marker(id);
+        let trace = format!("{namespace}-{id:012}");
         let mut body = String::with_capacity(args.body_bytes);
         for (offset, mut record) in records.by_ref().take(batch_rows).enumerate() {
             record.trace_id = Some(format!("{trace}-{offset:06}"));
@@ -134,20 +137,21 @@ async fn visibility_worker(
             loop {
                 if let Ok(rows) = query(&client, &url, sql.clone()).await {
                     if rows.iter().any(|row| row["trace_id"] == id) {
-                        return ms(probe.sent.elapsed());
+                        return Instant::now();
                     }
                 }
                 sleep(VISIBILITY_POLL).await;
             }
         };
-        let visible_ms = if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        let observed = if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             timeout(remaining, visible).await.ok()
         } else {
             None
         };
         measurements.push(Visibility {
             id: probe.id,
-            visible_ms,
+            visible_ms: observed.map(|at| ms(at.duration_since(probe.sent))),
+            ack_to_visible_ms: observed.map(|at| ms(at.duration_since(probe.ack))),
         });
     }
     measurements
@@ -209,8 +213,17 @@ async fn submit(
                     result.error = Some("invalid_ack");
                     result.acked_rows = None;
                 } else {
-                    result.ack_ms = Some(ms(start.elapsed()));
-                    if sample && visibility.try_send(Probe { id: batch.id, sent }).is_err() {
+                    let ack = Instant::now();
+                    result.ack_ms = Some(ms(ack.duration_since(start)));
+                    if sample
+                        && visibility
+                            .try_send(Probe {
+                                id: batch.id,
+                                sent,
+                                ack,
+                            })
+                            .is_err()
+                    {
                         result.error = Some("visibility_queue_full");
                     }
                 }
@@ -260,7 +273,15 @@ pub(super) async fn run(args: &Args, rate: usize) -> Result<()> {
     let existing = query(
         &client,
         &query_url,
-        format!("SELECT count(*) AS n FROM {}", args.table),
+        format!(
+            "SELECT count(*) AS n FROM {} WHERE {}",
+            args.table,
+            if std::env::var("VDG_BENCH_ALLOW_PRELOAD").as_deref() == Ok("1") {
+                "coalesce(trace_id NOT LIKE 'preload-%', true)"
+            } else {
+                "true"
+            }
+        ),
     )
     .await?;
     ensure!(
@@ -268,10 +289,71 @@ pub(super) async fn run(args: &Args, rate: usize) -> Result<()> {
         "sustained mode requires a fresh dedicated benchmark table"
     );
 
+    if let Some(preload_rows) = std::env::var_os("VDG_BENCH_PRELOAD_ROWS") {
+        ensure!(
+            std::env::var("VDG_BENCH_ALLOW_PRELOAD").as_deref() == Ok("1"),
+            "preloading requires VDG_BENCH_ALLOW_PRELOAD=1"
+        );
+        let preload_rows: usize = preload_rows
+            .to_str()
+            .context("non-UTF-8 preload row count")?
+            .parse()?;
+        ensure!(preload_rows > 0, "preload row count must be positive");
+        let preload_ms = i64::try_from((preload_rows as u128 * 1_000).div_ceil(rate as u128))?;
+        let preload_epoch = epoch
+            .checked_sub(preload_ms)
+            .context("preload timestamp overflow")?;
+        let (tx, mut rx) = mpsc::channel(1);
+        let generator_args = args.clone();
+        let producer = tokio::task::spawn_blocking(move || {
+            produce(
+                &generator_args,
+                rate,
+                preload_rows,
+                preload_epoch,
+                "preload",
+                tx,
+            )
+        });
+        let (probe_tx, _probe_rx) = mpsc::channel(1);
+        let endpoint = format!("{url}{}", args.path);
+        let start = Instant::now();
+        let mut acknowledged = 0;
+        while let Some(batch) = rx.recv().await {
+            let expected = u64::try_from(batch.rows)?;
+            let outcome = submit(
+                client.clone(),
+                endpoint.clone(),
+                batch,
+                start,
+                false,
+                probe_tx.clone(),
+            )
+            .await;
+            ensure!(
+                outcome.acked_rows == Some(expected),
+                "preload batch {} failed: {:?}",
+                outcome.id,
+                outcome.error
+            );
+            acknowledged += expected;
+        }
+        producer.await??;
+        ensure!(
+            acknowledged == u64::try_from(preload_rows)?,
+            "incomplete preload"
+        );
+        eprintln!("preloaded {acknowledged} rows");
+        if std::env::var("VDG_BENCH_PRELOAD_ONLY").as_deref() == Ok("1") {
+            return Ok(());
+        }
+    }
+
     let (tx, mut rx) = mpsc::channel(args.concurrency);
     let generator_args = args.clone();
-    let producer =
-        tokio::task::spawn_blocking(move || produce(&generator_args, rate, rows, epoch, tx));
+    let producer = tokio::task::spawn_blocking(move || {
+        produce(&generator_args, rate, rows, epoch, "sustained", tx)
+    });
     let (probe_tx, probe_rx) = mpsc::channel(VISIBILITY_QUEUE);
     let probes = tokio::spawn(visibility_worker(
         client.clone(),
@@ -381,12 +463,32 @@ pub(super) async fn run(args: &Args, rate: usize) -> Result<()> {
         .checked_sub(1)
         .and_then(|p| visible.get(p))
         .copied();
+    let sampled_acks = sampled_batches
+        .iter()
+        .filter(|&&id| {
+            outcomes
+                .get(id)
+                .is_some_and(|outcome| outcome.acked_rows.is_some())
+        })
+        .count();
+    let mut ack_to_visible: Vec<_> = visibility
+        .iter()
+        .filter_map(|sample| sample.ack_to_visible_ms)
+        .collect();
+    ack_to_visible.sort_by(f64::total_cmp);
+    let ack_to_visible_p95 = (sampled_acks * 95)
+        .div_ceil(100)
+        .checked_sub(1)
+        .and_then(|position| ack_to_visible.get(position))
+        .copied();
     let report = json!({"table": args.table, "seed": args.seed, "corpus_start_ms": epoch,
         "duration_s": args.duration_secs, "offered_rows_per_s": rate, "planned_rows": rows,
         "planned_batches": scheduled_batches, "outcomes": outcomes, "acked_rows": acked,
         "acked_in_window": acked_in_window, "acked_rows_per_s": acked_in_window as f64 / duration.as_secs_f64(),
         "visibility_poll_ms": VISIBILITY_POLL.as_millis(), "visibility_deadline_ms": VISIBILITY_TIMEOUT.as_millis(),
         "sampled_batches": sampled_batches, "visibility": visibility, "visibility_p95_ms": p95,
+        "sampled_acks": sampled_acks, "sampled_acks_without_visibility": sampled_acks.saturating_sub(ack_to_visible.len()),
+        "ack_to_visible_p95_ms": ack_to_visible_p95,
         "concurrency": args.concurrency, "buffered_batches": args.concurrency,
         "storage_samples": storage,
         "body_bytes_limit": args.body_bytes, "generation_error": generation.as_ref().err().map(ToString::to_string)});
@@ -419,7 +521,7 @@ mod tests {
     fn batches_have_unique_row_ids_in_the_requested_time_range() {
         let args = Args::parse_from(["loadgen", "--batch-rows", "2", "--body-bytes", "4096"]);
         let (tx, mut rx) = mpsc::channel(2);
-        produce(&args, 2, 3, 1000, tx).unwrap();
+        produce(&args, 2, 3, 1000, "sustained", tx).unwrap();
         let first = rx.try_recv().unwrap();
         let last = rx.try_recv().unwrap();
         assert_eq!((first.rows, last.rows), (2, 1));

@@ -7,6 +7,8 @@
 pub mod encode;
 pub mod generate;
 pub mod otlp;
+pub mod phases;
+use phases::{IngestPhase, IngestPhaseMetrics, PhaseTimer};
 pub mod schema;
 pub mod wire;
 
@@ -76,6 +78,7 @@ pub struct Ingestor {
     /// tests and simulation keep the default `SimClock`, so a compaction never
     /// reads wall time directly from this crate.
     clock: Arc<dyn Clock>,
+    phase_metrics: Option<Arc<IngestPhaseMetrics>>,
     /// Grace period between retiring a compacted-away file and deleting it.
     retired_grace_ms: u64,
 }
@@ -86,6 +89,7 @@ impl Ingestor {
             store,
             table: table.into(),
             clock: Arc::new(SimClock::default()),
+            phase_metrics: None,
             retired_grace_ms: DEFAULT_RETIRED_GRACE_MS,
         }
     }
@@ -94,6 +98,17 @@ impl Ingestor {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    pub fn with_phase_metrics(mut self, metrics: Arc<IngestPhaseMetrics>) -> Self {
+        self.phase_metrics = Some(metrics);
+        self
+    }
+
+    fn phase_timer(&self, phase: IngestPhase) -> Option<PhaseTimer<'_>> {
+        self.phase_metrics
+            .as_ref()
+            .map(|metrics| metrics.timer(self.clock.as_ref(), phase))
     }
 
     /// Override how long retired files remain readable before reclamation.
@@ -171,18 +186,30 @@ impl Ingestor {
         if add.is_empty() {
             return Ok(());
         }
-        let mut idx = self.load_trigrams().await?;
-        for (path, set) in &add.by_path {
-            idx.insert(path.clone(), set.clone());
+        let mut idx = {
+            let _timer = self.phase_timer(IngestPhase::TrigramGetDecode);
+            self.load_trigrams().await?
+        };
+        {
+            let _timer = self.phase_timer(IngestPhase::TrigramInsert);
+            for (path, set) in &add.by_path {
+                idx.insert(path.clone(), set.clone());
+            }
+            for (path, sets) in &add.row_groups_by_path {
+                idx.insert_row_groups(path.clone(), sets.clone());
+            }
         }
-        for (path, sets) in &add.row_groups_by_path {
-            idx.insert_row_groups(path.clone(), sets.clone());
+        let bytes = {
+            let _timer = self.phase_timer(IngestPhase::TrigramSerialize);
+            serde_json::to_vec(&idx).context("serializing trigram sidecar")?
+        };
+        {
+            let _timer = self.phase_timer(IngestPhase::TrigramPut);
+            self.store
+                .put(&self.trigrams_path(), bytes.into())
+                .await
+                .context("writing trigram sidecar")?;
         }
-        let bytes = serde_json::to_vec(&idx).context("serializing trigram sidecar")?;
-        self.store
-            .put(&self.trigrams_path(), bytes.into())
-            .await
-            .context("writing trigram sidecar")?;
         Ok(())
     }
 
@@ -244,6 +271,11 @@ impl Ingestor {
         base: Option<UpdateVersion>,
     ) -> anyhow::Result<CommitOutcome> {
         let bytes = serde_json::to_vec_pretty(manifest).context("serializing manifest")?;
+        if let Some(metrics) = &self.phase_metrics {
+            metrics
+                .manifest_payload_bytes
+                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let mode = match base {
             Some(v) => PutMode::Update(v),
             None => PutMode::Create,
@@ -261,7 +293,14 @@ impl Ingestor {
             // Another writer got there first (Update precondition failed, or Create
             // found an existing object).
             Err(object_store::Error::Precondition { .. })
-            | Err(object_store::Error::AlreadyExists { .. }) => Ok(CommitOutcome::Conflict),
+            | Err(object_store::Error::AlreadyExists { .. }) => {
+                if let Some(metrics) = &self.phase_metrics {
+                    metrics
+                        .manifest_cas_conflicts
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(CommitOutcome::Conflict)
+            }
             // Backend can't do conditional puts (some local stores): fall back to a
             // plain put. Correct under the single-writer deployment model.
             Err(object_store::Error::NotImplemented { .. }) => {
@@ -288,10 +327,16 @@ impl Ingestor {
                 incoming.insert(f.path.clone(), t.clone());
             }
         }
-        self.merge_trigrams(&incoming).await?;
+        {
+            let _timer = self.phase_timer(IngestPhase::TrigramMerge);
+            self.merge_trigrams(&incoming).await?;
+        }
 
         for _ in 0..MAX_COMMIT_RETRIES {
-            let (mut manifest, base) = self.load_manifest_versioned().await?;
+            let (mut manifest, base) = {
+                let _timer = self.phase_timer(IngestPhase::ManifestLoad);
+                self.load_manifest_versioned().await?
+            };
             let existing: HashSet<String> = manifest.files.iter().map(|f| f.path.clone()).collect();
             let mut added = false;
             for f in files {
@@ -303,7 +348,11 @@ impl Ingestor {
             if !added {
                 return Ok(()); // everything already committed (idempotent)
             }
-            if self.commit_manifest(&manifest, base).await? == CommitOutcome::Committed {
+            let outcome = {
+                let _timer = self.phase_timer(IngestPhase::ManifestCas);
+                self.commit_manifest(&manifest, base).await?
+            };
+            if outcome == CommitOutcome::Committed {
                 return Ok(());
             }
             // Conflict: another writer committed; loop reloads the fresh version.
@@ -315,13 +364,20 @@ impl Ingestor {
     /// returns its manifest entry. The name derives from the bytes, so concurrent
     /// writers never collide on a path.
     async fn write_file(&self, records: &[LogRecord], tier: Tier) -> anyhow::Result<DataFile> {
-        let (bytes, stats) = encode::encode_parquet(records)?;
-        let path = self.data_path(tier, &content_hash(&bytes));
+        let (bytes, stats, path) = {
+            let _timer = self.phase_timer(IngestPhase::Encode);
+            let (bytes, stats) = encode::encode_parquet(records)?;
+            let path = self.data_path(tier, &content_hash(&bytes));
+            (bytes, stats, path)
+        };
         let len = bytes.len() as u64;
-        self.store
-            .put(&ObjPath::from(path.clone()), bytes.into())
-            .await
-            .with_context(|| format!("writing {path}"))?;
+        {
+            let _timer = self.phase_timer(IngestPhase::ObjectPut);
+            self.store
+                .put(&ObjPath::from(path.clone()), bytes.into())
+                .await
+                .with_context(|| format!("writing {path}"))?;
+        }
         Ok(DataFile {
             path,
             bytes: len,

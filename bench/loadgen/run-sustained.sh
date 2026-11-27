@@ -10,6 +10,12 @@ if [[ ! "$vdg_cpus" =~ ^[1-9][0-9]*$ || ! "$minio_cpus" =~ ^[1-9][0-9]*$ ]]; the
   echo 'CPU limits must be positive integers' >&2
   exit 2
 fi
+if [[ "${REQUIRE_REFERENCE_PROFILE:-0}" == 1 ]]; then
+  if [[ "$vdg_cpus" != 8 || "$minio_cpus" != 4 ]] || (( $(nproc) < 14 )); then
+    echo "reference profile requires 8 Verdigris CPUs, 4 MinIO CPUs and at least 2 host CPUs for the driver" >&2
+    exit 2
+  fi
+fi
 query_cores=$(( vdg_cpus < 4 ? vdg_cpus : 4 ))
 out=$(realpath -m "${OUT:-$(mktemp -d)}")
 mkdir -p "$out"
@@ -56,11 +62,16 @@ done
 printf 'fixture preflight\n' | mc_run pipe local/verdigris/_benchmark_probe
 mc_run rm local/verdigris/_benchmark_probe
 sed "s/^cores = .*/cores = $query_cores/" bench/config/loadtest.toml > "$out/config.toml"
+if [[ "${PROFILE_INGEST_PHASES:-0}" == 1 ]]; then
+  sed -i '/^\[ingest\]$/a profile_phases = true' "$out/config.toml"
+fi
 chmod 644 "$out/config.toml"
-vdg=$(docker run -d --pull never --network "$net" --cpus="$vdg_cpus" --memory=4g -p 127.0.0.1::8080 \
-  -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS="$vdg_cpus" -e RUST_LOG=warn \
-  --mount "type=bind,src=$out/config.toml,dst=/app/config/bench.toml,readonly" \
-  "$VDG_IMAGE" serve --port 8080 --table logs --role all)
+start_vdg() {
+  vdg=$(docker run -d --pull never --network "$net" --cpus="$vdg_cpus" --memory=4g -p 127.0.0.1::8080 \
+    -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS="$vdg_cpus" -e RUST_LOG=warn \
+    --mount "type=bind,src=$out/config.toml,dst=/app/config/bench.toml,readonly" \
+    "$VDG_IMAGE" serve --port 8080 --table logs --role all)
+}
 wait_ready() {
   port=$(docker port "$vdg" 8080/tcp | awk -F: '{print $NF}')
   url="http://127.0.0.1:$port"
@@ -70,7 +81,39 @@ wait_ready() {
   done
   return 1
 }
+corpus_args=()
+if [[ -n "${CORPUS_START_MS:-}" ]]; then
+  corpus_args+=(--corpus-start-ms="$CORPUS_START_MS")
+fi
+start_vdg
 wait_ready
+if [[ -n "${PRELOAD_COMPACT_MIB:-}" ]]; then
+  [[ "$PRELOAD_COMPACT_MIB" =~ ^[0-9]+$ && "${VDG_BENCH_PRELOAD_ROWS:-}" =~ ^[1-9][0-9]*$ ]]
+  [[ "${VDG_BENCH_ALLOW_PRELOAD:-0}" == 1 ]]
+  docker stop "$vdg" >/dev/null
+  docker rm "$vdg" >/dev/null
+  vdg=
+  cp "$out/config.toml" "$out/measured-config.toml"
+  sed -i '/^\[compaction\]/,$s/^enabled = true$/enabled = false/' "$out/config.toml"
+  start_vdg
+  wait_ready
+  VDG_BENCH_PRELOAD_ONLY=1 "$LOADGEN" --url "$url" --table logs "${corpus_args[@]}" \
+    --sustain-rows-per-sec "${ROWS_PER_S:-220000}" --duration-secs "${DURATION_SECS:-600}" \
+    --batch-rows "${BATCH_ROWS:-10000}" --out "$out/preload.json" > "$out/preload.log" 2>&1
+  if [[ "$PRELOAD_COMPACT_MIB" != 0 ]]; then
+    timeout 300 docker exec "$vdg" vdg compact --table logs --target-mb "$PRELOAD_COMPACT_MIB" \
+      > "$out/preload-compaction.txt"
+  fi
+  docker exec "$vdg" vdg manifest --table logs > "$out/preload-manifest.txt"
+  curl -fsS --max-time 10 "$url/v1/storage/tiers" > "$out/preload-storage.json"
+  docker stop "$vdg" >/dev/null
+  docker rm "$vdg" >/dev/null
+  vdg=
+  mv "$out/measured-config.toml" "$out/config.toml"
+  start_vdg
+  wait_ready
+  unset VDG_BENCH_PRELOAD_ROWS
+fi
 {
   echo "source_commit=$(git rev-parse HEAD)"
   echo "vdg_image=$(docker image inspect "$VDG_IMAGE" --format '{{.Id}}')"
@@ -80,21 +123,38 @@ wait_ready
   uname -srm
   lscpu
 } > "$out/machine.txt"
-"$LOADGEN" --url "$url" --table logs --sustain-rows-per-sec "${ROWS_PER_S:-220000}" \
+capture_phases() {
+  curl -fsS --max-time 5 "$url/metrics" > "$out/phases-$1.prom"
+}
+if [[ "${PROFILE_INGEST_PHASES:-0}" == 1 ]]; then
+  capture_phases initial
+fi
+"$LOADGEN" --url "$url" --table logs "${corpus_args[@]}" --sustain-rows-per-sec "${ROWS_PER_S:-220000}" \
   --duration-secs "${DURATION_SECS:-600}" --batch-rows "${BATCH_ROWS:-10000}" \
   --concurrency "${LOADGEN_CONCURRENCY:-16}" --out "$out/run.json" > "$out/loadgen.log" 2>&1 &
 load_pid=$!
 while kill -0 "$load_pid" 2>/dev/null; do
+  if [[ "${PROFILE_INGEST_PHASES:-0}" == 1 ]]; then
+    capture_phases "$(date -u +%s)" || true
+  fi
   date -u +%FT%TZ >> "$out/containers.txt"
   docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' "$vdg" "$minio" \
     >> "$out/containers.txt" || true
   sleep 10
 done
 wait "$load_pid"
-python3 -B bench/loadgen/check-sustained.py snapshot --url "$url" --table logs --out "$out/before.json"
+if [[ "${PROFILE_INGEST_PHASES:-0}" == 1 ]]; then
+  capture_phases final
+  grep -qE '^verdigris_ingest_phase_observations_total\{phase="manifest_cas"\} [1-9][0-9]*$' "$out/phases-final.prom"
+fi
+snapshot_args=()
+if [[ "${VDG_BENCH_ALLOW_PRELOAD:-0}" == 1 ]]; then
+  snapshot_args+=(--allow-preload)
+fi
+python3 -B bench/loadgen/check-sustained.py snapshot --url "$url" --table logs "${snapshot_args[@]}" --out "$out/before.json"
 docker kill --signal KILL "$vdg" >/dev/null
 docker start "$vdg" >/dev/null
 wait_ready
-python3 -B bench/loadgen/check-sustained.py snapshot --url "$url" --table logs --out "$out/after.json"
+python3 -B bench/loadgen/check-sustained.py snapshot --url "$url" --table logs "${snapshot_args[@]}" --out "$out/after.json"
 python3 -B bench/loadgen/check-sustained.py verify --run "$out/run.json" --before "$out/before.json" \
   --after "$out/after.json" --out "$out/recovery.json"
