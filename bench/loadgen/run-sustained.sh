@@ -91,10 +91,14 @@ while kill -0 "$load_pid" 2>/dev/null; do
   sleep 10
 done
 wait "$load_pid"
-python3 -B bench/loadgen/check-sustained.py snapshot --url "$url" --table logs --out "$out/before.json"
+snapshot_args=()
+if [[ "${VDG_BENCH_ALLOW_PRELOAD:-0}" == 1 ]]; then
+  snapshot_args+=(--allow-preload)
+fi
+python3 -B bench/loadgen/check-sustained.py snapshot --url "$url" --table logs "${snapshot_args[@]}" --out "$out/before.json"
 docker kill --signal KILL "$vdg" >/dev/null
 docker start "$vdg" >/dev/null
 wait_ready
-python3 -B bench/loadgen/check-sustained.py snapshot --url "$url" --table logs --out "$out/after.json"
+python3 -B bench/loadgen/check-sustained.py snapshot --url "$url" --table logs "${snapshot_args[@]}" --out "$out/after.json"
 python3 -B bench/loadgen/check-sustained.py verify --run "$out/run.json" --before "$out/before.json" \
   --after "$out/after.json" --out "$out/recovery.json"
