@@ -319,6 +319,8 @@ pub struct QueryConfig {
     pub max_concurrent: usize,
     /// Permit slots reserved for cheap work, capped below the total capacity.
     pub cheap_permits: usize,
+    /// Admission wait for a scheduled alert evaluation, in milliseconds.
+    pub scheduled_alert_wait_ms: u64,
     /// How long a heavy query waits for a permit before 429.
     pub admission_wait_ms: u64,
     /// A query with `LIMIT <= this` uses the cheap lane. `0` disables the
@@ -345,6 +347,7 @@ impl Default for QueryConfig {
             metadata_cache_mib: 64,
             max_concurrent: 4,
             cheap_permits: 1,
+            scheduled_alert_wait_ms: 50,
             admission_wait_ms: 250,
             cheap_limit_rows: 1_000,
             cheap_scan_mib: 8,

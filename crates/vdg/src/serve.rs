@@ -1129,6 +1129,23 @@ async fn save_alerts_cas(
 /// Retry budget for alert-doc CAS commits under contention.
 const ALERTS_CAS_RETRIES: usize = 4;
 
+async fn admit_alert_query(
+    admission: &Admission,
+    cfg: &verdigris_core::config::QueryConfig,
+    files: &[IndexedFile],
+    wait_ms: u64,
+) -> Result<AdmissionPermit, AppError> {
+    let scan_bytes = files.iter().map(|f| f.bytes).sum();
+    admit_scan_with(
+        admission,
+        cfg,
+        scan_bytes,
+        false,
+        Duration::from_millis(wait_ms),
+    )
+    .await
+}
+
 /// Run a rule's SQL and pull out its single numeric result — the `v` column if
 /// present, else the first numeric column of the first row.
 async fn measure(
@@ -1137,12 +1154,8 @@ async fn measure(
     files: &[IndexedFile],
     sql: &str,
     limits: &QueryLimits,
-    admission: &Admission,
-    cfg: &verdigris_core::config::QueryConfig,
+    _permit: AdmissionPermit,
 ) -> Result<f64, AppError> {
-    let scan_bytes: u64 = files.iter().map(|f| f.bytes).sum();
-    let _permit =
-        admit_scan_with(admission, cfg, scan_bytes, false, Duration::from_millis(50)).await?;
     let rows = verdigris_query::engine::query_table_json(s.clone(), table, files, sql, limits)
         .await
         .map_err(AppError::from_query)?;
@@ -1205,17 +1218,18 @@ async fn evaluate_alert_pass(st: &AlertEvaluator) -> anyhow::Result<()> {
                 disabled += 1;
                 continue;
             }
-            let value = match measure(
-                s,
-                table,
-                &files,
-                &a.rule.sql,
-                &st.limits,
+            let result = match admit_alert_query(
                 &st.admission,
                 &st.query,
+                &files,
+                st.query.scheduled_alert_wait_ms,
             )
             .await
             {
+                Ok(permit) => measure(s, table, &files, &a.rule.sql, &st.limits, permit).await,
+                Err(error) => Err(error),
+            };
+            let value = match result {
                 Ok(v) => v,
                 Err(e) => {
                     if e.status == StatusCode::TOO_MANY_REQUESTS {
@@ -3115,14 +3129,16 @@ async fn h_alert_create(
         .load_manifest()
         .await?;
     let files: Vec<IndexedFile> = m.files.iter().map(IndexedFile::whole).collect();
+    // Interactive validation keeps its existing admission wait. The longer
+    // background wait only applies to the scheduler.
+    let permit = admit_alert_query(&st.admission, &st.cfg.query, &files, 50).await?;
     let value = measure(
         &s,
         st.table.as_str(),
         &files,
         &rule.sql,
         &limits(&st),
-        &st.admission,
-        &st.cfg.query,
+        permit,
     )
     .await?;
     let (status, _t) = alert::evaluate(&rule, &AlertStatus::initial(now), value, now);

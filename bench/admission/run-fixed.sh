@@ -54,7 +54,13 @@ if [[ "$cheap_permits" != 1 && "$cheap_permits" != 2 ]]; then
   echo "CHEAP_PERMITS must be 1 or 2 for this experiment" >&2
   exit 2
 fi
+scheduled_wait_ms=${SCHEDULED_ALERT_WAIT_MS:-50}
+if [[ "$scheduled_wait_ms" != 50 && "$scheduled_wait_ms" != 1000 ]]; then
+  echo "SCHEDULED_ALERT_WAIT_MS must be 50 or 1000 for this experiment" >&2
+  exit 2
+fi
 sed -e 's/perf81-mixed-minio/minio/g' -e "/^\[query\]$/a cheap_permits = $cheap_permits" \
+  -e "/^\[query\]$/a scheduled_alert_wait_ms = $scheduled_wait_ms" \
   bench/results/issue29/vdg.toml > "$out/config.toml"
 chmod 644 "$out/config.toml"
 vdg=$(docker run -d --pull never --network "$net" --cpus=4 --memory=2g -p 127.0.0.1::8080 \

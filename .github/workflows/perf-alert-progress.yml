@@ -1,0 +1,35 @@
+name: Verdigris scheduled alert progress experiment
+
+on:
+  push:
+    branches: [codex/perf-alert-progress]
+
+permissions:
+  contents: read
+
+jobs:
+  experiment:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the experiment image
+        run: docker build -f bench/Dockerfile.vdg -t verdigris-alert-progress:local .
+      - name: Test scheduled alert wait with two reserved permits
+        env:
+          VDG_IMAGE: verdigris-alert-progress:local
+          RESULT_ROOT: ${{ runner.temp }}/verdigris-alert-progress
+        run: |
+          mkdir -p "$RESULT_ROOT"
+          for wait_ms in 50 1000; do
+            CHEAP_PERMITS=2 SCHEDULED_ALERT_WAIT_MS="$wait_ms" OUT="$RESULT_ROOT/wait-$wait_ms" bench/admission/run-fixed.sh
+          done
+      - name: Upload both treatment arms
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verdigris-alert-progress
+          path: ${{ runner.temp }}/verdigris-alert-progress
+          retention-days: 7
