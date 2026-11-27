@@ -57,10 +57,12 @@ printf 'fixture preflight\n' | mc_run pipe local/verdigris/_benchmark_probe
 mc_run rm local/verdigris/_benchmark_probe
 sed "s/^cores = .*/cores = $query_cores/" bench/config/loadtest.toml > "$out/config.toml"
 chmod 644 "$out/config.toml"
-vdg=$(docker run -d --pull never --network "$net" --cpus="$vdg_cpus" --memory=4g -p 127.0.0.1::8080 \
-  -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS="$vdg_cpus" -e RUST_LOG=warn \
-  --mount "type=bind,src=$out/config.toml,dst=/app/config/bench.toml,readonly" \
-  "$VDG_IMAGE" serve --port 8080 --table logs --role all)
+start_vdg() {
+  vdg=$(docker run -d --pull never --network "$net" --cpus="$vdg_cpus" --memory=4g -p 127.0.0.1::8080 \
+    -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS="$vdg_cpus" -e RUST_LOG=warn \
+    --mount "type=bind,src=$out/config.toml,dst=/app/config/bench.toml,readonly" \
+    "$VDG_IMAGE" serve --port 8080 --table logs --role all)
+}
 wait_ready() {
   port=$(docker port "$vdg" 8080/tcp | awk -F: '{print $NF}')
   url="http://127.0.0.1:$port"
@@ -70,7 +72,35 @@ wait_ready() {
   done
   return 1
 }
+start_vdg
 wait_ready
+if [[ -n "${PRELOAD_COMPACT_MIB:-}" ]]; then
+  [[ "$PRELOAD_COMPACT_MIB" =~ ^[0-9]+$ && "${VDG_BENCH_PRELOAD_ROWS:-}" =~ ^[1-9][0-9]*$ ]]
+  [[ "${VDG_BENCH_ALLOW_PRELOAD:-0}" == 1 ]]
+  docker stop "$vdg" >/dev/null
+  docker rm "$vdg" >/dev/null
+  vdg=
+  cp "$out/config.toml" "$out/measured-config.toml"
+  sed -i '/^\[compaction\]/,$s/^enabled = true$/enabled = false/' "$out/config.toml"
+  start_vdg
+  wait_ready
+  VDG_BENCH_PRELOAD_ONLY=1 "$LOADGEN" --url "$url" --table logs \
+    --sustain-rows-per-sec "${ROWS_PER_S:-220000}" --duration-secs "${DURATION_SECS:-600}" \
+    --batch-rows "${BATCH_ROWS:-10000}" --out "$out/preload.json" > "$out/preload.log" 2>&1
+  if [[ "$PRELOAD_COMPACT_MIB" != 0 ]]; then
+    timeout 300 docker exec "$vdg" vdg compact --table logs --target-mb "$PRELOAD_COMPACT_MIB" \
+      > "$out/preload-compaction.txt"
+  fi
+  docker exec "$vdg" vdg manifest --table logs > "$out/preload-manifest.txt"
+  curl -fsS --max-time 10 "$url/v1/storage/tiers" > "$out/preload-storage.json"
+  docker stop "$vdg" >/dev/null
+  docker rm "$vdg" >/dev/null
+  vdg=
+  mv "$out/measured-config.toml" "$out/config.toml"
+  start_vdg
+  wait_ready
+  unset VDG_BENCH_PRELOAD_ROWS
+fi
 {
   echo "source_commit=$(git rev-parse HEAD)"
   echo "vdg_image=$(docker image inspect "$VDG_IMAGE" --format '{{.Id}}')"
