@@ -52,6 +52,14 @@ concurrent pending responses retain their own bounded memory accounting and
 response durability is preserved. Compare any scheduling change against these
 same arrival rates and report heavy work and scheduled alert progress.
 
+Removing only the measured admission interval from each successful trace
+sample leaves **126.14 / 121.68 / 83.61 ms p95** across the three trials.
+This calculation keeps the observed execution, audit and client overhead on
+each request and excludes shed requests. It measures headroom under the
+observed load. A different scheduling policy can change those other phases
+and admit requests absent from these samples. The replay must measure both
+success rate and end-to-end latency for each treatment.
+
 The reproducible command is `VDG_IMAGE=<release-image> OUT=<new-dir>
 bench/admission/run-fixed.sh`. See [machine.txt](machine.txt) for the exact
 source, images, and container IDs. Raw [trial 1](trial-1.json.gz),

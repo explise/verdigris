@@ -48,6 +48,22 @@ counted as failures, not silently dropped.
 trace success and prevented OOM, but service time under contention remains the
 next performance problem. The read-wait evidence is in `bench/results/issue83/`.
 
+## Check a fixed-rate replay
+
+```sh
+python3 -B bench/admission/check-fixed.py <result-directory>
+```
+
+Use Python 3.11 or newer. The checker accepts raw or gzipped trials, verifies
+arrivals and per-class goodput, and recomputes nearest-rank p95 and trace
+admission wait from the samples. It reports the configured permit limit,
+background alert counter deltas and container teardown state. The Rust
+admission tests verify enforcement of the permit limit. Exit 0 means the
+mixed-load trace, heavy progress and container health criteria passed. Exit 1
+means the trial recorded a no-go. Exit 2 means the artifact could not support
+a decision. Include host and backing-storage information when interpreting
+its result.
+
 ## Reproduction
 
 ```sh

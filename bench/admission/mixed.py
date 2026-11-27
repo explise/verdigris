@@ -5,6 +5,9 @@ import argparse, concurrent.futures, heapq, http.client, json, math, os, statist
 SERVICES = ["gateway", "checkout", "auth", "billing", "search", "catalog", "ingest", "query", "alerts", "settings"]
 BASE = int(os.environ.get("MIXED_BASE_TS_MS", str((int(time.time() * 1000) - 200 * 60_000) // 60_000 * 60_000)))
 WINDOW_MS = 200 * 60_000
+# Keep this schedule shared with the result validator.
+FIXED_RATES = {"heavy": 28.0, "cheap": 11.0, "trace": 11.0, "expensive": 4.0,
+               "dashboard": 0.5, "alert": 0.1}
 
 
 def record(i, rows):
@@ -142,10 +145,7 @@ def main():
     results = {kind: [] for kind in ("heavy", "cheap", "trace", "expensive", "dashboard", "alert")}
     trace_cursor = 0
     created_alerts = []
-    # Freeze targets near the original measured offered rates. Dashboard
-    # refresh and real alert creation/validation run at explicit low rates.
-    rates = {"heavy": 28.0, "cheap": 11.0, "trace": 11.0, "expensive": 4.0,
-             "dashboard": 0.5, "alert": 0.1}
+    rates = FIXED_RATES
 
     def run(kind, arrival=None, seq=None):
         nonlocal trace_cursor
