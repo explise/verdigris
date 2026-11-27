@@ -38,6 +38,7 @@ default-features = true
 [dev-dependencies]
 tokio.workspace = true
 verdigris-ingest.workspace = true
+parquet.workspace = true
 
 # The engine tests only make sense with the real engine compiled in.
 [[test]]

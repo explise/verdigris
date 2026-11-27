@@ -2705,6 +2705,7 @@ struct TailFile {
     path: String,
     bytes: u64,
     min_ts: i64,
+    immutable: bool,
 }
 
 /// Cursor over append-only ingest files, carried across `unfold` steps.
@@ -2801,6 +2802,7 @@ impl TailCursor {
                 path: f.path.clone(),
                 bytes: f.bytes,
                 min_ts: f.min_ts,
+                immutable: f.is_immutable_key(),
             })
             .collect();
         // Mark every current path known — including compaction outputs — so the
@@ -2823,6 +2825,7 @@ impl TailCursor {
             path: file.path.clone(),
             bytes: file.bytes,
             row_groups: None,
+            immutable: file.immutable,
         }];
         // `arrow_cast(ts, 'Int64')` keeps the internal epoch-millis helper out of
         // the public row contract while still letting `ORDER BY ts` use the

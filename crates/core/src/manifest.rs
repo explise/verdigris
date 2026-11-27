@@ -112,6 +112,10 @@ pub struct DataFile {
     pub row_group_trigrams: Option<Vec<TrigramSet>>,
 }
 
+fn is_content_digest(s: &str) -> bool {
+    s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 impl DataFile {
     /// True for a file written by the streaming ingest path (`part-<hash>.parquet`),
     /// as opposed to a compaction output (`c<gen>-…`). Live tail uses this to
@@ -122,6 +126,34 @@ impl DataFile {
             .rsplit('/')
             .next()
             .is_some_and(|name| name.starts_with("part-"))
+    }
+
+    /// True when the key itself proves the object is immutable: an ingest part
+    /// with a 16-hex content digest, or a compaction output carrying one. Query
+    /// caches may reuse metadata for these keys without revalidating the object.
+    ///
+    /// Older writers used generation/counter keys (`part-00001.parquet`); those
+    /// can be replaced in place at the same length and must not inherit the
+    /// content-addressed cache contract.
+    pub fn is_immutable_key(&self) -> bool {
+        let Some(name) = self.path.rsplit('/').next() else {
+            return false;
+        };
+        if let Some(digest) = name
+            .strip_prefix("part-")
+            .and_then(|n| n.strip_suffix(".parquet"))
+        {
+            return is_content_digest(digest);
+        }
+        if let Some(rest) = name
+            .strip_prefix('c')
+            .and_then(|n| n.strip_suffix(".parquet"))
+        {
+            if let Some((_, digest)) = rest.rsplit_once('-') {
+                return is_content_digest(digest);
+            }
+        }
+        false
     }
 
     fn stat_values(&self, column: StatColumn) -> &[String] {
