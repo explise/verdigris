@@ -272,7 +272,15 @@ pub(super) async fn run(args: &Args, rate: usize) -> Result<()> {
     let existing = query(
         &client,
         &query_url,
-        format!("SELECT count(*) AS n FROM {}", args.table),
+        format!(
+            "SELECT count(*) AS n FROM {} WHERE {}",
+            args.table,
+            if std::env::var("VDG_BENCH_ALLOW_PRELOAD").as_deref() == Ok("1") {
+                "coalesce(trace_id NOT LIKE 'preload-%', true)"
+            } else {
+                "true"
+            }
+        ),
     )
     .await?;
     ensure!(
