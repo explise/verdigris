@@ -113,4 +113,12 @@ if [[ "${RUN_MUTATING_TRIAL:-0}" == 1 ]]; then
     --trial mutating --stats-container "$vdg" --stats-container "$minio" --ingest-probe-every 10 \
     --out "$out/mutating.json" > "$out/mutating.log"
   curl -fsS --max-time 10 "http://127.0.0.1:$port/v1/metrics" > "$out/metrics-mutating.json"
+  if [[ "${CHECK_DRAINED_FRESHNESS:-0}" == 1 ]]; then
+    freshness_flags=()
+    if [[ "${DASHBOARD_SNAPSHOT_CACHE:-false}" == true ]]; then
+      freshness_flags+=(--expect-cache-hits)
+    fi
+    python3 -B bench/admission/dashboard-freshness.py --port "$port" --mutating "$out/mutating.json" \
+      --out "$out/freshness.json" "${freshness_flags[@]}"
+  fi
 fi

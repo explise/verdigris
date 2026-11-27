@@ -24,10 +24,15 @@ jobs:
           RESULT_ROOT: ${{ runner.temp }}/verdigris-dashboard-grace
         run: |
           mkdir -p "$RESULT_ROOT"
-          for cache in false true; do
-            CHEAP_PERMITS=2 SCHEDULED_ALERT_WAIT_MS=1000 RUN_MUTATING_TRIAL=1 DASHBOARD_SNAPSHOT_CACHE="$cache" \
-              OUT="$RESULT_ROOT/cache-$cache" bench/admission/run-fixed.sh
+          failures=0
+          for cache in true false; do
+            if ! CHEAP_PERMITS=2 SCHEDULED_ALERT_WAIT_MS=1000 RUN_MUTATING_TRIAL=1 \
+              CHECK_DRAINED_FRESHNESS=1 DASHBOARD_SNAPSHOT_CACHE="$cache" \
+              OUT="$RESULT_ROOT/cache-$cache" bench/admission/run-fixed.sh; then
+              failures=1
+            fi
           done
+          exit "$failures"
       - name: Upload both treatment arms
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

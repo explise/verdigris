@@ -367,6 +367,9 @@ def main():
                 raise RuntimeError(f"dashboard returned a stale or mixed snapshot: {sample}")
         out["committed_probe_rows"] = probe_rows
         out["dashboard_snapshot_checks"] = dashboard_observations
+        out["dashboard_post_ack_observations"] = sum(
+            sample["expected_min"] > args.rows for sample in dashboard_observations
+        )
     print(json.dumps(out, indent=2), flush=True)
     open(args.out, "w").write(json.dumps(out, indent=2))
 
