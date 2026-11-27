@@ -56,6 +56,29 @@ The [scheduled-alert wait experiment](scheduled-alert-wait/README.md) restored
 scheduled evaluations while retaining the trace gate. Dashboard refreshes
 still needed a separate treatment.
 
+## Measured dashboard configuration
+
+The [dashboard snapshot experiment](dashboard-snapshot/README.md) passed
+the three steady disk-backed trials with four query permits and the
+following opt-in query settings.
+
+```toml
+[query]
+max_concurrent = 4
+cheap_permits = 2
+admission_wait_ms = 250
+scheduled_alert_wait_ms = 1000
+dashboard_snapshot_cache = true
+```
+
+A dashboard refresh rereads the authoritative manifest and can reuse a
+single complete aggregate result for the same set of readable,
+content-addressed files. Cold and legacy files use the original scan.
+Misses retain ordinary scan admission and the same scan budget. The
+cache hit counter appears as `dashboardSnapshotHits` in `/v1/metrics`.
+Ingest and compaction change the snapshot and trigger a fresh result.
+The changing-fixture trial completed 14 of 30 refreshes with reuse.
+
 ## Check a fixed-rate replay
 
 ```sh

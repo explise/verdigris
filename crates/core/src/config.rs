@@ -311,12 +311,18 @@ pub struct QueryConfig {
     /// bloom filters, page index), in MiB. Shared across requests; execution
     /// memory stays per query. Set to 0 to disable cross-request reuse.
     pub metadata_cache_mib: u64,
+    /// Reuse complete dashboard aggregates for an identical immutable snapshot.
+    pub dashboard_snapshot_cache: bool,
 
     // ── Query admission (issue #29) ────────────────────────────────────────
     /// Total concurrent query executions admitted by this node. One permit is
     /// reserved for cheap queries so a dashboard LIMIT query cannot starve
     /// behind full-scan aggregates.
     pub max_concurrent: usize,
+    /// Permit slots reserved for cheap work, capped below the total capacity.
+    pub cheap_permits: usize,
+    /// Admission wait for a scheduled alert evaluation, in milliseconds.
+    pub scheduled_alert_wait_ms: u64,
     /// How long a heavy query waits for a permit before 429.
     pub admission_wait_ms: u64,
     /// A query with `LIMIT <= this` uses the cheap lane. `0` disables the
@@ -341,7 +347,10 @@ impl Default for QueryConfig {
             max_result_rows: 1_000_000,
             max_result_mib: 256,
             metadata_cache_mib: 64,
+            dashboard_snapshot_cache: false,
             max_concurrent: 4,
+            cheap_permits: 1,
+            scheduled_alert_wait_ms: 50,
             admission_wait_ms: 250,
             cheap_limit_rows: 1_000,
             cheap_scan_mib: 8,

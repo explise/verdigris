@@ -49,7 +49,25 @@ done
 # minimum free-drive threshold while every upload is rejected.
 printf 'fixture preflight\n' | mc_run pipe local/verdigris/_benchmark_probe
 mc_run rm local/verdigris/_benchmark_probe
-sed 's/perf81-mixed-minio/minio/g' bench/results/issue29/vdg.toml > "$out/config.toml"
+cheap_permits=${CHEAP_PERMITS:-1}
+if [[ "$cheap_permits" != 1 && "$cheap_permits" != 2 ]]; then
+  echo "CHEAP_PERMITS must be 1 or 2 for this experiment" >&2
+  exit 2
+fi
+scheduled_wait_ms=${SCHEDULED_ALERT_WAIT_MS:-50}
+if [[ "$scheduled_wait_ms" != 50 && "$scheduled_wait_ms" != 1000 ]]; then
+  echo "SCHEDULED_ALERT_WAIT_MS must be 50 or 1000 for this experiment" >&2
+  exit 2
+fi
+sed -e 's/perf81-mixed-minio/minio/g' -e "/^\[query\]$/a cheap_permits = $cheap_permits" \
+  -e "/^\[query\]$/a scheduled_alert_wait_ms = $scheduled_wait_ms" \
+  bench/results/issue29/vdg.toml > "$out/config.toml"
+if [[ -n "${DASHBOARD_SNAPSHOT_CACHE:-}" ]]; then
+  sed -i "/^\[query\]$/a dashboard_snapshot_cache = $DASHBOARD_SNAPSHOT_CACHE" "$out/config.toml"
+fi
+if [[ -n "${RETIRED_GRACE_SECS:-}" ]]; then
+  sed -i "s/^retired_grace_secs = .*/retired_grace_secs = $RETIRED_GRACE_SECS/" "$out/config.toml"
+fi
 chmod 644 "$out/config.toml"
 vdg=$(docker run -d --pull never --network "$net" --cpus=4 --memory=2g -p 127.0.0.1::8080 \
   -e VERDIGRIS_CONFIG=/app/config/bench.toml -e TOKIO_WORKER_THREADS=4 -e RUST_LOG=warn \
@@ -89,3 +107,10 @@ for trial in 1 2 3; do
     --out "$out/trial-$trial.json" > "$out/trial-$trial.log"
   echo "Completed trial $trial"
 done
+curl -fsS --max-time 10 "http://127.0.0.1:$port/v1/metrics" > "$out/metrics-after.json"
+if [[ "${RUN_MUTATING_TRIAL:-0}" == 1 ]]; then
+  python3 -B bench/admission/mixed.py --port "$port" --rows 20000000 --reuse --duration 60 --fixed-rates \
+    --trial mutating --stats-container "$vdg" --stats-container "$minio" --ingest-probe-every 10 \
+    --out "$out/mutating.json" > "$out/mutating.log"
+  curl -fsS --max-time 10 "http://127.0.0.1:$port/v1/metrics" > "$out/metrics-mutating.json"
+fi
