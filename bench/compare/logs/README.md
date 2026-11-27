@@ -74,15 +74,28 @@ the JSON. See [`bench/results/issue63/`](../../results/issue63/README.md) for th
 normalized three-engine run and [`bench/results/issue70/`](../../results/issue70/README.md)
 for the trace-latency work.
 
-## Measured 2026-11-27
+## Results on the four-CPU reference host
 
-The current run is in [`bench/results/issue63/`](../../results/issue63/README.md):
-three-engine, 100 warm samples per shape, with per-query restart samples and
-storage decomposed into bucket bytes vs MinIO internals. The earlier
-2026-11-26 numbers in history used 10 samples and a relative search window; do
-not mix the two tables.
+Each range below is p95 across three fresh 1M-row deployments. Each deployment
+ran 100 warm samples per shape and validated the full query results. Verdigris
+ran with durable audit and disk-backed MinIO inside the same total CPU and RAM
+budget as each competitor.
 
-Host: 16 vCPU / 14 GiB, Docker 29.9; one system at a time. Verdigris + MinIO is
-charged 8 CPU / 6 GiB total, same as each single-container competitor. Raw
-machine/config metadata, image IDs and every request sample are in the result
-directory.
+| Warm p95 (ms) | Verdigris + MinIO | ClickHouse | VictoriaLogs |
+| --- | ---: | ---: | ---: |
+| Exact trace hit | 17.27–18.65 | 5.84–6.00 | 1.83–3.21 |
+| Exact trace miss | 4.27–4.44 | 1.61–1.65 | 0.63–0.66 |
+| Cross-tier trace | 24.48–26.26 | 3.81–3.88 | 1.25–3.13 |
+| Recent service search | 17.89–18.67 | 3.78–3.85 | 7.56–16.01 |
+| Raw minute aggregation | 37.84–38.10 | 8.55–8.81 | 10.63–15.45 |
+
+Verdigris met its 1M warm targets for trace hit, trace miss and recent search.
+Both reference engines were faster on every measured shape. The separate 20M
+Verdigris sizing run met the warm trace-hit and trace-miss targets and missed
+cross-tier trace, recent search and raw aggregation. These measurements use a
+local S3-compatible store and a specific synthetic corpus. [Raw three-engine
+baseline](../../results/issue63/four-cpu/README.md) · [20M sizing
+run](../../results/issue83/four-cpu/README.md)
+
+The [earlier eight-CPU cohort](../../results/issue63/README.md) used a different
+host and budget. Its values are retained as a separate reference.
