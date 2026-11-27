@@ -17,7 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[derive(Parser, Debug)]
+mod sustained;
+
+#[derive(Parser, Debug, Clone)]
 #[command(about = "Ramp load against a Verdigris ingest endpoint until it saturates")]
 struct Args {
     /// Base URL of the ingest node.
@@ -78,6 +80,26 @@ struct Args {
     /// by this fraction — saturation, so further steps only add queueing.
     #[arg(long, default_value_t = 0.02)]
     saturation_epsilon: f64,
+
+    /// Offered rows per second for a single open-loop streaming run.
+    #[arg(long)]
+    sustain_rows_per_sec: Option<usize>,
+
+    /// Duration of the sustained run, excluding warmup and response drain.
+    #[arg(long, default_value_t = 600)]
+    duration_secs: u64,
+
+    /// Fixed rows per sustained request. The body must also fit --body-bytes.
+    #[arg(long, default_value_t = 10_000)]
+    batch_rows: usize,
+
+    /// Fixture table used by sustained-run visibility and recovery queries.
+    #[arg(long, default_value = "logs")]
+    table: String,
+
+    /// Fixed corpus epoch in milliseconds. Defaults to the current time.
+    #[arg(long)]
+    corpus_start_ms: Option<i64>,
 
     /// Where to write the JSON results artifact.
     #[arg(long, default_value = "bench/results/latest.json")]
@@ -495,6 +517,9 @@ struct ReportConfig {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(rate) = args.sustain_rows_per_sec {
+        return sustained::run(&args, rate).await;
+    }
 
     let corpus = Arc::new(build_corpus(
         args.seed,

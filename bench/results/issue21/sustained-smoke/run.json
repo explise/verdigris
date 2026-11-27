@@ -1,0 +1,338 @@
+{
+  "acked_in_window": 24000,
+  "acked_rows": 24000,
+  "acked_rows_per_s": 2000.0,
+  "body_bytes_limit": 4194304,
+  "buffered_batches": 4,
+  "concurrency": 4,
+  "corpus_start_ms": 1795769127692,
+  "duration_s": 12,
+  "generation_error": null,
+  "offered_rows_per_s": 2000,
+  "outcomes": [
+    {
+      "ack_ms": 14.540132000000002,
+      "acked_rows": 1000,
+      "bytes": 239622,
+      "error": null,
+      "id": 0,
+      "rows": 1000,
+      "start_ms": 1.1743999999999999,
+      "status": 200
+    },
+    {
+      "ack_ms": 511.739272,
+      "acked_rows": 1000,
+      "bytes": 239770,
+      "error": null,
+      "id": 1,
+      "rows": 1000,
+      "start_ms": 500.72434300000003,
+      "status": 200
+    },
+    {
+      "ack_ms": 1016.469403,
+      "acked_rows": 1000,
+      "bytes": 239335,
+      "error": null,
+      "id": 2,
+      "rows": 1000,
+      "start_ms": 1001.285137,
+      "status": 200
+    },
+    {
+      "ack_ms": 1515.866318,
+      "acked_rows": 1000,
+      "bytes": 240088,
+      "error": null,
+      "id": 3,
+      "rows": 1000,
+      "start_ms": 1501.4491429999998,
+      "status": 200
+    },
+    {
+      "ack_ms": 2015.053157,
+      "acked_rows": 1000,
+      "bytes": 239754,
+      "error": null,
+      "id": 4,
+      "rows": 1000,
+      "start_ms": 2000.692135,
+      "status": 200
+    },
+    {
+      "ack_ms": 2516.995585,
+      "acked_rows": 1000,
+      "bytes": 239821,
+      "error": null,
+      "id": 5,
+      "rows": 1000,
+      "start_ms": 2501.8428369999997,
+      "status": 200
+    },
+    {
+      "ack_ms": 3018.060951,
+      "acked_rows": 1000,
+      "bytes": 239623,
+      "error": null,
+      "id": 6,
+      "rows": 1000,
+      "start_ms": 3001.2207900000003,
+      "status": 200
+    },
+    {
+      "ack_ms": 3517.780042,
+      "acked_rows": 1000,
+      "bytes": 239624,
+      "error": null,
+      "id": 7,
+      "rows": 1000,
+      "start_ms": 3501.369231,
+      "status": 200
+    },
+    {
+      "ack_ms": 4018.1777429999997,
+      "acked_rows": 1000,
+      "bytes": 239298,
+      "error": null,
+      "id": 8,
+      "rows": 1000,
+      "start_ms": 4001.477198,
+      "status": 200
+    },
+    {
+      "ack_ms": 4518.876248,
+      "acked_rows": 1000,
+      "bytes": 239334,
+      "error": null,
+      "id": 9,
+      "rows": 1000,
+      "start_ms": 4501.828794,
+      "status": 200
+    },
+    {
+      "ack_ms": 5028.639915000001,
+      "acked_rows": 1000,
+      "bytes": 240492,
+      "error": null,
+      "id": 10,
+      "rows": 1000,
+      "start_ms": 5001.162219,
+      "status": 200
+    },
+    {
+      "ack_ms": 5518.401677,
+      "acked_rows": 1000,
+      "bytes": 239415,
+      "error": null,
+      "id": 11,
+      "rows": 1000,
+      "start_ms": 5501.535677,
+      "status": 200
+    },
+    {
+      "ack_ms": 6018.95108,
+      "acked_rows": 1000,
+      "bytes": 240455,
+      "error": null,
+      "id": 12,
+      "rows": 1000,
+      "start_ms": 6002.395992000001,
+      "status": 200
+    },
+    {
+      "ack_ms": 6517.781563,
+      "acked_rows": 1000,
+      "bytes": 239203,
+      "error": null,
+      "id": 13,
+      "rows": 1000,
+      "start_ms": 6501.581368,
+      "status": 200
+    },
+    {
+      "ack_ms": 7016.029346,
+      "acked_rows": 1000,
+      "bytes": 238933,
+      "error": null,
+      "id": 14,
+      "rows": 1000,
+      "start_ms": 7001.103474,
+      "status": 200
+    },
+    {
+      "ack_ms": 7518.797652,
+      "acked_rows": 1000,
+      "bytes": 239173,
+      "error": null,
+      "id": 15,
+      "rows": 1000,
+      "start_ms": 7501.509637,
+      "status": 200
+    },
+    {
+      "ack_ms": 8019.607769,
+      "acked_rows": 1000,
+      "bytes": 239898,
+      "error": null,
+      "id": 16,
+      "rows": 1000,
+      "start_ms": 8001.599369,
+      "status": 200
+    },
+    {
+      "ack_ms": 8519.435298999999,
+      "acked_rows": 1000,
+      "bytes": 239478,
+      "error": null,
+      "id": 17,
+      "rows": 1000,
+      "start_ms": 8501.390372,
+      "status": 200
+    },
+    {
+      "ack_ms": 9019.253343999999,
+      "acked_rows": 1000,
+      "bytes": 239072,
+      "error": null,
+      "id": 18,
+      "rows": 1000,
+      "start_ms": 9000.994633,
+      "status": 200
+    },
+    {
+      "ack_ms": 9520.358047,
+      "acked_rows": 1000,
+      "bytes": 240148,
+      "error": null,
+      "id": 19,
+      "rows": 1000,
+      "start_ms": 9501.306658000001,
+      "status": 200
+    },
+    {
+      "ack_ms": 10019.723109999999,
+      "acked_rows": 1000,
+      "bytes": 239581,
+      "error": null,
+      "id": 20,
+      "rows": 1000,
+      "start_ms": 10001.270573,
+      "status": 200
+    },
+    {
+      "ack_ms": 10513.07209,
+      "acked_rows": 1000,
+      "bytes": 240849,
+      "error": null,
+      "id": 21,
+      "rows": 1000,
+      "start_ms": 10501.57236,
+      "status": 200
+    },
+    {
+      "ack_ms": 11015.691481,
+      "acked_rows": 1000,
+      "bytes": 239668,
+      "error": null,
+      "id": 22,
+      "rows": 1000,
+      "start_ms": 11001.078816,
+      "status": 200
+    },
+    {
+      "ack_ms": 11516.867248,
+      "acked_rows": 1000,
+      "bytes": 240522,
+      "error": null,
+      "id": 23,
+      "rows": 1000,
+      "start_ms": 11501.174546,
+      "status": 200
+    }
+  ],
+  "planned_batches": 24,
+  "planned_rows": 24000,
+  "sampled_batches": [
+    0,
+    2,
+    4,
+    6,
+    8,
+    10,
+    12,
+    14,
+    16,
+    18,
+    20,
+    22
+  ],
+  "seed": 42,
+  "storage_samples": [
+    {
+      "compaction": {
+        "compacted": 0,
+        "generation": 0,
+        "retiredFiles": 0,
+        "smallFiles": 0,
+        "status": "idle",
+        "targetSize": "256 MB"
+      },
+      "elapsed_ms": 1.145878
+    }
+  ],
+  "table": "bench",
+  "visibility": [
+    {
+      "id": 0,
+      "visible_ms": 23.152471000000002
+    },
+    {
+      "id": 2,
+      "visible_ms": 27.489948000000002
+    },
+    {
+      "id": 4,
+      "visible_ms": 24.759667
+    },
+    {
+      "id": 6,
+      "visible_ms": 27.171733
+    },
+    {
+      "id": 8,
+      "visible_ms": 29.746308
+    },
+    {
+      "id": 10,
+      "visible_ms": 39.291013
+    },
+    {
+      "id": 12,
+      "visible_ms": 29.301741
+    },
+    {
+      "id": 14,
+      "visible_ms": 27.734779
+    },
+    {
+      "id": 16,
+      "visible_ms": 30.344418
+    },
+    {
+      "id": 18,
+      "visible_ms": 32.630864
+    },
+    {
+      "id": 20,
+      "visible_ms": 38.945818
+    },
+    {
+      "id": 22,
+      "visible_ms": 27.485751
+    }
+  ],
+  "visibility_deadline_ms": 5000,
+  "visibility_p95_ms": 39.291013,
+  "visibility_poll_ms": 50
+}

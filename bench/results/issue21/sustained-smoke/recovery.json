@@ -1,0 +1,15 @@
+{
+  "acked_batches": 24,
+  "acked_rows": 24000,
+  "acknowledged_batch_mismatches": {
+    "after": {},
+    "before": {}
+  },
+  "ambiguous_transport_or_ack_batches": [],
+  "passed": true,
+  "unacknowledged_batches": {
+    "after": {},
+    "before": {}
+  },
+  "unexplained_batch_ids": []
+}
